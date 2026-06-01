@@ -6,12 +6,12 @@ from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.utils import executor
 import logging
 import ssl
 import certifi
 import warnings
 import os
+from aiohttp import web
 
 warnings.filterwarnings('ignore')
 
@@ -338,7 +338,21 @@ async def open_position_cmd(message: types.Message):
     except Exception as e:
         await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
 
+# === ВЕБ-СЕРВЕР ДЛЯ RENDER ===
+async def handle_health(request):
+    return web.Response(text="OK")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/health', handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 10000)
+    await site.start()
+    print("🌐 Веб-сервер запущен на порту 10000")
+
 async def on_startup(dp):
+    await start_web_server()
     try:
         await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n/start")
         print("✅ Бот в Telegram")
@@ -354,4 +368,5 @@ if __name__ == "__main__":
     print("ПРОФ АНАЛИТИК | ЭФФЕКТ ДМИТРИЕВА")
     print("17 акций с подтверждённым эффектом")
     print("=" * 50)
+    from aiogram.utils import executor
     executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
