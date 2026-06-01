@@ -3,6 +3,7 @@ import aiohttp
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+import pytz
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
@@ -63,29 +64,37 @@ LUNAR_PHASES = {
 }
 
 def get_lunar_info():
-    now = datetime.now()
+    msk_tz = pytz.timezone('Europe/Moscow')
+    now = datetime.now(msk_tz)
     next_full = next_new = None
     for date_str, time_str in LUNAR_PHASES["full_moons"]:
         dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        dt = msk_tz.localize(dt)
         if dt > now:
             next_full = dt
             break
     for date_str, time_str in LUNAR_PHASES["new_moons"]:
         dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        dt = msk_tz.localize(dt)
         if dt > now:
             next_new = dt
             break
     for date_str, time_str in LUNAR_PHASES["full_moons"]:
         dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        dt = msk_tz.localize(dt)
         if (now - dt).days <= 1 and (now - dt).days >= 0:
             return "полнолуние", dt, next_full, next_new
         if (dt - now).days == 1:
             return "полнолуние_завтра", dt, next_full, next_new
     for date_str, time_str in LUNAR_PHASES["new_moons"]:
         dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        dt = msk_tz.localize(dt)
         if abs((now - dt).days) <= 1:
             return "новолуние", dt, next_full, next_new
-    new_moons = [datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M") for d, t in LUNAR_PHASES["new_moons"]]
+    new_moons = []
+    for date_str, time_str in LUNAR_PHASES["new_moons"]:
+        dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        new_moons.append(msk_tz.localize(dt))
     last_new = max([d for d in new_moons if d <= now], default=None)
     if last_new:
         days = (now - last_new).days
@@ -228,7 +237,8 @@ async def lunar_phases_cmd(message: types.Message):
     msg = await message.answer("🌙 Загружаю данные...")
     try:
         phase, phase_date, next_full, next_new = get_lunar_info()
-        now = datetime.now()
+        msk_tz = pytz.timezone('Europe/Moscow')
+        now = datetime.now(msk_tz)
         text = f"🌙 ЛУННЫЙ КАЛЕНДАРЬ\n\n📅 Сегодня: {now.strftime('%d.%m.%Y')}\n"
         if phase == "полнолуние":
             text += f"🌕 Фаза: ПОЛНОЛУНИЕ (активный сигнал!)\n"
@@ -274,6 +284,8 @@ async def open_position_cmd(message: types.Message):
     try:
         phase, phase_date, next_full, next_new = get_lunar_info()
         trends = await get_all_trends()
+        msk_tz = pytz.timezone('Europe/Moscow')
+        now = datetime.now(msk_tz)
         text = f"🎯 РЕКОМЕНДАЦИЯ ПО ОТКРЫТИЮ ПОЗИЦИИ\n\n"
         text += f"🌙 ЛУННЫЙ СИГНАЛ:\n"
         if phase == "полнолуние":
@@ -328,7 +340,7 @@ async def open_position_cmd(message: types.Message):
                 elif data['trend'] == "медвежий":
                     text += f"🔴 {data['name']}: готовиться к ПРОДАЖЕ (успех {data['success_bear']:.0f}%)\n"
         elif next_full:
-            days = (next_full - datetime.now()).days
+            days = (next_full - now).days
             text += f"⏳ Следующая точка входа: {next_full.strftime('%d.%m.%Y')} (через {days} дн.)\n"
         else:
             text += f"⏸ Активный сигнал отсутствует\n"
