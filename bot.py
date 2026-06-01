@@ -4,8 +4,9 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram import F
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.utils import executor
 import logging
 import ssl
 import certifi
@@ -14,7 +15,7 @@ import os
 
 warnings.filterwarnings('ignore')
 
-# === БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ТОКЕНА ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ===
+# === БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ТОКЕНА ===
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MY_CHAT_ID = 414210743
 
@@ -92,10 +93,21 @@ def get_lunar_info():
         return phase, last_new, next_full, next_new
     return "неизвестно", None, next_full, next_new
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(bot)
+dp.middleware.setup(LoggingMiddleware())
+
+# === КЛАВИАТУРА ===
+keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🌙 Фазы Луны")],
+        [KeyboardButton(text="📈 Открыть позицию")],
+        [KeyboardButton(text="📊 Историческая статистика")]
+    ],
+    resize_keyboard=True
+)
 
 # === СБОР ДАННЫХ С MOEX ===
 class DataFetcher:
@@ -199,16 +211,8 @@ def calc_rr(entry, stop, target):
     except:
         return 0
 
-@dp.message(Command("start"))
+@dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
-    keyboard = types.ReplyKeyboardMarkup(
-        keyboard=[
-            [types.KeyboardButton(text="🌙 Фазы Луны")],
-            [types.KeyboardButton(text="📈 Открыть позицию")],
-            [types.KeyboardButton(text="📊 Историческая статистика")]
-        ],
-        resize_keyboard=True
-    )
     await message.answer(
         f"🌙 ПРОФ АНАЛИТИК | ЭФФЕКТ ДМИТРИЕВА\n\n"
         f"📊 17 акций с подтверждённым эффектом\n\n"
@@ -219,7 +223,7 @@ async def cmd_start(message: types.Message):
         reply_markup=keyboard
     )
 
-@dp.message(F.text == "🌙 Фазы Луны")
+@dp.message_handler(lambda message: message.text == "🌙 Фазы Луны")
 async def lunar_phases_cmd(message: types.Message):
     msg = await message.answer("🌙 Загружаю данные...")
     try:
@@ -245,7 +249,7 @@ async def lunar_phases_cmd(message: types.Message):
     except Exception as e:
         await msg.edit_text(f"⚠️ Ошибка: {e}")
 
-@dp.message(F.text == "📊 Историческая статистика")
+@dp.message_handler(lambda message: message.text == "📊 Историческая статистика")
 async def stats_cmd(message: types.Message):
     text = f"📊 ИСТОРИЧЕСКАЯ СТАТИСТИКА (2024-2026)\n\n"
     text += f"{'─' * 35}\n"
@@ -264,7 +268,7 @@ async def stats_cmd(message: types.Message):
     text += f"⚠️ Статистика основана на 2 годах данных\n📖 Решение принимает трейдер"
     await message.answer(text)
 
-@dp.message(F.text == "📈 Открыть позицию")
+@dp.message_handler(lambda message: message.text == "📈 Открыть позицию")
 async def open_position_cmd(message: types.Message):
     msg = await message.answer("📈 Анализирую рынок... ⏳ 30-40 сек")
     try:
@@ -334,23 +338,20 @@ async def open_position_cmd(message: types.Message):
     except Exception as e:
         await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
 
-async def main():
-    print("=" * 50)
-    print("ПРОФ АНАЛИТИК | ЭФФЕКТ ДМИТРИЕВА")
-    print("17 акций с подтверждённым эффектом")
-    print("=" * 50)
+async def on_startup(dp):
     try:
         await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n/start")
         print("✅ Бот в Telegram")
     except: 
         print("⚠️ Не удалось отправить сообщение, но бот работает")
-    try:
-        await dp.start_polling(bot, skip_updates=True)
-    finally:
-        await data_fetcher.close()
+
+async def on_shutdown(dp):
+    await data_fetcher.close()
+    await bot.close()
 
 if __name__ == "__main__":
-    try: 
-        asyncio.run(main())
-    except KeyboardInterrupt: 
-        print("\n⏹ Стоп")
+    print("=" * 50)
+    print("ПРОФ АНАЛИТИК | ЭФФЕКТ ДМИТРИЕВА")
+    print("17 акций с подтверждённым эффектом")
+    print("=" * 50)
+    executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
