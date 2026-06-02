@@ -15,6 +15,8 @@ import os
 from aiohttp import web
 import matplotlib.pyplot as plt
 from io import BytesIO
+import sqlite3
+import ta  # technical analysis library
 
 warnings.filterwarnings('ignore')
 
@@ -47,6 +49,52 @@ TICKERS = {
 }
 
 ALL_TICKERS = list(TICKERS.keys())
+
+# === БАЗА ДАННЫХ ДЛЯ WATCHLIST ===
+def init_db():
+    conn = sqlite3.connect('watchlist.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS watchlist
+                 (user_id INTEGER, ticker TEXT, PRIMARY KEY (user_id, ticker))''')
+    conn.commit()
+    conn.close()
+
+def get_watchlist(user_id):
+    conn = sqlite3.connect('watchlist.db')
+    c = conn.cursor()
+    c.execute("SELECT ticker FROM watchlist WHERE user_id = ?", (user_id,))
+    result = [row[0] for row in c.fetchall()]
+    conn.close()
+    return result
+
+def add_to_watchlist(user_id, ticker):
+    if ticker not in ALL_TICKERS:
+        return False
+    conn = sqlite3.connect('watchlist.db')
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO watchlist (user_id, ticker) VALUES (?, ?)", (user_id, ticker))
+        conn.commit()
+        conn.close()
+        return True
+    except:
+        conn.close()
+        return False
+
+def remove_from_watchlist(user_id, ticker):
+    conn = sqlite3.connect('watchlist.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM watchlist WHERE user_id = ? AND ticker = ?", (user_id, ticker))
+    conn.commit()
+    conn.close()
+    return True
+
+def clear_watchlist(user_id):
+    conn = sqlite3.connect('watchlist.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM watchlist WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
 
 # === ЛУННЫЕ ДАННЫЕ ===
 LUNAR_PHASES = {
@@ -117,7 +165,10 @@ keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="📈 Открыть позицию")],
         [KeyboardButton(text="📊 Историческая статистика")],
         [KeyboardButton(text="📋 Все активы (/all)")],
-        [KeyboardButton(text="📈 График акции")]
+        [KeyboardButton(text="📈 График акции")],
+        [KeyboardButton(text="⭐ Watchlist")],
+        [KeyboardButton(text="📎 Экспорт в Excel")],
+        [KeyboardButton(text="📈 Сравнение с IMOEX")]
     ],
     resize_keyboard=True
 )
@@ -176,6 +227,27 @@ class DataFetcher:
         except: pass
         return None
 
+    async def fetch_imoex(self, days=100):
+        """Загружает данные индекса IMOEX для сравнения"""
+        try:
+            s = await self.get_session()
+            url = "https://iss.moex.com/iss/engines/stock/markets/index/securities/IMOEX/candles.json"
+            params = {'from': (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d'),
+                     'till': datetime.now().strftime('%Y-%m-%d'), 'interval': 24}
+            async with s.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    candles = data.get('candles', {}).get('data', [])
+                    if candles:
+                        df = pd.DataFrame(candles, columns=['open','close','high','low','value','volume','begin','end'])
+                        df['begin'] = pd.to_datetime(df['begin'])
+                        df = df.sort_values('begin').reset_index(drop=True)
+                        df = df[['begin','close']]
+                        df.columns = ['date', 'close']
+                        return df
+        except: pass
+        return None
+
     async def close(self):
         if self.session and not self.session.closed:
             await self.session.close()
@@ -195,6 +267,29 @@ def calc_trend(df):
         return "боковик"
     return "бычий" if ma18 > ma50 else "медвежий"
 
+def calc_indicators(df):
+    """Рассчитывает RSI и MACD"""
+    if df is None or len(df) < 30:
+        return None
+    close = df['close']
+    rsi = ta.momentum.RSIIndicator(close).rsi().iloc[-1]
+    macd = ta.trend.MACD(close)
+    macd_line = macd.macd().iloc[-1]
+    macd_signal = macd.macd_signal().iloc[-1]
+    macd_histogram = macd.macd_diff().iloc[-1]
+    
+    # Интерпретация
+    rsi_status = "перекупленность" if rsi > 70 else "перепроданность" if rsi < 30 else "нейтрально"
+    macd_status = "бычий сигнал" if macd_line > macd_signal else "медвежий сигнал"
+    
+    return {
+        'rsi': round(rsi, 1),
+        'rsi_status': rsi_status,
+        'macd_line': round(macd_line, 2),
+        'macd_signal': round(macd_signal, 2),
+        'macd_status': macd_status
+    }
+
 async def get_all_trends():
     results = {}
     for ticker in ALL_TICKERS:
@@ -202,9 +297,10 @@ async def get_all_trends():
             df = await data_fetcher.fetch_candles(ticker, 100)
             price = await data_fetcher.get_price(ticker)
             trend = calc_trend(df)
-            results[ticker] = {**TICKERS[ticker], "price": price, "trend": trend}
+            indicators = calc_indicators(df) if df is not None else None
+            results[ticker] = {**TICKERS[ticker], "price": price, "trend": trend, "indicators": indicators}
         except:
-            results[ticker] = {**TICKERS[ticker], "price": None, "trend": "ошибка"}
+            results[ticker] = {**TICKERS[ticker], "price": None, "trend": "ошибка", "indicators": None}
     return results
 
 def confidence_stars(p):
@@ -223,6 +319,193 @@ def calc_rr(entry, stop, target):
         return rr
     except:
         return 0
+
+# === КОМАНДА /watchlist ===
+@dp.message_handler(commands=['watchlist'])
+async def cmd_watchlist(message: types.Message):
+    user_id = message.from_user.id
+    watchlist = get_watchlist(user_id)
+    if not watchlist:
+        await message.answer("⭐ Ваш watchlist пуст.\n\nДобавить акцию: /add TICKER\nУдалить: /remove TICKER\nОчистить: /clear_watchlist\n\nПример: /add SBER")
+        return
+    
+    text = f"⭐ ВАШ WATCHLIST ({len(watchlist)} акций):\n\n"
+    for ticker in watchlist:
+        name = TICKERS.get(ticker, {}).get('name', ticker)
+        text += f"• {name} ({ticker})\n"
+    text += f"\nКоманды:\n/add TICKER — добавить\n/remove TICKER — удалить\n/clear_watchlist — очистить всё\n/watchlist_status — статус активов"
+    await message.answer(text)
+
+@dp.message_handler(commands=['add'])
+async def add_to_watchlist_cmd(message: types.Message):
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /add TICKER\nПример: /add SBER")
+        return
+    ticker = parts[1].upper()
+    if ticker not in TICKERS:
+        await message.answer(f"❌ Тикер {ticker} не найден. Доступные: " + ", ".join(ALL_TICKERS[:5]) + "...")
+        return
+    if add_to_watchlist(message.from_user.id, ticker):
+        await message.answer(f"✅ {TICKERS[ticker]['name']} ({ticker}) добавлен в watchlist")
+    else:
+        await message.answer(f"⚠️ {ticker} уже в вашем watchlist")
+
+@dp.message_handler(commands=['remove'])
+async def remove_from_watchlist_cmd(message: types.Message):
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /remove TICKER\nПример: /remove SBER")
+        return
+    ticker = parts[1].upper()
+    remove_from_watchlist(message.from_user.id, ticker)
+    await message.answer(f"🗑️ {ticker} удалён из watchlist")
+
+@dp.message_handler(commands=['clear_watchlist'])
+async def clear_watchlist_cmd(message: types.Message):
+    clear_watchlist(message.from_user.id)
+    await message.answer("🗑️ Watchlist полностью очищен")
+
+@dp.message_handler(commands=['watchlist_status'])
+async def watchlist_status_cmd(message: types.Message):
+    user_id = message.from_user.id
+    watchlist = get_watchlist(user_id)
+    if not watchlist:
+        await message.answer("⭐ Watchlist пуст. Добавьте акции командой /add TICKER")
+        return
+    
+    msg = await message.answer("📊 Анализирую watchlist... ⏳")
+    try:
+        trends = await get_all_trends()
+        text = f"⭐ СТАТУС WATCHLIST ({len(watchlist)} акций)\n\n"
+        for ticker in watchlist:
+            if ticker in trends:
+                data = trends[ticker]
+                emoji = "🟢" if data['trend'] == "бычий" else "🔴" if data['trend'] == "медвежий" else "⚪"
+                price_str = f"{data['price']:.2f}₽" if data['price'] else "Н/Д"
+                text += f"{emoji} {data['name']}: {price_str} | {data['trend']}\n"
+                if data['indicators']:
+                    ind = data['indicators']
+                    text += f"   📊 RSI: {ind['rsi']} ({ind['rsi_status']}) | MACD: {ind['macd_status']}\n"
+        await msg.delete()
+        await message.answer(text)
+    except Exception as e:
+        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
+
+# === КОМАНДА /export ===
+@dp.message_handler(commands=['export'])
+async def cmd_export(message: types.Message):
+    msg = await message.answer("📎 Формирую Excel-файл со статистикой... ⏳")
+    try:
+        trends = await get_all_trends()
+        
+        # Создаём DataFrame
+        data = []
+        for ticker, info in trends.items():
+            row = {
+                'Тикер': ticker,
+                'Название': info['name'],
+                'Цена': info['price'],
+                'Тренд': info['trend'],
+                'Успех LONG %': info['success_bull'],
+                'Доходность LONG %': info['return_bull'],
+                'Успех SHORT %': info['success_bear'],
+                'Доходность SHORT %': info['return_bear'],
+                'p-value': info['p_value'],
+                'Доверие': confidence_stars(info['p_value'])
+            }
+            if info['indicators']:
+                row['RSI'] = info['indicators']['rsi']
+                row['RSI сигнал'] = info['indicators']['rsi_status']
+                row['MACD сигнал'] = info['indicators']['macd_status']
+            data.append(row)
+        
+        df = pd.DataFrame(data)
+        
+        # Сохраняем в Excel
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Активы', index=False)
+        
+        output.seek(0)
+        
+        await msg.delete()
+        await message.answer_document(
+            types.InputFile(output, filename=f'moon_bot_report_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx'),
+            caption="📎 Полная статистика по всем 17 активам"
+        )
+    except Exception as e:
+        await msg.edit_text(f"⚠️ Ошибка при создании Excel: {str(e)[:100]}")
+
+# === СРАВНЕНИЕ С IMOEX ===
+@dp.message_handler(commands=['imoex'])
+async def cmd_imoex(message: types.Message):
+    msg = await message.answer("📈 Загружаю данные IMOEX и сравниваю с портфелем... ⏳ 30-40 сек")
+    try:
+        # Загружаем данные IMOEX
+        imoex_df = await data_fetcher.fetch_imoex(60)
+        if imoex_df is None:
+            await msg.edit_text("⚠️ Не удалось загрузить данные IMOEX")
+            return
+        
+        # Загружаем данные всех активов
+        trends = await get_all_trends()
+        
+        # Считаем доходность портфеля (по рекомендациям бота)
+        portfolio_returns = []
+        dates = imoex_df['date'].values
+        
+        for ticker, data in trends.items():
+            if data['price'] and data['trend'] != "боковик" and data['trend'] != "недостаточно данных":
+                # Используем ожидаемую доходность из статистики
+                if data['trend'] == "бычий":
+                    ret = data['return_bull'] / 100
+                else:
+                    ret = data['return_bear'] / 100
+                portfolio_returns.append(ret)
+        
+        avg_portfolio_return = np.mean(portfolio_returns) if portfolio_returns else 0
+        
+        # Доходность IMOEX за последние 60 дней
+        imoex_start = imoex_df['close'].iloc[0]
+        imoex_end = imoex_df['close'].iloc[-1]
+        imoex_return = (imoex_end - imoex_start) / imoex_start
+        
+        # Рисуем график сравнения
+        plt.figure(figsize=(12, 6))
+        plt.plot(imoex_df['date'], imoex_df['close'] / imoex_df['close'].iloc[0] * 100, 'b-', linewidth=2, label='IMOEX (индекс)')
+        
+        # Добавляем линию портфеля (упрощённо)
+        portfolio_line = [100 * (1 + avg_portfolio_return * i/60) for i in range(len(imoex_df))]
+        plt.plot(imoex_df['date'], portfolio_line, 'g--', linewidth=2, label='Портфель (прогноз по стратегии)')
+        
+        plt.title("Сравнение: Портфель (по рекомендациям бота) vs IMOEX")
+        plt.xlabel("Дата")
+        plt.ylabel("Нормированное значение (начало = 100)")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        
+        buf = BytesIO()
+        plt.savefig(buf, format='png', dpi=100)
+        buf.seek(0)
+        plt.close()
+        
+        text = f"📊 СРАВНЕНИЕ С РЫНКОМ\n\n"
+        text += f"📈 Доходность IMOEX за 60 дней: {imoex_return*100:.2f}%\n"
+        text += f"🎯 Ожидаемая доходность портфеля (по рекомендациям бота): {avg_portfolio_return*100:.2f}%\n"
+        text += f"{'─' * 35}\n"
+        if avg_portfolio_return > imoex_return:
+            text += f"✅ Портфель стратегии потенциально превосходит рынок на {(avg_portfolio_return - imoex_return)*100:.2f}%\n"
+        else:
+            text += f"⚠️ Стратегия отстаёт от рынка на {(imoex_return - avg_portfolio_return)*100:.2f}%\n"
+        text += f"\n⚠️ Сравнение приблизительное, основано на исторической доходности активов"
+        
+        await msg.delete()
+        await message.answer_photo(photo=buf, caption=text)
+    except Exception as e:
+        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
 
 # === КОМАНДА /all ===
 @dp.message_handler(commands=['all'])
@@ -256,6 +539,14 @@ async def cmd_all(message: types.Message):
                 side_count += 1
         if side_count == 0:
             text += f"   ⚠️ Нет активов в боковике\n"
+        
+        # Добавляем информацию по RSI/MACD для бычьих/медвежьих активов
+        text += f"\n📊 RSI/MACD сигналы:\n"
+        for ticker, data in trends.items():
+            if data['indicators'] and data['trend'] in ["бычий", "медвежий"]:
+                ind = data['indicators']
+                text += f"   {data['name']}: RSI={ind['rsi']} ({ind['rsi_status']}) | {ind['macd_status']}\n"
+        
         text += f"\n📅 {datetime.now(pytz.timezone('Europe/Moscow')).strftime('%d.%m.%Y %H:%M')}"
         await message.answer(text)
     except Exception as e:
@@ -278,32 +569,50 @@ async def send_chart(message: types.Message):
         if df is None or len(df) < 10:
             await msg.edit_text(f"⚠️ Недостаточно данных для {TICKERS[ticker]['name']}")
             return
-        # Рисуем график
-        plt.figure(figsize=(10, 6))
-        plt.plot(df['date'], df['close'], 'b-', linewidth=2, label='Цена закрытия')
-        # Скользящие средние
+        
+        # Рисуем график с индикаторами
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [3, 1]})
+        
+        # Цена и скользящие средние
+        ax1.plot(df['date'], df['close'], 'b-', linewidth=2, label='Цена закрытия')
         if len(df) >= 18:
             ma18 = df['close'].rolling(18).mean()
-            plt.plot(df['date'], ma18, 'g--', linewidth=1.5, label='MA 18')
+            ax1.plot(df['date'], ma18, 'g--', linewidth=1.5, label='MA 18')
         if len(df) >= 50:
             ma50 = df['close'].rolling(50).mean()
-            plt.plot(df['date'], ma50, 'r--', linewidth=1.5, label='MA 50')
-        plt.title(f"{TICKERS[ticker]['name']} ({ticker}) - Цена и тренды")
-        plt.xlabel("Дата")
-        plt.ylabel("Цена, ₽")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
+            ax1.plot(df['date'], ma50, 'r--', linewidth=1.5, label='MA 50')
+        ax1.set_title(f"{TICKERS[ticker]['name']} ({ticker}) - Цена и RSI/MACD")
+        ax1.set_ylabel("Цена, ₽")
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # RSI        rsi = ta.momentum.RSIIndicator(df['close']).rsi()
+        ax2.plot(df['date'], rsi, 'purple', linewidth=1.5)
+        ax2.axhline(y=70, color='r', linestyle='--', alpha=0.5, label='Перекупленность (70)')
+        ax2.axhline(y=30, color='g', linestyle='--', alpha=0.5, label='Перепроданность (30)')
+        ax2.set_ylabel("RSI")
+        ax2.set_ylim(0, 100)
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
         plt.xticks(rotation=45)
         plt.tight_layout()
-        # Сохраняем в память
+        
         buf = BytesIO()
         plt.savefig(buf, format='png', dpi=100)
         buf.seek(0)
         plt.close()
+        
+        # Получаем текущие индикаторы
+        indicators = calc_indicators(df)
+        caption = f"📈 {TICKERS[ticker]['name']} ({ticker})\nТренд: {calc_trend(df)}"
+        if indicators:
+            caption += f"\n📊 RSI: {indicators['rsi']} ({indicators['rsi_status']})\n📊 MACD: {indicators['macd_status']}"
+        
         await msg.delete()
-        await message.answer_photo(photo=buf, caption=f"📈 {TICKERS[ticker]['name']} ({ticker})\nТренд: {calc_trend(df)}")
+        await message.answer_photo(photo=buf, caption=caption)
     except Exception as e:
-        await msg.edit_text(f"⚠️ Ошибка при загрузке графика: {str(e)[:100]}")
+        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
 
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
@@ -313,8 +622,11 @@ async def cmd_start(message: types.Message):
         f"🌙 Фазы Луны — информация о текущей фазе\n"
         f"📈 Открыть позицию — рекомендация по входу\n"
         f"📊 Историческая статистика — успешность\n"
-        f"📋 Все активы (/all) — сводная таблица\n"
-        f"📈 График акции — введите тикер (SBER, VTBR и т.д.)\n\n"
+        f"📋 Все активы (/all) — сводная таблица с RSI/MACD\n"
+        f"📈 График акции — введите тикер\n"
+        f"⭐ Watchlist — персональный список (/add, /remove, /watchlist_status)\n"
+        f"📎 Экспорт в Excel — выгрузка всей статистики\n"
+        f"📈 Сравнение с IMOEX — портфель vs рынок\n\n"
         f"По методике: полнолуние → точка входа",
         reply_markup=keyboard
     )
@@ -390,6 +702,9 @@ async def open_position_cmd(message: types.Message):
             stars = confidence_stars(data['p_value'])
             text += f"{emoji} {data['name']} ({ticker}): {price_str}\n"
             text += f"   📈 Тренд: {data['trend']} | Доверие: {stars}\n"
+            if data['indicators']:
+                ind = data['indicators']
+                text += f"   📊 RSI: {ind['rsi']} ({ind['rsi_status']}) | MACD: {ind['macd_status']}\n"
             if data['trend'] == "бычий":
                 stop = data['price'] * 0.97 if data['price'] else None
                 target = data['price'] * (1 + data['return_bull']/100) if data['price'] else None
@@ -441,16 +756,25 @@ async def open_position_cmd(message: types.Message):
 async def all_button_handler(message: types.Message):
     await cmd_all(message)
 
-# === АВТО-УВЕДОМЛЕНИЯ (проверка 1 раз в час) ===
+@dp.message_handler(lambda message: message.text == "⭐ Watchlist")
+async def watchlist_button_handler(message: types.Message):
+    await cmd_watchlist(message)
+
+@dp.message_handler(lambda message: message.text == "📎 Экспорт в Excel")
+async def export_button_handler(message: types.Message):
+    await cmd_export(message)
+
+@dp.message_handler(lambda message: message.text == "📈 Сравнение с IMOEX")
+async def imoex_button_handler(message: types.Message):
+    await cmd_imoex(message)
+
+# === АВТО-УВЕДОМЛЕНИЯ ===
 async def check_full_moon_notification():
-    """Проверяет, не пора ли отправить уведомление о полнолунии"""
     msk_tz = pytz.timezone('Europe/Moscow')
     now = datetime.now(msk_tz)
-    # Загружаем время последнего уведомления (храним в памяти)
     if not hasattr(check_full_moon_notification, 'last_notify'):
         check_full_moon_notification.last_notify = {}
     phase, phase_date, next_full, next_new = get_lunar_info()
-    # Уведомление за день до полнолуния
     if next_full:
         one_day_before = next_full - timedelta(days=1)
         if one_day_before.date() == now.date():
@@ -460,27 +784,24 @@ async def check_full_moon_notification():
                 await bot.send_message(MY_CHAT_ID, 
                     f"🌕 НАПОМИНАНИЕ!\n\n"
                     f"Завтра ПОЛНОЛУНИЕ ({next_full.strftime('%d.%m.%Y')}) — точка входа!\n"
-                    f"Нажмите 📈 Открыть позицию, чтобы получить рекомендации.")
-        # Уведомление в день полнолуния
+                    f"Нажмите 📈 Открыть позицию, чтобы получить рекомендации с RSI/MACD.")
         if next_full.date() == now.date():
             key = f"day_{next_full.date()}"
             if check_full_moon_notification.last_notify.get(key) != now.date():
                 check_full_moon_notification.last_notify[key] = now.date()
                 await bot.send_message(MY_CHAT_ID,
                     f"🌕 СЕГОДНЯ ПОЛНОЛУНИЕ!\n\n"
-                    f"ТОЧКА ВХОДА! Нажмите 📈 Открыть позицию для детальных рекомендаций.")
+                    f"ТОЧКА ВХОДА! Нажмите 📈 Открыть позицию для детальных рекомендаций с техническими индикаторами.")
 
-# === ЗАДАЧА ДЛЯ ПЕРИОДИЧЕСКОЙ ПРОВЕРКИ ===
 async def periodic_notification():
-    """Запускает проверку уведомлений каждый час"""
     while True:
         try:
             await check_full_moon_notification()
         except Exception as e:
             print(f"Ошибка в уведомлениях: {e}")
-        await asyncio.sleep(3600)  # 1 час
+        await asyncio.sleep(3600)
 
-# === ВЕБ-СЕРВЕР ДЛЯ RENDER ===
+# === ВЕБ-СЕРВЕР ===
 async def handle_health(request):
     return web.Response(text="OK")
 
@@ -494,11 +815,15 @@ async def start_web_server():
     print("🌐 Веб-сервер запущен на порту 10000")
 
 async def on_startup(dp):
+    init_db()
     await start_web_server()
-    # Запускаем фоновую задачу уведомлений
     asyncio.create_task(periodic_notification())
     try:
-        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен с улучшениями!\n/all - все активы\n📈 График акции - график цены\nАвто-уведомления о полнолунии включены")
+        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен с новыми функциями!\n\n"
+            "⭐ Watchlist — персональный список акций\n"
+            "📎 Экспорт в Excel — выгрузка статистики\n"
+            "📈 Сравнение с IMOEX — портфель vs рынок\n"
+            "📊 RSI и MACD добавлены в анализ")
         print("✅ Бот в Telegram")
     except: 
         print("⚠️ Не удалось отправить сообщение, но бот работает")
@@ -511,7 +836,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print("ПРОФ АНАЛИТИК | ЭФФЕКТ ДМИТРИЕВА")
     print("17 акций с подтверждённым эффектом")
-    print("Улучшения: /all, графики, авто-уведомления")
+    print("Улучшения: Watchlist, Excel, IMOEX, RSI/MACD")
     print("=" * 50)
     from aiogram.utils import executor
     executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
