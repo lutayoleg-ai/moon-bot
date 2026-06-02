@@ -13,6 +13,8 @@ import certifi
 import warnings
 import os
 from aiohttp import web
+import matplotlib.pyplot as plt
+from io import BytesIO
 
 warnings.filterwarnings('ignore')
 
@@ -113,7 +115,9 @@ keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🌙 Фазы Луны")],
         [KeyboardButton(text="📈 Открыть позицию")],
-        [KeyboardButton(text="📊 Историческая статистика")]
+        [KeyboardButton(text="📊 Историческая статистика")],
+        [KeyboardButton(text="📋 Все активы (/all)")],
+        [KeyboardButton(text="📈 График акции")]
     ],
     resize_keyboard=True
 )
@@ -220,14 +224,97 @@ def calc_rr(entry, stop, target):
     except:
         return 0
 
+# === КОМАНДА /all ===
+@dp.message_handler(commands=['all'])
+async def cmd_all(message: types.Message):
+    await message.answer("📋 Собираю данные по всем активам... ⏳ 30-40 сек")
+    try:
+        trends = await get_all_trends()
+        text = f"📋 ВСЕ АКТИВЫ (17)\n\n"
+        # LONG
+        text += f"🟢 LONG (покупка):\n"
+        long_count = 0
+        for ticker, data in trends.items():
+            if data['trend'] == "бычий":
+                text += f"   ✅ {data['name']}: +{data['return_bull']:.2f}% | Успех {data['success_bull']:.0f}%\n"
+                long_count += 1
+        if long_count == 0:
+            text += f"   ⚠️ Нет активов в LONG\n"
+        text += f"\n🔴 SHORT (продажа):\n"
+        short_count = 0
+        for ticker, data in trends.items():
+            if data['trend'] == "медвежий":
+                text += f"   ❌ {data['name']}: +{data['return_bear']:.2f}% | Успех {data['success_bear']:.0f}%\n"
+                short_count += 1
+        if short_count == 0:
+            text += f"   ⚠️ Нет активов в SHORT\n"
+        text += f"\n⚪ БОКОВИК (не торгуем):\n"
+        side_count = 0
+        for ticker, data in trends.items():
+            if data['trend'] == "боковик" or data['trend'] == "недостаточно данных":
+                text += f"   ⚪ {data['name']}: {data['trend']}\n"
+                side_count += 1
+        if side_count == 0:
+            text += f"   ⚠️ Нет активов в боковике\n"
+        text += f"\n📅 {datetime.now(pytz.timezone('Europe/Moscow')).strftime('%d.%m.%Y %H:%M')}"
+        await message.answer(text)
+    except Exception as e:
+        await message.answer(f"⚠️ Ошибка: {str(e)[:100]}")
+
+# === ГРАФИК АКЦИИ ===
+@dp.message_handler(lambda message: message.text == "📈 График акции")
+async def ask_ticker_for_chart(message: types.Message):
+    await message.answer("📊 Введите тикер акции для графика (например, SBER, VTBR, GAZP):\n\nДоступные тикеры:\n" + ", ".join(ALL_TICKERS))
+
+@dp.message_handler(lambda message: message.text.upper() in [t.lower() for t in ALL_TICKERS] or message.text.upper() in ALL_TICKERS)
+async def send_chart(message: types.Message):
+    ticker = message.text.upper().strip()
+    if ticker not in TICKERS:
+        await message.answer(f"❌ Тикер {ticker} не найден. Доступные: " + ", ".join(ALL_TICKERS))
+        return
+    msg = await message.answer(f"📈 Загружаю график для {TICKERS[ticker]['name']}...")
+    try:
+        df = await data_fetcher.fetch_candles(ticker, 100)
+        if df is None or len(df) < 10:
+            await msg.edit_text(f"⚠️ Недостаточно данных для {TICKERS[ticker]['name']}")
+            return
+        # Рисуем график
+        plt.figure(figsize=(10, 6))
+        plt.plot(df['date'], df['close'], 'b-', linewidth=2, label='Цена закрытия')
+        # Скользящие средние
+        if len(df) >= 18:
+            ma18 = df['close'].rolling(18).mean()
+            plt.plot(df['date'], ma18, 'g--', linewidth=1.5, label='MA 18')
+        if len(df) >= 50:
+            ma50 = df['close'].rolling(50).mean()
+            plt.plot(df['date'], ma50, 'r--', linewidth=1.5, label='MA 50')
+        plt.title(f"{TICKERS[ticker]['name']} ({ticker}) - Цена и тренды")
+        plt.xlabel("Дата")
+        plt.ylabel("Цена, ₽")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        # Сохраняем в память
+        buf = BytesIO()
+        plt.savefig(buf, format='png', dpi=100)
+        buf.seek(0)
+        plt.close()
+        await msg.delete()
+        await message.answer_photo(photo=buf, caption=f"📈 {TICKERS[ticker]['name']} ({ticker})\nТренд: {calc_trend(df)}")
+    except Exception as e:
+        await msg.edit_text(f"⚠️ Ошибка при загрузке графика: {str(e)[:100]}")
+
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     await message.answer(
         f"🌙 ПРОФ АНАЛИТИК | ЭФФЕКТ ДМИТРИЕВА\n\n"
         f"📊 17 акций с подтверждённым эффектом\n\n"
         f"🌙 Фазы Луны — информация о текущей фазе\n"
-        f"📈 Открыть позицию — рекомендация по входу с учётом % успеха и R/R\n"
-        f"📊 Историческая статистика — успешность по каждому активу\n\n"
+        f"📈 Открыть позицию — рекомендация по входу\n"
+        f"📊 Историческая статистика — успешность\n"
+        f"📋 Все активы (/all) — сводная таблица\n"
+        f"📈 График акции — введите тикер (SBER, VTBR и т.д.)\n\n"
         f"По методике: полнолуние → точка входа",
         reply_markup=keyboard
     )
@@ -350,6 +437,49 @@ async def open_position_cmd(message: types.Message):
     except Exception as e:
         await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
 
+@dp.message_handler(lambda message: message.text == "📋 Все активы (/all)")
+async def all_button_handler(message: types.Message):
+    await cmd_all(message)
+
+# === АВТО-УВЕДОМЛЕНИЯ (проверка 1 раз в час) ===
+async def check_full_moon_notification():
+    """Проверяет, не пора ли отправить уведомление о полнолунии"""
+    msk_tz = pytz.timezone('Europe/Moscow')
+    now = datetime.now(msk_tz)
+    # Загружаем время последнего уведомления (храним в памяти)
+    if not hasattr(check_full_moon_notification, 'last_notify'):
+        check_full_moon_notification.last_notify = {}
+    phase, phase_date, next_full, next_new = get_lunar_info()
+    # Уведомление за день до полнолуния
+    if next_full:
+        one_day_before = next_full - timedelta(days=1)
+        if one_day_before.date() == now.date():
+            key = f"before_{next_full.date()}"
+            if check_full_moon_notification.last_notify.get(key) != now.date():
+                check_full_moon_notification.last_notify[key] = now.date()
+                await bot.send_message(MY_CHAT_ID, 
+                    f"🌕 НАПОМИНАНИЕ!\n\n"
+                    f"Завтра ПОЛНОЛУНИЕ ({next_full.strftime('%d.%m.%Y')}) — точка входа!\n"
+                    f"Нажмите 📈 Открыть позицию, чтобы получить рекомендации.")
+        # Уведомление в день полнолуния
+        if next_full.date() == now.date():
+            key = f"day_{next_full.date()}"
+            if check_full_moon_notification.last_notify.get(key) != now.date():
+                check_full_moon_notification.last_notify[key] = now.date()
+                await bot.send_message(MY_CHAT_ID,
+                    f"🌕 СЕГОДНЯ ПОЛНОЛУНИЕ!\n\n"
+                    f"ТОЧКА ВХОДА! Нажмите 📈 Открыть позицию для детальных рекомендаций.")
+
+# === ЗАДАЧА ДЛЯ ПЕРИОДИЧЕСКОЙ ПРОВЕРКИ ===
+async def periodic_notification():
+    """Запускает проверку уведомлений каждый час"""
+    while True:
+        try:
+            await check_full_moon_notification()
+        except Exception as e:
+            print(f"Ошибка в уведомлениях: {e}")
+        await asyncio.sleep(3600)  # 1 час
+
 # === ВЕБ-СЕРВЕР ДЛЯ RENDER ===
 async def handle_health(request):
     return web.Response(text="OK")
@@ -365,8 +495,10 @@ async def start_web_server():
 
 async def on_startup(dp):
     await start_web_server()
+    # Запускаем фоновую задачу уведомлений
+    asyncio.create_task(periodic_notification())
     try:
-        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n/start")
+        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен с улучшениями!\n/all - все активы\n📈 График акции - график цены\nАвто-уведомления о полнолунии включены")
         print("✅ Бот в Telegram")
     except: 
         print("⚠️ Не удалось отправить сообщение, но бот работает")
@@ -379,6 +511,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print("ПРОФ АНАЛИТИК | ЭФФЕКТ ДМИТРИЕВА")
     print("17 акций с подтверждённым эффектом")
+    print("Улучшения: /all, графики, авто-уведомления")
     print("=" * 50)
     from aiogram.utils import executor
     executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
