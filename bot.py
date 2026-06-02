@@ -17,10 +17,6 @@ import matplotlib.pyplot as plt
 from io import BytesIO
 import sqlite3
 import ta
-import json
-import plotly.graph_objs as go
-import plotly.utils
-from sklearn.linear_model import LinearRegression
 import hashlib
 
 warnings.filterwarnings('ignore')
@@ -28,10 +24,10 @@ warnings.filterwarnings('ignore')
 # === КОНФИГУРАЦИЯ ===
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MY_CHAT_ID = 414210743
-CHANNEL_ID = os.environ.get("CHANNEL_ID")  # Добавьте в Environment: CHANNEL_ID (например, @your_channel)
+CHANNEL_ID = os.environ.get("CHANNEL_ID")
 
 if not BOT_TOKEN:
-    raise ValueError("❌ Токен не найден! Добавьте переменную окружения BOT_TOKEN в Render")
+    raise ValueError("❌ Токен не найден!")
 
 # === КЭШ ===
 data_cache = {}
@@ -84,24 +80,17 @@ ALL_TICKERS = list(TICKERS.keys())
 def init_db():
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS watchlist
-                 (user_id INTEGER, ticker TEXT, PRIMARY KEY (user_id, ticker))''')
-    c.execute('''CREATE TABLE IF NOT EXISTS adaptive_weights
-                 (ticker TEXT, weight REAL DEFAULT 1.0, correct_count INTEGER DEFAULT 0, 
-                  total_count INTEGER DEFAULT 0, last_updated TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS daily_summary
-                 (date TEXT, summary TEXT, PRIMARY KEY (date))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS watchlist (user_id INTEGER, ticker TEXT, PRIMARY KEY (user_id, ticker))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS adaptive_weights (ticker TEXT, weight REAL DEFAULT 1.0, correct_count INTEGER DEFAULT 0, total_count INTEGER DEFAULT 0, last_updated TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS daily_summary (date TEXT, summary TEXT, PRIMARY KEY (date))''')
     conn.commit()
     conn.close()
-    init_weights()
-
-def init_weights():
-    conn = sqlite3.connect('bot_data.db')
-    c = conn.cursor()
     for ticker in ALL_TICKERS:
+        conn = sqlite3.connect('bot_data.db')
+        c = conn.cursor()
         c.execute("INSERT OR IGNORE INTO adaptive_weights (ticker, weight) VALUES (?, 1.0)", (ticker,))
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
 
 def get_adaptive_weight(ticker):
     conn = sqlite3.connect('bot_data.db')
@@ -109,9 +98,7 @@ def get_adaptive_weight(ticker):
     c.execute("SELECT weight, correct_count, total_count FROM adaptive_weights WHERE ticker = ?", (ticker,))
     row = c.fetchone()
     conn.close()
-    if row:
-        return {'weight': row[0], 'correct': row[1], 'total': row[2]}
-    return {'weight': 1.0, 'correct': 0, 'total': 0}
+    return {'weight': row[0], 'correct': row[1], 'total': row[2]} if row else {'weight': 1.0, 'correct': 0, 'total': 0}
 
 def get_watchlist(user_id):
     conn = sqlite3.connect('bot_data.db')
@@ -210,10 +197,8 @@ def get_lunar_info():
         dt = msk_tz.localize(dt)
         if abs((now - dt).days) <= 1:
             return "новолуние", dt, next_full, next_new
-    new_moons = []
-    for date_str, time_str in LUNAR_PHASES["new_moons"]:
-        dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-        new_moons.append(msk_tz.localize(dt))
+    new_moons = [datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M") for d, t in LUNAR_PHASES["new_moons"]]
+    new_moons = [msk_tz.localize(dt) for dt in new_moons]
     last_new = max([d for d in new_moons if d <= now], default=None)
     if last_new:
         days = (now - last_new).days
@@ -221,6 +206,7 @@ def get_lunar_info():
         return phase, last_new, next_full, next_new
     return "неизвестно", None, next_full, next_new
 
+# === НАСТРОЙКА ЛОГИРОВАНИЯ ===
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
@@ -237,7 +223,6 @@ keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="📈 График акции")],
         [KeyboardButton(text="⭐ Watchlist")],
         [KeyboardButton(text="📎 Экспорт в Excel")],
-        [KeyboardButton(text="📈 Сравнение с IMOEX")],
         [KeyboardButton(text="📊 Оценка риска (/risk)")],
         [KeyboardButton(text="📈 Сравнить активы (/compare)")],
         [KeyboardButton(text="🏆 Топ активов (/best)")],
@@ -255,89 +240,83 @@ class DataFetcher:
     async def get_session(self):
         if self.session is None or self.session.closed:
             connector = aiohttp.TCPConnector(limit=50, ssl=ssl.create_default_context(cafile=certifi.where()))
-            self.session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=10),
-                headers={'User-Agent': 'Mozilla/5.0'})
+            self.session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=15),
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
         return self.session
 
     async def get_price(self, ticker):
         cache_key = get_cache_key('price', ticker)
         cached = get_from_cache(cache_key)
-        if cached:
+        if cached is not None:
             return cached
         
         try:
             s = await self.get_session()
-            url = f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{ticker}.json"
+            url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}.json"
             async with s.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    md = data.get('marketdata', {}).get('data', [])
-                    if md:
-                        cols = [c.lower() for c in data['marketdata']['columns']]
-                        row = md[0]
-                        for field in ['last', 'currentprice']:
-                            if field in cols:
-                                idx = cols.index(field)
-                                if idx < len(row) and row[idx]:
+                    marketdata = data.get('marketdata', {}).get('data', [])
+                    if marketdata:
+                        cols = data.get('marketdata', {}).get('columns', [])
+                        for i, col in enumerate(cols):
+                            if col.lower() in ['last', 'currentprice', 'close']:
+                                if len(marketdata[0]) > i and marketdata[0][i]:
                                     try:
-                                        p = float(row[idx])
+                                        p = float(marketdata[0][i])
                                         if p > 0:
                                             set_to_cache(cache_key, p)
                                             return p
-                                    except: continue
-        except: pass
+                                    except:
+                                        pass
+        except:
+            pass
         return None
 
     async def fetch_candles(self, ticker, days=100):
         cache_key = get_cache_key('candles', ticker, days)
         cached = get_from_cache(cache_key)
-        if cached:
+        if cached is not None and isinstance(cached, pd.DataFrame) and len(cached) > 0:
             return cached
         
         try:
             s = await self.get_session()
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days)
             url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json"
-            params = {'from': (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d'),
-                     'till': datetime.now().strftime('%Y-%m-%d'), 'interval': 24}
+            params = {'from': start_date.strftime('%Y-%m-%d'), 'till': end_date.strftime('%Y-%m-%d'), 'interval': 24}
             async with s.get(url, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    candles = data.get('candles', {}).get('data', [])
-                    if candles and len(candles) >= 30:
-                        df = pd.DataFrame(candles, columns=['open','close','high','low','value','volume','begin','end'])
-                        df['begin'] = pd.to_datetime(df['begin'])
-                        df = df.sort_values('begin').reset_index(drop=True)
-                        df = df[['begin','close']]
-                        df.columns = ['date', 'close']
-                        set_to_cache(cache_key, df)
-                        return df
-        except: pass
-        return None
-
-    async def fetch_imoex(self, days=60):
-        cache_key = get_cache_key('imoex', days)
-        cached = get_from_cache(cache_key)
-        if cached:
-            return cached
-        
-        try:
-            s = await self.get_session()
-            url = "https://iss.moex.com/iss/engines/stock/markets/index/securities/IMOEX/candles.json"
-            params = {'from': (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d'),
-                     'till': datetime.now().strftime('%Y-%m-%d'), 'interval': 24}
-            async with s.get(url, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    candles = data.get('candles', {}).get('data', [])
-                    if candles:
-                        df = pd.DataFrame(candles, columns=['open','close','high','low','value','volume','begin','end'])
-                        df['begin'] = pd.to_datetime(df['begin'])
-                        df = df.sort_values('begin').reset_index(drop=True)
-                        df = df[['begin','close']]
-                        df.columns = ['date', 'close']
-                        set_to_cache(cache_key, df)
-                        return df
-        except: pass
+                    candles_data = data.get('candles', {})
+                    candles = candles_data.get('data', [])
+                    columns = candles_data.get('columns', [])
+                    if candles and len(candles) >= 3:
+                        col_date = None
+                        col_close = None
+                        for i, col in enumerate(columns):
+                            if col.lower() in ['begin', 'date']:
+                                col_date = i
+                            elif col.lower() in ['close', 'value']:
+                                col_close = i
+                        if col_date is not None and col_close is not None:
+                            df_data = []
+                            for candle in candles:
+                                if len(candle) > max(col_date, col_close):
+                                    try:
+                                        date_val = candle[col_date]
+                                        close_val = float(candle[col_close])
+                                        if date_val and close_val > 0:
+                                            df_data.append({'date': pd.to_datetime(date_val), 'close': close_val})
+                                    except:
+                                        pass
+                            if len(df_data) >= 5:
+                                df = pd.DataFrame(df_data)
+                                df = df.sort_values('date').reset_index(drop=True)
+                                set_to_cache(cache_key, df)
+                                return df
+        except:
+            pass
         return None
 
     async def close(self):
@@ -363,24 +342,17 @@ def calc_indicators(df):
     if df is None or len(df) < 30:
         return None
     close = df['close']
-    rsi = ta.momentum.RSIIndicator(close).rsi().iloc[-1]
+    rsi = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
     macd = ta.trend.MACD(close)
     macd_line = macd.macd().iloc[-1]
     macd_signal = macd.macd_signal().iloc[-1]
-    
     rsi_status = "перекупленность" if rsi > 70 else "перепроданность" if rsi < 30 else "нейтрально"
     macd_status = "бычий сигнал" if macd_line > macd_signal else "медвежий сигнал"
-    
-    return {
-        'rsi': round(rsi, 1),
-        'rsi_status': rsi_status,
-        'macd_status': macd_status
-    }
+    return {'rsi': round(rsi, 1), 'rsi_status': rsi_status, 'macd_status': macd_status}
 
 async def get_all_trends(force_refresh=False):
     if force_refresh:
         clear_cache()
-    
     results = {}
     for ticker in ALL_TICKERS:
         try:
@@ -393,192 +365,69 @@ async def get_all_trends(force_refresh=False):
             results[ticker] = {**TICKERS[ticker], "price": None, "trend": "ошибка", "indicators": None}
     return results
 
-def confidence_stars(p):
-    if p < 0.001: return "⭐⭐⭐"
-    if p < 0.01: return "⭐⭐"
-    if p < 0.05: return "⭐"
-    return "⚠️"
-
-# === ПРОГНОЗ ЦЕНЫ ===
+# === ПРОГНОЗ ===
 async def generate_forecast(ticker, days_ahead=7):
-    """Генерирует прогноз цены на основе линейной регрессии и технических индикаторов"""
     df = await data_fetcher.fetch_candles(ticker, 100)
     if df is None or len(df) < 30:
         return None
-    
-    # Подготовка данных для регрессии
+    from sklearn.linear_model import LinearRegression
     df['date_num'] = (df['date'] - df['date'].min()).dt.days
     X = df['date_num'].values.reshape(-1, 1)
     y = df['close'].values
-    
-    # Линейная регрессия
     model = LinearRegression()
     model.fit(X, y)
-    
-    # Прогноз на days_ahead дней
     last_date = df['date'].max()
     future_dates = [last_date + timedelta(days=i) for i in range(1, days_ahead + 1)]
     future_date_nums = [(d - df['date'].min()).days for d in future_dates]
     future_prices = model.predict(np.array(future_date_nums).reshape(-1, 1))
-    
-    # Текущие индикаторы
-    rsi = ta.momentum.RSIIndicator(df['close']).rsi().iloc[-1]
+    rsi = ta.momentum.RSIIndicator(df['close'], window=14).rsi().iloc[-1]
     macd = ta.trend.MACD(df['close'])
     macd_line = macd.macd().iloc[-1]
     macd_signal = macd.macd_signal().iloc[-1]
-    
-    # Скользящие средние
     ma18 = df['close'].rolling(18).mean().iloc[-1]
     ma50 = df['close'].rolling(50).mean().iloc[-1]
-    
-    # Интерпретация
     if rsi > 70:
-        rsi_signal = "перекупленность ⚠️ (ожидается коррекция вниз)"
+        rsi_signal = "перекупленность ⚠️ (ожидается коррекция)"
     elif rsi < 30:
         rsi_signal = "перепроданность 📈 (ожидается рост)"
     else:
         rsi_signal = "нейтрально"
-    
-    if macd_line > macd_signal:
-        macd_signal_text = "бычий 📈"
-    else:
-        macd_signal_text = "медвежий 📉"
-    
-    # Направление тренда по скользящим
-    if ma18 > ma50:
-        trend_direction = "восходящий (MA18 > MA50)"
-        trend_forecast = "скорее рост"
-    else:
-        trend_direction = "нисходящий (MA18 < MA50)"
-        trend_forecast = "скорее падение"
-    
-    # Текущая цена
+    macd_signal_text = "бычий 📈" if macd_line > macd_signal else "медвежий 📉"
+    trend_direction = "восходящий" if ma18 > ma50 else "нисходящий"
     current_price = df['close'].iloc[-1]
     forecast_pct = (future_prices[-1] - current_price) / current_price * 100
-    
     return {
-        'ticker': ticker,
-        'name': TICKERS[ticker]['name'],
-        'current_price': current_price,
-        'forecast_prices': future_prices,
-        'forecast_dates': future_dates,
-        'forecast_pct': forecast_pct,
-        'rsi': round(rsi, 1),
-        'rsi_signal': rsi_signal,
-        'macd_signal': macd_signal_text,
-        'trend_direction': trend_direction,
-        'trend_forecast': trend_forecast,
-        'ma18': round(ma18, 2) if not np.isnan(ma18) else None,
-        'ma50': round(ma50, 2) if not np.isnan(ma50) else None
+        'ticker': ticker, 'name': TICKERS[ticker]['name'],
+        'current_price': current_price, 'forecast_prices': future_prices,
+        'forecast_dates': future_dates, 'forecast_pct': forecast_pct,
+        'rsi': round(rsi, 1), 'rsi_signal': rsi_signal, 'macd_signal': macd_signal_text,
+        'trend_direction': trend_direction, 'ma18': round(ma18, 2), 'ma50': round(ma50, 2)
     }
 
-# === КОМАНДА /forecast ===
-@dp.message_handler(commands=['forecast'])
-async def cmd_forecast(message: types.Message):
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("🔮 Использование: /forecast TICKER\n\nПример: /forecast SBER\n\nПрогноз на 7 дней на основе технических индикаторов")
-        return
-    
-    ticker = parts[1].upper()
-    if ticker not in TICKERS:
-        await message.answer(f"❌ Тикер {ticker} не найден")
-        return
-    
-    msg = await message.answer(f"🔮 Генерирую прогноз для {TICKERS[ticker]['name']}... ⏳")
-    try:
-        forecast = await generate_forecast(ticker, 7)
-        if forecast is None:
-            await msg.edit_text(f"⚠️ Недостаточно данных для прогноза {TICKERS[ticker]['name']}")
-            return
-        
-        # Рисуем график с прогнозом
-        plt.figure(figsize=(12, 8))
-        
-        # Исторические данные
-        df = await data_fetcher.fetch_candles(ticker, 60)
-        plt.plot(df['date'], df['close'], 'b-', linewidth=2, label='Историческая цена')
-        
-        # Прогноз
-        forecast_dates = forecast['forecast_dates']
-        forecast_prices = forecast['forecast_prices']
-        plt.plot(forecast_dates, forecast_prices, 'r--', linewidth=2, marker='o', label='Прогноз (7 дней)')
-        
-        # Соединяем историю с прогнозом
-        last_hist_date = df['date'].iloc[-1]
-        last_hist_price = df['close'].iloc[-1]
-        plt.plot([last_hist_date, forecast_dates[0]], [last_hist_price, forecast_prices[0]], 'g--', alpha=0.5)
-        
-        plt.title(f"Прогноз цены {forecast['name']} ({ticker}) на 7 дней")
-        plt.xlabel("Дата")
-        plt.ylabel("Цена, ₽")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        
-        buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=100)
-        buf.seek(0)
-        plt.close()
-        
-        # Текстовый прогноз
-        text = f"🔮 **ПРОГНОЗ {forecast['name']} ({ticker})**\n\n"
-        text += f"💰 Текущая цена: {forecast['current_price']:.2f}₽\n"
-        text += f"📈 Прогноз через 7 дней: {forecast['forecast_prices'][-1]:.2f}₽ ({forecast['forecast_pct']:+.1f}%)\n\n"
-        text += f"📊 **Технические индикаторы:**\n"
-        text += f"   • RSI: {forecast['rsi']} ({forecast['rsi_signal']})\n"
-        text += f"   • MACD: {forecast['macd_signal']}\n"
-        text += f"   • Тренд: {forecast['trend_direction']}\n"
-        text += f"   • MA18: {forecast['ma18']}₽ | MA50: {forecast['ma50']}₽\n\n"
-        text += f"🎯 **Вероятный сценарий:** {forecast['trend_forecast']}\n"
-        text += f"\n⚠️ Прогноз основан на техническом анализе и не гарантирует результат"
-        
-        await msg.delete()
-        await message.answer_photo(photo=buf, caption=text, parse_mode='Markdown')
-    except Exception as e:
-        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
-
-# === ОЦЕНКА РИСКА ПОРТФЕЛЯ ===
-async def calculate_portfolio_risk(tickers=None, days=60):
-    if tickers is None:
-        tickers = ALL_TICKERS
-    
+# === РИСК ПОРТФЕЛЯ ===
+async def calculate_portfolio_risk(days=60):
     all_returns = []
-    for ticker in tickers:
+    for ticker in ALL_TICKERS:
         df = await data_fetcher.fetch_candles(ticker, days+10)
         if df is not None and len(df) >= days:
             returns = df['close'].pct_change().dropna()
             if len(returns) >= days - 5:
                 all_returns.append(returns)
-    
     if not all_returns:
         return None
-    
     portfolio_returns = pd.DataFrame(all_returns).T.mean(axis=1).dropna()
     cumulative = (1 + portfolio_returns).cumprod()
-    
     cummax = cumulative.cummax()
     drawdown = (cumulative - cummax) / cummax * 100
     max_drawdown = drawdown.min()
-    
     risk_free_rate = 0.16
     excess_returns = portfolio_returns - risk_free_rate / 252
-    if excess_returns.std() > 0:
-        sharpe = np.sqrt(252) * excess_returns.mean() / excess_returns.std()
-    else:
-        sharpe = 0
-    
+    sharpe = np.sqrt(252) * excess_returns.mean() / excess_returns.std() if excess_returns.std() > 0 else 0
     volatility = portfolio_returns.std() * np.sqrt(252) * 100
-    
     return {
-        'max_drawdown': max_drawdown,
-        'sharpe': sharpe,
-        'volatility': volatility,
-        'total_return': (cumulative.iloc[-1] - 1) * 100,
-        'days': len(portfolio_returns),
-        'positive_days': (portfolio_returns > 0).sum(),
-        'negative_days': (portfolio_returns < 0).sum()
+        'max_drawdown': max_drawdown, 'sharpe': sharpe, 'volatility': volatility,
+        'total_return': (cumulative.iloc[-1] - 1) * 100, 'days': len(portfolio_returns),
+        'positive_days': (portfolio_returns > 0).sum(), 'negative_days': (portfolio_returns < 0).sum()
     }
 
 # === ДОХОДНОСТЬ ЗА ПЕРИОД ===
@@ -586,7 +435,6 @@ async def get_returns_for_period(days):
     results = []
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days)
-    
     for ticker, data in TICKERS.items():
         df = await data_fetcher.fetch_candles(ticker, days+20)
         if df is not None and len(df) >= 10:
@@ -595,367 +443,45 @@ async def get_returns_for_period(days):
                 start_price = df_start['close'].iloc[0]
                 end_price = df['close'].iloc[-1]
                 return_pct = (end_price - start_price) / start_price * 100
-                results.append({
-                    'ticker': ticker,
-                    'name': data['name'],
-                    'return': return_pct
-                })
+                results.append({'ticker': ticker, 'name': data['name'], 'return': return_pct})
     return sorted(results, key=lambda x: -x['return'])
-
-# === КОМАНДА /refresh ===
-@dp.message_handler(commands=['refresh'])
-async def cmd_refresh(message: types.Message):
-    msg = await message.answer("🔄 Очищаю кэш и обновляю данные... ⏳")
-    try:
-        clear_cache()
-        trends = await get_all_trends(force_refresh=True)
-        phase, phase_date, next_full, next_new = get_lunar_info()
-        
-        text = f"✅ **Данные успешно обновлены!**\n\n"
-        text += f"🗑️ Кэш очищен\n"
-        text += f"📊 Загружены актуальные цены {len(trends)} активов\n"
-        text += f"🌙 Текущая фаза луны: {phase}\n"
-        if next_full:
-            text += f"🌕 Следующее полнолуние: {next_full.strftime('%d.%m.%Y')}\n"
-        text += f"\n💡 Используйте /forecast TICKER для прогноза"
-        
-        await msg.delete()
-        await message.answer(text, parse_mode='Markdown')
-    except Exception as e:
-        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
-
-# === КОМАНДА /risk ===
-@dp.message_handler(commands=['risk'])
-async def cmd_risk(message: types.Message):
-    msg = await message.answer("📊 Рассчитываю риск портфеля... ⏳")
-    try:
-        risk = await calculate_portfolio_risk()
-        if risk:
-            if risk['sharpe'] > 1:
-                sharpe_comment = "Отличный показатель ✅"
-            elif risk['sharpe'] > 0.5:
-                sharpe_comment = "Хороший показатель 📈"
-            elif risk['sharpe'] > 0:
-                sharpe_comment = "Умеренный показатель ⚪"
-            else:
-                sharpe_comment = "Низкий показатель ⚠️"
-            
-            text = f"📊 **ОЦЕНКА РИСКА ПОРТФЕЛЯ**\n\n"
-            text += f"{'─' * 35}\n"
-            text += f"📉 **Макс. просадка:** {risk['max_drawdown']:.2f}%\n"
-            text += f"📈 **Sharpe ratio:** {risk['sharpe']:.2f} ({sharpe_comment})\n"
-            text += f"⚡ **Волатильность:** {risk['volatility']:.2f}%\n"
-            text += f"💰 **Общая доходность:** {risk['total_return']:.2f}%\n"
-            text += f"{'─' * 35}\n"
-            text += f"📅 Период: {risk['days']} дней\n"
-            text += f"🟢 Положительных дней: {risk['positive_days']}\n"
-            text += f"🔴 Отрицательных дней: {risk['negative_days']}\n"
-            
-            await msg.delete()
-            await message.answer(text, parse_mode='Markdown')
-        else:
-            await msg.edit_text("⚠️ Недостаточно данных для расчёта риска портфеля")
-    except Exception as e:
-        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
-
-# === КОМАНДА /compare ===
-@dp.message_handler(commands=['compare'])
-async def cmd_compare(message: types.Message):
-    parts = message.text.split()
-    if len(parts) != 3:
-        await message.answer("📈 Использование: /compare TICKER1 TICKER2\n\nПример: /compare SBER VTBR")
-        return
-    
-    ticker1 = parts[1].upper()
-    ticker2 = parts[2].upper()
-    
-    if ticker1 not in TICKERS or ticker2 not in TICKERS:
-        await message.answer("❌ Один из тикеров не найден")
-        return
-    
-    msg = await message.answer(f"📈 Загружаю график сравнения...")
-    try:
-        df1 = await data_fetcher.fetch_candles(ticker1, 60)
-        df2 = await data_fetcher.fetch_candles(ticker2, 60)
-        
-        if df1 is None or df2 is None:
-            await msg.edit_text("⚠️ Недостаточно данных для построения графика")
-            return
-        
-        norm1 = df1['close'] / df1['close'].iloc[0] * 100
-        norm2 = df2['close'] / df2['close'].iloc[0] * 100
-        
-        plt.figure(figsize=(12, 6))
-        plt.plot(df1['date'], norm1, 'b-', linewidth=2, label=f"{TICKERS[ticker1]['name']} ({ticker1})")
-        plt.plot(df2['date'], norm2, 'r-', linewidth=2, label=f"{TICKERS[ticker2]['name']} ({ticker2})")
-        plt.axhline(y=100, color='gray', linestyle='--', alpha=0.5)
-        plt.title(f"Сравнение активов")
-        plt.xlabel("Дата")
-        plt.ylabel("Нормированная цена (начало = 100)")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        
-        buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=100)
-        buf.seek(0)
-        plt.close()
-        
-        ret1 = (norm1.iloc[-1] - 100)
-        ret2 = (norm2.iloc[-1] - 100)
-        emoji1 = "🟢" if ret1 > 0 else "🔴" if ret1 < 0 else "⚪"
-        emoji2 = "🟢" if ret2 > 0 else "🔴" if ret2 < 0 else "⚪"
-        
-        caption = f"📈 {TICKERS[ticker1]['name']}: {emoji1} {ret1:+.2f}%\n📈 {TICKERS[ticker2]['name']}: {emoji2} {ret2:+.2f}%\n📅 За 60 дней"
-        
-        await msg.delete()
-        await message.answer_photo(photo=buf, caption=caption)
-    except Exception as e:
-        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
-
-# === КОМАНДА /best ===
-@dp.message_handler(commands=['best'])
-async def cmd_best(message: types.Message):
-    parts = message.text.split()
-    period = 30
-    
-    if len(parts) == 2:
-        period_str = parts[1].lower()
-        if period_str == '7d':
-            period = 7
-        elif period_str == '30d':
-            period = 30
-        elif period_str == '90d':
-            period = 90
-        else:
-            await message.answer("Использование: /best [7d|30d|90d]\n\nПримеры:\n/best 7d\n/best 30d\n/best 90d")
-            return
-    
-    msg = await message.answer(f"🏆 Рассчитываю топ активов за {period} дней...")
-    try:
-        returns = await get_returns_for_period(period)
-        if not returns:
-            await msg.edit_text("⚠️ Недостаточно данных для расчёта")
-            return
-        
-        text = f"🏆 **ТОП-3 АКТИВА ПО ДОХОДНОСТИ**\n📅 Период: последние {period} дней\n\n"
-        
-        text += f"🟢 **ЛУЧШИЕ:**\n"
-        for i, r in enumerate(returns[:3], 1):
-            emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉"
-            text += f"{emoji} **{r['name']}** ({r['ticker']}): `{r['return']:+.2f}%`\n"
-        
-        text += f"\n🔴 **ХУДШИЕ:**\n"
-        for r in returns[-3:]:
-            text += f"   {r['name']} ({r['ticker']}): `{r['return']:+.2f}%`\n"
-        
-        avg_return = np.mean([r['return'] for r in returns])
-        median_return = np.median([r['return'] for r in returns])
-        
-        text += f"\n📊 **Статистика:**\n"
-        text += f"   Средняя: `{avg_return:+.2f}%`\n"
-        text += f"   Медианная: `{median_return:+.2f}%`\n"
-        text += f"   Всего активов: {len(returns)}\n"
-        
-        await msg.delete()
-        await message.answer(text, parse_mode='Markdown')
-    except Exception as e:
-        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
 
 # === ВОЛАТИЛЬНОСТЬ ===
 async def get_volatility(ticker, days=30):
-    try:
-        df = await data_fetcher.fetch_candles(ticker, days+10)
-        if df is None or len(df) < days:
-            return None
-        
-        returns = df['close'].pct_change().dropna()
-        if len(returns) < days - 5:
-            return None
-        
-        daily_vol = returns.std()
-        annual_vol = daily_vol * np.sqrt(252)
-        
-        cummax = df['close'].cummax()
-        drawdown = (df['close'] - cummax) / cummax * 100
-        max_drawdown = drawdown.min()
-        
-        return {
-            'daily_vol': daily_vol * 100,
-            'annual_vol': annual_vol * 100,
-            'max_drawdown': max_drawdown,
-            'avg_return': returns.mean() * 100,
-            'days': len(returns)
-        }
-    except Exception as e:
+    df = await data_fetcher.fetch_candles(ticker, days+10)
+    if df is None or len(df) < days:
         return None
+    returns = df['close'].pct_change().dropna()
+    if len(returns) < days - 5:
+        return None
+    daily_vol = returns.std()
+    annual_vol = daily_vol * np.sqrt(252)
+    cummax = df['close'].cummax()
+    drawdown = (df['close'] - cummax) / cummax * 100
+    max_drawdown = drawdown.min()
+    return {
+        'daily_vol': daily_vol * 100, 'annual_vol': annual_vol * 100,
+        'max_drawdown': max_drawdown, 'avg_return': returns.mean() * 100,
+        'days': len(returns)
+    }
 
-# === КОМАНДА /volatility ===
-@dp.message_handler(commands=['volatility'])
-async def cmd_volatility(message: types.Message):
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("📊 Использование: /volatility TICKER\n\nПример: /volatility SBER")
-        return
-    
-    ticker = parts[1].upper()
-    if ticker not in TICKERS:
-        await message.answer(f"❌ Тикер {ticker} не найден")
-        return
-    
-    msg = await message.answer(f"📊 Рассчитываю волатильность...")
-    try:
-        vol = await get_volatility(ticker, 30)
-        if vol:
-            text = f"📊 **ВОЛАТИЛЬНОСТЬ {TICKERS[ticker]['name']} ({ticker})**\n\n"
-            text += f"📈 Дневная: {vol['daily_vol']:.2f}%\n"
-            text += f"📈 Годовая: {vol['annual_vol']:.2f}%\n"
-            text += f"📉 Макс. просадка: {vol['max_drawdown']:.2f}%\n"
-            text += f"💰 Средняя доходность: {vol['avg_return']:.3f}%\n"
-            text += f"📅 Период: {vol['days']} дней"
-            await msg.delete()
-            await message.answer(text, parse_mode='Markdown')
-        else:
-            await msg.edit_text(f"⚠️ Недостаточно данных для расчёта волатильности")
-    except Exception as e:
-        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
+# === КОРРЕЛЯЦИЯ ===
+async def get_correlation(ticker1, ticker2, days=60):
+    df1 = await data_fetcher.fetch_candles(ticker1, days+10)
+    df2 = await data_fetcher.fetch_candles(ticker2, days+10)
+    if df1 is None or df2 is None:
+        return None
+    df1 = df1.set_index('date')['close']
+    df2 = df2.set_index('date')['close']
+    combined = pd.DataFrame({'ticker1': df1, 'ticker2': df2}).dropna()
+    if len(combined) < 30:
+        return None
+    returns1 = combined['ticker1'].pct_change().dropna()
+    returns2 = combined['ticker2'].pct_change().dropna()
+    correlation = returns1.corr(returns2)
+    return {'correlation': correlation, 'days': len(combined), 'price1': combined['ticker1'].iloc[-1], 'price2': combined['ticker2'].iloc[-1]}
 
-# === КОМАНДА /correlation ===
-@dp.message_handler(commands=['correlation'])
-async def cmd_correlation(message: types.Message):
-    parts = message.text.split()
-    if len(parts) != 3:
-        await message.answer("📈 Использование: /correlation TICKER1 TICKER2\n\nПример: /correlation SBER VTBR")
-        return
-    
-    ticker1 = parts[1].upper()
-    ticker2 = parts[2].upper()
-    
-    if ticker1 not in TICKERS or ticker2 not in TICKERS:
-        await message.answer("❌ Один из тикеров не найден")
-        return
-    
-    msg = await message.answer(f"📈 Рассчитываю корреляцию...")
-    try:
-        df1 = await data_fetcher.fetch_candles(ticker1, 60)
-        df2 = await data_fetcher.fetch_candles(ticker2, 60)
-        
-        if df1 is None or df2 is None:
-            await msg.edit_text("⚠️ Недостаточно данных")
-            return
-        
-        df1 = df1.set_index('date')['close']
-        df2 = df2.set_index('date')['close']
-        combined = pd.DataFrame({'ticker1': df1, 'ticker2': df2}).dropna()
-        
-        if len(combined) < 30:
-            await msg.edit_text("⚠️ Недостаточно данных")
-            return
-        
-        returns1 = combined['ticker1'].pct_change().dropna()
-        returns2 = combined['ticker2'].pct_change().dropna()
-        correlation = returns1.corr(returns2)
-        
-        if correlation > 0.7:
-            interpretation = "сильная положительная ✅"
-        elif correlation > 0.3:
-            interpretation = "умеренная положительная 📈"
-        elif correlation > -0.3:
-            interpretation = "слабая / отсутствует ⚪"
-        elif correlation > -0.7:
-            interpretation = "умеренная отрицательная 📉"
-        else:
-            interpretation = "сильная отрицательная 🔄"
-        
-        text = f"📈 **КОРРЕЛЯЦИЯ**\n\n"
-        text += f"{TICKERS[ticker1]['name']} vs {TICKERS[ticker2]['name']}\n\n"
-        text += f"🎯 Коэффициент: {correlation:.3f}\n"
-        text += f"📖 {interpretation}\n"
-        text += f"📅 Период: {len(combined)} дней"
-        
-        await msg.delete()
-        await message.answer(text, parse_mode='Markdown')
-    except Exception as e:
-        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
-
-# === КОМАНДА /export ===
-@dp.message_handler(commands=['export'])
-async def cmd_export(message: types.Message):
-    msg = await message.answer("📎 Формирую Excel-файл...")
-    try:
-        trends = await get_all_trends()
-        data = []
-        for ticker, info in trends.items():
-            adaptive = get_adaptive_weight(ticker)
-            row = {
-                'Тикер': ticker,
-                'Название': info['name'],
-                'Цена': info['price'],
-                'Тренд': info['trend'],
-                'Успех LONG %': info['success_bull'],
-                'Доходность LONG %': info['return_bull'],
-                'Успех SHORT %': info['success_bear'],
-                'Доходность SHORT %': info['return_bear'],
-                'Адаптивный вес': adaptive['weight']
-            }
-            if info['indicators']:
-                row['RSI'] = info['indicators']['rsi']
-            data.append(row)
-        
-        df = pd.DataFrame(data)
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name='Активы', index=False)
-        
-        output.seek(0)
-        await msg.delete()
-        await message.answer_document(
-            types.InputFile(output, filename=f'moon_bot_report_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx'),
-            caption="📎 Полная статистика по всем активам"
-        )
-    except Exception as e:
-        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
-
-# === КОМАНДА /all ===
-@dp.message_handler(commands=['all'])
-async def cmd_all(message: types.Message):
-    msg = await message.answer("📋 Собираю данные... ⏳")
-    try:
-        trends = await get_all_trends()
-        text = f"📋 **ВСЕ АКТИВЫ**\n\n"
-        
-        text += f"🟢 **LONG (покупка):**\n"
-        long_count = 0
-        for ticker, data in trends.items():
-            if data['trend'] == "бычий":
-                adaptive = get_adaptive_weight(ticker)
-                text += f"   ✅ {data['name']}: +{data['return_bull']:.2f}% | вес {adaptive['weight']:.2f}\n"
-                long_count += 1
-        if long_count == 0:
-            text += f"   ⚠️ Нет активов в LONG\n"
-        
-        text += f"\n🔴 **SHORT (продажа):**\n"
-        short_count = 0
-        for ticker, data in trends.items():
-            if data['trend'] == "медвежий":
-                adaptive = get_adaptive_weight(ticker)
-                text += f"   ❌ {data['name']}: +{data['return_bear']:.2f}% | вес {adaptive['weight']:.2f}\n"
-                short_count += 1
-        if short_count == 0:
-            text += f"   ⚠️ Нет активов в SHORT\n"
-        
-        text += f"\n⚪ **БОКОВИК:**\n"
-        for ticker, data in trends.items():
-            if data['trend'] == "боковик":
-                text += f"   ⚪ {data['name']}\n"
-        
-        await msg.delete()
-        await message.answer(text, parse_mode='Markdown')
-    except Exception as e:
-        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
-
-# === КОМАНДА /start ===
+# === КОМАНДЫ ===
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     await message.answer(
@@ -975,39 +501,290 @@ async def cmd_start(message: types.Message):
         f"   📊 /volatility TICKER — волатильность\n"
         f"   📈 /correlation T1 T2 — корреляция\n"
         f"   🔄 /refresh — обновить данные\n\n"
-        f"🔹 **WEB-ИНТЕРФЕЙС:**\n"
-        f"   🌐 https://moon-bot-55tl.onrender.com/dashboard\n\n"
+        f"🌐 Web-дашборд: https://moon-bot-55tl.onrender.com/dashboard\n\n"
         f"📖 По методике: полнолуние → точка входа\n"
-        f"💡 Бот учится на ошибках и корректирует веса!",
-        reply_markup=keyboard,
-        parse_mode='Markdown'
-    )
+        f"💡 Бот учится на ошибках!",
+        reply_markup=keyboard, parse_mode='Markdown')
 
-# === ОБРАБОТЧИКИ КНОПОК ===
+@dp.message_handler(commands=['refresh'])
+async def cmd_refresh(message: types.Message):
+    msg = await message.answer("🔄 Очищаю кэш и обновляю данные...")
+    clear_cache()
+    await get_all_trends(force_refresh=True)
+    phase, phase_date, next_full, _ = get_lunar_info()
+    text = f"✅ **Данные обновлены!**\n\n🗑️ Кэш очищен\n🌙 Текущая фаза: {phase}\n"
+    if next_full:
+        text += f"🌕 Следующее полнолуние: {next_full.strftime('%d.%m.%Y')}\n"
+    text += f"\n💡 Используйте /forecast TICKER для прогноза"
+    await msg.delete()
+    await message.answer(text, parse_mode='Markdown')
+
+@dp.message_handler(commands=['forecast'])
+async def cmd_forecast(message: types.Message):
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("🔮 Использование: /forecast TICKER\nПример: /forecast SBER")
+        return
+    ticker = parts[1].upper()
+    if ticker not in TICKERS:
+        await message.answer(f"❌ Тикер {ticker} не найден")
+        return
+    msg = await message.answer(f"🔮 Генерирую прогноз для {TICKERS[ticker]['name']}...")
+    try:
+        forecast = await generate_forecast(ticker, 7)
+        if forecast is None:
+            await msg.edit_text(f"⚠️ Недостаточно данных для прогноза")
+            return
+        plt.figure(figsize=(12, 6))
+        df = await data_fetcher.fetch_candles(ticker, 60)
+        if df is not None:
+            plt.plot(df['date'], df['close'], 'b-', linewidth=2, label='История')
+        plt.plot(forecast['forecast_dates'], forecast['forecast_prices'], 'r--', linewidth=2, marker='o', label='Прогноз 7 дней')
+        plt.title(f"Прогноз {forecast['name']} ({ticker})")
+        plt.xlabel("Дата")
+        plt.ylabel("Цена, ₽")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        buf = BytesIO()
+        plt.savefig(buf, format='png', dpi=100)
+        buf.seek(0)
+        plt.close()
+        text = f"🔮 **ПРОГНОЗ {forecast['name']} ({ticker})**\n\n"
+        text += f"💰 Текущая цена: {forecast['current_price']:.2f}₽\n"
+        text += f"📈 Прогноз через 7 дней: {forecast['forecast_prices'][-1]:.2f}₽ ({forecast['forecast_pct']:+.1f}%)\n\n"
+        text += f"📊 **Индикаторы:**\n"
+        text += f"   • RSI: {forecast['rsi']} ({forecast['rsi_signal']})\n"
+        text += f"   • MACD: {forecast['macd_signal']}\n"
+        text += f"   • Тренд: {forecast['trend_direction']}\n"
+        text += f"   • MA18: {forecast['ma18']}₽ | MA50: {forecast['ma50']}₽"
+        await msg.delete()
+        await message.answer_photo(photo=buf, caption=text, parse_mode='Markdown')
+    except Exception as e:
+        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
+
+@dp.message_handler(commands=['risk'])
+async def cmd_risk(message: types.Message):
+    msg = await message.answer("📊 Рассчитываю риск портфеля...")
+    risk = await calculate_portfolio_risk()
+    if risk:
+        sharpe_comment = "Отличный ✅" if risk['sharpe'] > 1 else "Хороший 📈" if risk['sharpe'] > 0.5 else "Умеренный ⚪" if risk['sharpe'] > 0 else "Низкий ⚠️"
+        text = f"📊 **ОЦЕНКА РИСКА**\n\n📉 Просадка: {risk['max_drawdown']:.2f}%\n📈 Sharpe: {risk['sharpe']:.2f} ({sharpe_comment})\n⚡ Волатильность: {risk['volatility']:.2f}%\n💰 Доходность: {risk['total_return']:.2f}%\n📅 Период: {risk['days']} дн.\n🟢 {risk['positive_days']} | 🔴 {risk['negative_days']}"
+        await msg.delete()
+        await message.answer(text, parse_mode='Markdown')
+    else:
+        await msg.edit_text("⚠️ Недостаточно данных")
+
+@dp.message_handler(commands=['compare'])
+async def cmd_compare(message: types.Message):
+    parts = message.text.split()
+    if len(parts) != 3:
+        await message.answer("📈 Использование: /compare TICKER1 TICKER2\nПример: /compare SBER VTBR")
+        return
+    ticker1, ticker2 = parts[1].upper(), parts[2].upper()
+    if ticker1 not in TICKERS or ticker2 not in TICKERS:
+        await message.answer("❌ Тикер не найден")
+        return
+    msg = await message.answer("📈 Загружаю график...")
+    df1 = await data_fetcher.fetch_candles(ticker1, 60)
+    df2 = await data_fetcher.fetch_candles(ticker2, 60)
+    if df1 is None or df2 is None:
+        await msg.edit_text("⚠️ Недостаточно данных")
+        return
+    norm1 = df1['close'] / df1['close'].iloc[0] * 100
+    norm2 = df2['close'] / df2['close'].iloc[0] * 100
+    plt.figure(figsize=(12, 6))
+    plt.plot(df1['date'], norm1, 'b-', linewidth=2, label=f"{TICKERS[ticker1]['name']}")
+    plt.plot(df2['date'], norm2, 'r-', linewidth=2, label=f"{TICKERS[ticker2]['name']}")
+    plt.axhline(y=100, color='gray', linestyle='--')
+    plt.title("Сравнение активов")
+    plt.xlabel("Дата")
+    plt.ylabel("Нормированная цена (100)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    buf = BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    plt.close()
+    ret1 = norm1.iloc[-1] - 100
+    ret2 = norm2.iloc[-1] - 100
+    caption = f"📈 {TICKERS[ticker1]['name']}: {'🟢' if ret1>0 else '🔴'} {ret1:+.2f}%\n📈 {TICKERS[ticker2]['name']}: {'🟢' if ret2>0 else '🔴'} {ret2:+.2f}%"
+    await msg.delete()
+    await message.answer_photo(photo=buf, caption=caption)
+
+@dp.message_handler(commands=['best'])
+async def cmd_best(message: types.Message):
+    parts = message.text.split()
+    period = 30
+    if len(parts) == 2:
+        p = parts[1].lower()
+        if p == '7d': period = 7
+        elif p == '30d': period = 30
+        elif p == '90d': period = 90
+        else:
+            await message.answer("Использование: /best [7d|30d|90d]")
+            return
+    msg = await message.answer(f"🏆 Топ активов за {period} дней...")
+    returns = await get_returns_for_period(period)
+    if not returns:
+        await msg.edit_text("⚠️ Недостаточно данных")
+        return
+    text = f"🏆 **ТОП-3 за {period} дней**\n\n🟢 **ЛУЧШИЕ:**\n"
+    for i, r in enumerate(returns[:3], 1):
+        emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉"
+        text += f"{emoji} {r['name']}: `{r['return']:+.2f}%`\n"
+    text += f"\n🔴 **ХУДШИЕ:**\n"
+    for r in returns[-3:]:
+        text += f"   {r['name']}: `{r['return']:+.2f}%`\n"
+    avg_ret = np.mean([r['return'] for r in returns])
+    text += f"\n📊 Средняя: `{avg_ret:+.2f}%`"
+    await msg.delete()
+    await message.answer(text, parse_mode='Markdown')
+
+@dp.message_handler(commands=['volatility'])
+async def cmd_volatility(message: types.Message):
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("📊 Использование: /volatility TICKER\nПример: /volatility SBER")
+        return
+    ticker = parts[1].upper()
+    if ticker not in TICKERS:
+        await message.answer("❌ Тикер не найден")
+        return
+    msg = await message.answer(f"📊 Волатильность {TICKERS[ticker]['name']}...")
+    vol = await get_volatility(ticker, 30)
+    if vol:
+        text = f"📊 **Волатильность {TICKERS[ticker]['name']}**\n\n📈 Дневная: {vol['daily_vol']:.2f}%\n📈 Годовая: {vol['annual_vol']:.2f}%\n📉 Просадка: {vol['max_drawdown']:.2f}%\n💰 Доходность: {vol['avg_return']:.3f}%/день"
+        await msg.delete()
+        await message.answer(text, parse_mode='Markdown')
+    else:
+        await msg.edit_text("⚠️ Недостаточно данных")
+
+@dp.message_handler(commands=['correlation'])
+async def cmd_correlation(message: types.Message):
+    parts = message.text.split()
+    if len(parts) != 3:
+        await message.answer("📈 Использование: /correlation T1 T2\nПример: /correlation SBER VTBR")
+        return
+    t1, t2 = parts[1].upper(), parts[2].upper()
+    if t1 not in TICKERS or t2 not in TICKERS:
+        await message.answer("❌ Тикер не найден")
+        return
+    msg = await message.answer("📈 Расчёт корреляции...")
+    corr = await get_correlation(t1, t2, 60)
+    if corr:
+        if corr['correlation'] > 0.7: interp = "сильная положительная ✅"
+        elif corr['correlation'] > 0.3: interp = "умеренная положительная 📈"
+        elif corr['correlation'] > -0.3: interp = "слабая ⚪"
+        elif corr['correlation'] > -0.7: interp = "умеренная отрицательная 📉"
+        else: interp = "сильная отрицательная 🔄"
+        text = f"📈 **Корреляция**\n\n{TICKERS[t1]['name']} vs {TICKERS[t2]['name']}\n\n🎯 Коэффициент: {corr['correlation']:.3f}\n📖 {interp}\n📅 Период: {corr['days']} дн."
+        await msg.delete()
+        await message.answer(text, parse_mode='Markdown')
+    else:
+        await msg.edit_text("⚠️ Недостаточно данных")
+
+@dp.message_handler(commands=['all'])
+async def cmd_all(message: types.Message):
+    msg = await message.answer("📋 Собираю данные...")
+    trends = await get_all_trends()
+    text = f"📋 **ВСЕ АКТИВЫ**\n\n"
+    long_list = [(t, d) for t, d in trends.items() if d['trend'] == "бычий"]
+    short_list = [(t, d) for t, d in trends.items() if d['trend'] == "медвежий"]
+    side_list = [(t, d) for t, d in trends.items() if d['trend'] == "боковик"]
+    text += f"🟢 **LONG ({len(long_list)}):**\n"
+    for t, d in long_list[:5]:
+        text += f"   ✅ {d['name']}: +{d['return_bull']:.2f}%\n"
+    if not long_list: text += "   ⚠️ Нет\n"
+    text += f"\n🔴 **SHORT ({len(short_list)}):**\n"
+    for t, d in short_list[:5]:
+        text += f"   ❌ {d['name']}: +{d['return_bear']:.2f}%\n"
+    if not short_list: text += "   ⚠️ Нет\n"
+    text += f"\n⚪ **БОКОВИК ({len(side_list)}):**\n"
+    for t, d in side_list[:5]:
+        text += f"   ⚪ {d['name']}\n"
+    await msg.delete()
+    await message.answer(text, parse_mode='Markdown')
+
+@dp.message_handler(commands=['export'])
+async def cmd_export(message: types.Message):
+    msg = await message.answer("📎 Формирую Excel...")
+    trends = await get_all_trends()
+    data = []
+    for ticker, info in trends.items():
+        adaptive = get_adaptive_weight(ticker)
+        data.append({
+            'Тикер': ticker, 'Название': info['name'], 'Цена': info['price'],
+            'Тренд': info['trend'], 'LONG %': info['return_bull'], 'LONG успех %': info['success_bull'],
+            'SHORT %': info['return_bear'], 'SHORT успех %': info['success_bear'], 'Вес': adaptive['weight']
+        })
+    df = pd.DataFrame(data)
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='Активы', index=False)
+    output.seek(0)
+    await msg.delete()
+    await message.answer_document(types.InputFile(output, filename=f'moon_bot_report_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx'), caption="📎 Статистика")
+
+@dp.message_handler(commands=['watchlist'])
+async def cmd_watchlist(message: types.Message):
+    wl = get_watchlist(message.from_user.id)
+    if not wl:
+        await message.answer("⭐ Watchlist пуст\n/add TICKER — добавить\n/remove TICKER — удалить\n/clear_watchlist — очистить")
+        return
+    text = f"⭐ **Watchlist**\n"
+    for t in wl:
+        text += f"• {TICKERS[t]['name']} ({t})\n"
+    await message.answer(text, parse_mode='Markdown')
+
+@dp.message_handler(commands=['add'])
+async def cmd_add(message: types.Message):
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /add TICKER\nПример: /add SBER")
+        return
+    ticker = parts[1].upper()
+    if ticker not in TICKERS:
+        await message.answer("❌ Тикер не найден")
+        return
+    if add_to_watchlist(message.from_user.id, ticker):
+        await message.answer(f"✅ {TICKERS[ticker]['name']} добавлен")
+    else:
+        await message.answer(f"⚠️ Уже в списке")
+
+@dp.message_handler(commands=['remove'])
+async def cmd_remove(message: types.Message):
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /remove TICKER")
+        return
+    ticker = parts[1].upper()
+    remove_from_watchlist(message.from_user.id, ticker)
+    await message.answer(f"🗑️ {ticker} удалён")
+
+@dp.message_handler(commands=['clear_watchlist'])
+async def cmd_clear_watchlist(message: types.Message):
+    clear_watchlist(message.from_user.id)
+    await message.answer("🗑️ Watchlist очищен")
+
 @dp.message_handler(lambda message: message.text == "🌙 Фазы Луны")
 async def lunar_phases_cmd(message: types.Message):
     phase, phase_date, next_full, next_new = get_lunar_info()
-    msk_tz = pytz.timezone('Europe/Moscow')
-    now = datetime.now(msk_tz)
-    text = f"🌙 **ЛУННЫЙ КАЛЕНДАРЬ**\n\n📅 Сегодня: {now.strftime('%d.%m.%Y')}\n"
-    if phase == "полнолуние":
-        text += f"🌕 Фаза: ПОЛНОЛУНИЕ (активный сигнал!)\n"
-    elif phase == "полнолуние_завтра":
-        text += f"🌕 Фаза: ПОЛНОЛУНИЕ ЗАВТРА (готовьтесь!)\n"
-    else:
-        text += f"🌙 Фаза: {phase.upper()}\n"
+    now = datetime.now(pytz.timezone('Europe/Moscow'))
+    text = f"🌙 **ЛУННЫЙ КАЛЕНДАРЬ**\n\n📅 Сегодня: {now.strftime('%d.%m.%Y')}\n🌙 Фаза: {phase.upper()}\n"
     if phase_date:
         text += f"📆 Дата фазы: {phase_date.strftime('%d.%m.%Y %H:%M')}\n"
-    text += f"\n🎯 **Ближайшие события:**\n"
-    if next_full:
-        text += f"🌕 Полнолуние: {next_full.strftime('%d.%m.%Y %H:%M')}\n"
-    if next_new:
-        text += f"🌑 Новолуние: {next_new.strftime('%d.%m.%Y %H:%M')}\n"
+    text += f"\n🎯 **События:**\n"
+    if next_full: text += f"🌕 Полнолуние: {next_full.strftime('%d.%m.%Y %H:%M')}\n"
+    if next_new: text += f"🌑 Новолуние: {next_new.strftime('%d.%m.%Y %H:%M')}"
     await message.answer(text, parse_mode='Markdown')
 
 @dp.message_handler(lambda message: message.text == "📊 Историческая статистика")
 async def stats_cmd(message: types.Message):
-    text = f"📊 **ИСТОРИЧЕСКАЯ СТАТИСТИКА** (2024-2026)\n\n"
+    text = f"📊 **ИСТОРИЧЕСКАЯ СТАТИСТИКА**\n\n"
     sorted_by_return = sorted(TICKERS.items(), key=lambda x: -x[1]['return_bull'])
     for i, (ticker, data) in enumerate(sorted_by_return[:10], 1):
         text += f"{i}. {data['name']}: +{data['return_bull']:.2f}% (успех {data['success_bull']:.0f}%)\n"
@@ -1015,28 +792,24 @@ async def stats_cmd(message: types.Message):
 
 @dp.message_handler(lambda message: message.text == "📈 Открыть позицию")
 async def open_position_cmd(message: types.Message):
-    msg = await message.answer("📈 Анализирую рынок... ⏳")
-    try:
-        phase, phase_date, next_full, next_new = get_lunar_info()
+    phase, phase_date, next_full, _ = get_lunar_info()
+    now = datetime.now(pytz.timezone('Europe/Moscow'))
+    text = f"🎯 **РЕКОМЕНДАЦИИ**\n\n"
+    if phase == "полнолуние":
+        text += f"🌕 СЕГОДНЯ ПОЛНОЛУНИЕ — ТОЧКА ВХОДА!\n"
         trends = await get_all_trends()
-        text = f"🎯 **РЕКОМЕНДАЦИИ**\n\n"
-        if phase == "полнолуние":
-            text += f"🌕 СЕГОДНЯ ПОЛНОЛУНИЕ — ТОЧКА ВХОДА!\n\n"
-            for ticker, data in trends.items():
-                if data['trend'] == "бычий":
-                    text += f"✅ {data['name']}: ПОКУПКА\n"
-                elif data['trend'] == "медвежий":
-                    text += f"❌ {data['name']}: ПРОДАЖА\n"
-        else:
-            text += f"⏸ Активный сигнал отсутствует\n"
-            if next_full:
-                days = (next_full - datetime.now(pytz.timezone('Europe/Moscow'))).days
-                text += f"⏳ Следующая точка входа: {next_full.strftime('%d.%m.%Y')} (через {days} дн.)\n"
-        text += f"\n⚠️ СТОП-ЛОСС ОБЯЗАТЕЛЕН!"
-        await msg.delete()
-        await message.answer(text, parse_mode='Markdown')
-    except Exception as e:
-        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
+        for ticker, data in trends.items():
+            if data['trend'] == "бычий":
+                text += f"✅ {data['name']}: ПОКУПКА\n"
+            elif data['trend'] == "медвежий":
+                text += f"❌ {data['name']}: ПРОДАЖА\n"
+    else:
+        text += f"⏸ Активный сигнал отсутствует\n"
+        if next_full:
+            days = (next_full - now).days
+            text += f"⏳ Следующая точка входа: {next_full.strftime('%d.%m.%Y')} (через {days} дн.)\n"
+    text += f"\n⚠️ СТОП-ЛОСС ОБЯЗАТЕЛЕН!"
+    await message.answer(text, parse_mode='Markdown')
 
 @dp.message_handler(lambda message: message.text == "📋 Все активы (/all)")
 async def all_button_handler(message: types.Message):
@@ -1044,56 +817,11 @@ async def all_button_handler(message: types.Message):
 
 @dp.message_handler(lambda message: message.text == "⭐ Watchlist")
 async def watchlist_button_handler(message: types.Message):
-    user_id = message.from_user.id
-    watchlist = get_watchlist(user_id)
-    if not watchlist:
-        await message.answer("⭐ Ваш watchlist пуст.\n\nДобавить: /add TICKER\nПример: /add SBER")
-        return
-    
-    text = f"⭐ **ВОШЛИСТ** ({len(watchlist)} акций):\n\n"
-    for ticker in watchlist:
-        name = TICKERS.get(ticker, {}).get('name', ticker)
-        text += f"• {name} ({ticker})\n"
-    text += f"\n💡 Команды: /add, /remove, /clear_watchlist"
-    await message.answer(text, parse_mode='Markdown')
-
-@dp.message_handler(commands=['add'])
-async def add_to_watchlist_cmd(message: types.Message):
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("Использование: /add TICKER\nПример: /add SBER")
-        return
-    ticker = parts[1].upper()
-    if ticker not in TICKERS:
-        await message.answer(f"❌ Тикер {ticker} не найден")
-        return
-    if add_to_watchlist(message.from_user.id, ticker):
-        await message.answer(f"✅ {TICKERS[ticker]['name']} ({ticker}) добавлен в watchlist")
-    else:
-        await message.answer(f"⚠️ {ticker} уже в watchlist")
-
-@dp.message_handler(commands=['remove'])
-async def remove_from_watchlist_cmd(message: types.Message):
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("Использование: /remove TICKER\nПример: /remove SBER")
-        return
-    ticker = parts[1].upper()
-    remove_from_watchlist(message.from_user.id, ticker)
-    await message.answer(f"🗑️ {ticker} удалён из watchlist")
-
-@dp.message_handler(commands=['clear_watchlist'])
-async def clear_watchlist_cmd(message: types.Message):
-    clear_watchlist(message.from_user.id)
-    await message.answer("🗑️ Watchlist полностью очищен")
+    await cmd_watchlist(message)
 
 @dp.message_handler(lambda message: message.text == "📎 Экспорт в Excel")
 async def export_button_handler(message: types.Message):
     await cmd_export(message)
-
-@dp.message_handler(lambda message: message.text == "📈 Сравнение с IMOEX")
-async def imoex_button_handler(message: types.Message):
-    await message.answer("📈 Используйте /compare для сравнения активов или /risk для оценки портфеля")
 
 @dp.message_handler(lambda message: message.text == "📊 Оценка риска (/risk)")
 async def risk_button_handler(message: types.Message):
@@ -1101,11 +829,11 @@ async def risk_button_handler(message: types.Message):
 
 @dp.message_handler(lambda message: message.text == "📈 Сравнить активы (/compare)")
 async def compare_button_handler(message: types.Message):
-    await message.answer("📈 Используйте: /compare SBER VTBR")
+    await message.answer("📈 /compare SBER VTBR")
 
 @dp.message_handler(lambda message: message.text == "🏆 Топ активов (/best)")
 async def best_button_handler(message: types.Message):
-    await message.answer("🏆 Используйте: /best 30d (7d, 30d, 90d)")
+    await message.answer("🏆 /best 30d (7d, 30d, 90d)")
 
 @dp.message_handler(lambda message: message.text == "🔄 Обновить данные (/refresh)")
 async def refresh_button_handler(message: types.Message):
@@ -1113,93 +841,69 @@ async def refresh_button_handler(message: types.Message):
 
 @dp.message_handler(lambda message: message.text == "🔮 Прогноз (/forecast)")
 async def forecast_button_handler(message: types.Message):
-    await message.answer("🔮 Используйте: /forecast SBER\n\nПрогноз на 7 дней на основе RSI, MACD и линейной регрессии")
+    await message.answer("🔮 /forecast SBER")
 
 @dp.message_handler(lambda message: message.text == "📈 График акции")
 async def ask_ticker_for_chart(message: types.Message):
-    await message.answer("📊 Введите тикер (например, SBER, VTBR, GAZP)")
+    await message.answer("📊 Введите тикер (SBER, VTBR, GAZP...)")
 
 @dp.message_handler(lambda message: message.text.upper() in ALL_TICKERS)
 async def send_chart(message: types.Message):
     ticker = message.text.upper()
-    msg = await message.answer(f"📈 Загружаю график для {TICKERS[ticker]['name']}...")
-    try:
-        df = await data_fetcher.fetch_candles(ticker, 100)
-        if df is None or len(df) < 10:
-            await msg.edit_text(f"⚠️ Недостаточно данных")
-            return
-        
-        plt.figure(figsize=(12, 6))
-        plt.plot(df['date'], df['close'], 'b-', linewidth=2, label='Цена')
-        if len(df) >= 18:
-            ma18 = df['close'].rolling(18).mean()
-            plt.plot(df['date'], ma18, 'g--', linewidth=1.5, label='MA 18')
-        if len(df) >= 50:
-            ma50 = df['close'].rolling(50).mean()
-            plt.plot(df['date'], ma50, 'r--', linewidth=1.5, label='MA 50')
-        plt.title(f"{TICKERS[ticker]['name']} ({ticker})")
-        plt.xlabel("Дата")
-        plt.ylabel("Цена, ₽")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        
-        buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=100)
-        buf.seek(0)
-        plt.close()
-        
-        indicators = calc_indicators(df)
-        caption = f"📈 {TICKERS[ticker]['name']} ({ticker})"
-        if indicators:
-            caption += f"\nRSI: {indicators['rsi']} ({indicators['rsi_status']}) | MACD: {indicators['macd_status']}"
-        
-        await msg.delete()
-        await message.answer_photo(photo=buf, caption=caption)
-    except Exception as e:
-        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
+    msg = await message.answer(f"📈 График {TICKERS[ticker]['name']}...")
+    df = await data_fetcher.fetch_candles(ticker, 100)
+    if df is None:
+        await msg.edit_text("⚠️ Нет данных")
+        return
+    plt.figure(figsize=(12, 6))
+    plt.plot(df['date'], df['close'], 'b-', linewidth=2, label='Цена')
+    if len(df) >= 18:
+        ma18 = df['close'].rolling(18).mean()
+        plt.plot(df['date'], ma18, 'g--', linewidth=1.5, label='MA18')
+    if len(df) >= 50:
+        ma50 = df['close'].rolling(50).mean()
+        plt.plot(df['date'], ma50, 'r--', linewidth=1.5, label='MA50')
+    plt.title(f"{TICKERS[ticker]['name']} ({ticker})")
+    plt.xlabel("Дата")
+    plt.ylabel("Цена, ₽")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=100)
+    buf.seek(0)
+    plt.close()
+    indicators = calc_indicators(df)
+    caption = f"📈 {TICKERS[ticker]['name']} ({ticker})"
+    if indicators:
+        caption += f"\nRSI: {indicators['rsi']} ({indicators['rsi_status']}) | MACD: {indicators['macd_status']}"
+    await msg.delete()
+    await message.answer_photo(photo=buf, caption=caption)
 
-# === ЕЖЕДНЕВНАЯ СВОДКА В КАНАЛ ===
+# === ЕЖЕДНЕВНАЯ СВОДКА ===
 async def send_daily_summary():
     if not CHANNEL_ID:
         return
-    
     msk_tz = pytz.timezone('Europe/Moscow')
     today = datetime.now(msk_tz).strftime('%Y-%m-%d')
-    last_date = get_last_summary_date()
-    if last_date == today:
+    if get_last_summary_date() == today:
         return
-    
+    phase, phase_date, next_full, _ = get_lunar_info()
+    trends = await get_all_trends()
+    text = f"🌙 **ЕЖЕДНЕВНАЯ СВОДКА**\n📅 {datetime.now(msk_tz).strftime('%d.%m.%Y')}\n\n"
+    if next_full:
+        days_left = (next_full - datetime.now(msk_tz)).days
+        text += f"🌕 Полнолуние через {days_left} дн. ({next_full.strftime('%d.%m.%Y')})\n\n"
+    long_list = [d for d in trends.values() if d['trend'] == "бычий"]
+    short_list = [d for d in trends.values() if d['trend'] == "медвежий"]
+    text += f"🟢 LONG: {len(long_list)} | 🔴 SHORT: {len(short_list)}\n\n"
+    text += f"💡 /forecast, /risk, /best"
+    save_daily_summary(today, text)
     try:
-        phase, phase_date, next_full, next_new = get_lunar_info()
-        trends = await get_all_trends()
-        
-        text = f"🌙 **ЕЖЕДНЕВНАЯ СВОДКА**\n📅 {datetime.now(msk_tz).strftime('%d.%m.%Y')}\n\n"
-        
-        if phase == "полнолуние":
-            text += f"🌕 **СЕГОДНЯ ПОЛНОЛУНИЕ — ТОЧКА ВХОДА!**\n\n"
-        elif next_full:
-            days_left = (next_full - datetime.now(msk_tz)).days
-            text += f"🌙 Следующее полнолуние: **{next_full.strftime('%d.%m.%Y')}** (через {days_left} дн.)\n\n"
-        
-        text += f"🟢 **ТОП-3 LONG:**\n"
-        long_assets = [(t, d) for t, d in trends.items() if d['trend'] == "бычий"]
-        for ticker, data in long_assets[:3]:
-            text += f"   ✅ {data['name']}: успех {data['success_bull']:.0f}%\n"
-        
-        text += f"\n🔴 **ТОП-3 SHORT:**\n"
-        short_assets = [(t, d) for t, d in trends.items() if d['trend'] == "медвежий"]
-        for ticker, data in short_assets[:3]:
-            text += f"   ❌ {data['name']}: успех {data['success_bear']:.0f}%\n"
-        
-        text += f"\n💡 **Команды:** /forecast, /risk, /best, /compare\n🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard"
-        
-        save_daily_summary(today, text)
         await bot.send_message(CHANNEL_ID, text, parse_mode='Markdown')
-        print(f"✅ Ежедневная сводка отправлена в канал")
-    except Exception as e:
-        print(f"Error sending summary: {e}")
+    except:
+        pass
 
 async def daily_summary_task():
     while True:
@@ -1209,202 +913,99 @@ async def daily_summary_task():
             if now.hour == 10 and now.minute < 5:
                 await send_daily_summary()
             await asyncio.sleep(60)
-        except Exception as e:
-            print(f"Error in daily_summary: {e}")
+        except:
             await asyncio.sleep(60)
 
-# === АВТО-УВЕДОМЛЕНИЯ ===
+# === УВЕДОМЛЕНИЯ ===
 async def check_full_moon_notification():
     msk_tz = pytz.timezone('Europe/Moscow')
     now = datetime.now(msk_tz)
     if not hasattr(check_full_moon_notification, 'last_notify'):
         check_full_moon_notification.last_notify = {}
-    phase, phase_date, next_full, next_new = get_lunar_info()
+    phase, phase_date, next_full, _ = get_lunar_info()
     if next_full:
         one_day_before = next_full - timedelta(days=1)
         if one_day_before.date() == now.date():
             key = f"before_{next_full.date()}"
             if check_full_moon_notification.last_notify.get(key) != now.date():
                 check_full_moon_notification.last_notify[key] = now.date()
-                await bot.send_message(MY_CHAT_ID, 
-                    f"🌕 **НАПОМИНАНИЕ!**\n\nЗавтра ПОЛНОЛУНИЕ ({next_full.strftime('%d.%m.%Y')}) — точка входа!\n\nИспользуйте /forecast для прогнозов")
+                await bot.send_message(MY_CHAT_ID, f"🌕 **НАПОМИНАНИЕ!**\n\nЗавтра ПОЛНОЛУНИЕ ({next_full.strftime('%d.%m.%Y')}) — точка входа!")
         if next_full.date() == now.date():
             key = f"day_{next_full.date()}"
             if check_full_moon_notification.last_notify.get(key) != now.date():
                 check_full_moon_notification.last_notify[key] = now.date()
-                await bot.send_message(MY_CHAT_ID,
-                    f"🌕 **СЕГОДНЯ ПОЛНОЛУНИЕ!**\n\nТОЧКА ВХОДА!\n\n🔮 /forecast — прогнозы\n📊 /risk — риск портфеля")
+                await bot.send_message(MY_CHAT_ID, f"🌕 **СЕГОДНЯ ПОЛНОЛУНИЕ!**\n\nТОЧКА ВХОДА!")
 
 async def periodic_notification():
     while True:
         try:
             await check_full_moon_notification()
-        except Exception as e:
-            print(f"Error in notifications: {e}")
+        except:
+            pass
         await asyncio.sleep(3600)
 
-# === WEB-ИНТЕРФЕЙС (ДАШБОРД) ===
+# === WEB ДАШБОРД ===
 async def handle_dashboard(request):
-    """Главная страница дашборда"""
-    # Загружаем данные для дашборда
     trends = await get_all_trends()
     phase, phase_date, next_full, next_new = get_lunar_info()
-    
-    # Формируем HTML
+    now = datetime.now(pytz.timezone('Europe/Moscow'))
     html = f"""
     <!DOCTYPE html>
     <html>
-    <head>
-        <title>Проф Аналитик — Дашборд</title>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-            body {{ 
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                color: #eee;
-                padding: 20px;
-                min-height: 100vh;
-            }}
-            h1 {{ text-align: center; margin-bottom: 10px; color: #f0c040; }}
-            .subtitle {{ text-align: center; margin-bottom: 30px; color: #aaa; }}
-            .container {{ max-width: 1400px; margin: 0 auto; }}
-            .lunar-card {{
-                background: rgba(255,255,255,0.1);
-                border-radius: 15px;
-                padding: 20px;
-                margin-bottom: 20px;
-                backdrop-filter: blur(10px);
-                border: 1px solid rgba(255,255,255,0.2);
-            }}
-            .stats-grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-                gap: 20px;
-                margin-bottom: 20px;
-            }}
-            .stat-card {{
-                background: rgba(255,255,255,0.1);
-                border-radius: 15px;
-                padding: 20px;
-                backdrop-filter: blur(10px);
-                border: 1px solid rgba(255,255,255,0.2);
-            }}
-            .stat-card h3 {{ margin-bottom: 15px; color: #f0c040; }}
-            .stat-value {{ font-size: 2em; font-weight: bold; }}
-            .stat-unit {{ font-size: 0.8em; color: #aaa; }}
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-                background: rgba(255,255,255,0.1);
-                border-radius: 15px;
-                overflow: hidden;
-            }}
-            th, td {{
-                padding: 12px;
-                text-align: left;
-                border-bottom: 1px solid rgba(255,255,255,0.2);
-            }}
-            th {{ background: rgba(240,192,64,0.3); color: #f0c040; }}
-            tr:hover {{ background: rgba(255,255,255,0.05); }}
-            .bull {{ color: #4ade80; }}
-            .bear {{ color: #f87171; }}
-            .neutral {{ color: #facc15; }}
-            .footer {{
-                text-align: center;
-                margin-top: 30px;
-                padding: 20px;
-                color: #666;
-                font-size: 0.8em;
-            }}
-            .refresh-btn {{
-                background: #f0c040;
-                color: #1a1a2e;
-                border: none;
-                padding: 10px 20px;
-                border-radius: 8px;
-                cursor: pointer;
-                font-weight: bold;
-                margin-bottom: 20px;
-            }}
-            .refresh-btn:hover {{ background: #ffd700; }}
-        </style>
+    <head><title>Проф Аналитик</title><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        *{{margin:0;padding:0;box-sizing:border-box;}}
+        body{{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);color:#eee;padding:20px;min-height:100vh;}}
+        h1{{text-align:center;margin-bottom:10px;color:#f0c040;}}
+        .container{{max-width:1400px;margin:0 auto;}}
+        .lunar-card, .stat-card{{background:rgba(255,255,255,0.1);border-radius:15px;padding:20px;margin-bottom:20px;backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.2);}}
+        .stats-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px;margin-bottom:20px;}}
+        .stat-value{{font-size:2.5em;font-weight:bold;color:#f0c040;}}
+        table{{width:100%;border-collapse:collapse;background:rgba(255,255,255,0.1);border-radius:15px;overflow:hidden;}}
+        th,td{{padding:12px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.2);}}
+        th{{background:rgba(240,192,64,0.3);color:#f0c040;}}
+        .bull{{color:#4ade80;}}.bear{{color:#f87171;}}.neutral{{color:#facc15;}}
+        .refresh-btn{{background:#f0c040;color:#1a1a2e;border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-weight:bold;margin-bottom:20px;}}
+        .footer{{text-align:center;margin-top:30px;padding:20px;color:#666;font-size:0.8em;}}
+    </style>
     </head>
     <body>
-        <div class="container">
-            <h1>🌙 ПРОФ АНАЛИТИК</h1>
-            <div class="subtitle">Эффект Дмитриева — анализ 17 акций</div>
-            
-            <button class="refresh-btn" onclick="location.reload()">🔄 Обновить данные</button>
-            
-            <div class="lunar-card">
-                <h2>🌙 Лунный календарь</h2>
-                <p>📅 Сегодня: {datetime.now(pytz.timezone('Europe/Moscow')).strftime('%d.%m.%Y %H:%M')}</p>
-                <p>🌙 Текущая фаза: <strong>{phase}</strong></p>
-                <p>🌕 Следующее полнолуние: {next_full.strftime('%d.%m.%Y %H:%M') if next_full else 'Нет данных'}</p>
-                <p>🌑 Следующее новолуние: {next_new.strftime('%d.%m.%Y %H:%M') if next_new else 'Нет данных'}</p>
-            </div>
-            
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <h3>📈 LONG активы</h3>
-                    <div class="stat-value">{len([t for t,d in trends.items() if d['trend'] == 'бычий'])}</div>
-                    <div class="stat-unit">активов в покупку</div>
-                </div>
-                <div class="stat-card">
-                    <h3>📉 SHORT активы</h3>
-                    <div class="stat-value">{len([t for t,d in trends.items() if d['trend'] == 'медвежий'])}</div>
-                    <div class="stat-unit">активов в продажу</div>
-                </div>
-                <div class="stat-card">
-                    <h3>⚪ Боковик</h3>
-                    <div class="stat-value">{len([t for t,d in trends.items() if d['trend'] == 'боковик'])}</div>
-                    <div class="stat-unit">активов — не торгуем</div>
-                </div>
-            </div>
-            
-            <h2 style="margin: 20px 0 15px 0;">📊 Статистика по активам</h2>
-            <div style="overflow-x: auto;">
-                <table>
-                    <thead>
-                        <tr><th>Актив</th><th>Тикер</th><th>Цена</th><th>Тренд</th><th>LONG доход</th><th>LONG успех</th><th>SHORT доход</th><th>SHORT успех</th></tr>
-                    </thead>
-                    <tbody>
-    """
-    
+    <div class="container">
+        <h1>🌙 ПРОФ АНАЛИТИК</h1>
+        <div style="text-align:center;margin-bottom:20px;">Эффект Дмитриева — анализ 17 акций</div>
+        <button class="refresh-btn" onclick="location.reload()">🔄 Обновить</button>
+        <div class="lunar-card">
+            <h3>🌙 Лунный календарь</h3>
+            <p>📅 {now.strftime('%d.%m.%Y %H:%M')}</p>
+            <p>🌙 Фаза: <strong>{phase}</strong></p>
+            <p>🌕 Полнолуние: {next_full.strftime('%d.%m.%Y %H:%M') if next_full else '—'}</p>
+            <p>🌑 Новолуние: {next_new.strftime('%d.%m.%Y %H:%M') if next_new else '—'}</p>
+        </div>
+        <div class="stats-grid">
+            <div class="stat-card"><h3>📈 LONG</h3><div class="stat-value">{len([t for t,d in trends.items() if d['trend'] == 'бычий'])}</div><div>активов</div></div>
+            <div class="stat-card"><h3>📉 SHORT</h3><div class="stat-value">{len([t for t,d in trends.items() if d['trend'] == 'медвежий'])}</div><div>активов</div></div>
+            <div class="stat-card"><h3>⚪ БОКОВИК</h3><div class="stat-value">{len([t for t,d in trends.items() if d['trend'] == 'боковик'])}</div><div>активов</div></div>
+        </div>
+        <div style="overflow-x:auto;">
+        <table>
+            <thead><tr><th>Актив</th><th>Тикер</th><th>Цена</th><th>Тренд</th><th>LONG доход</th><th>SHORT доход</th></tr></thead>
+            <tbody>"""
     for ticker, data in trends.items():
+        price_str = f"{data['price']:.2f}" if data['price'] else "—"
         trend_class = "bull" if data['trend'] == "бычий" else "bear" if data['trend'] == "медвежий" else "neutral"
         trend_symbol = "🟢" if data['trend'] == "бычий" else "🔴" if data['trend'] == "медвежий" else "⚪"
-        price_str = f"{data['price']:.2f}" if data['price'] else "Н/Д"
-        html += f"""
-                        <tr>
-                            <td>{data['name']}</td>
-                            <td>{ticker}</td>
-                            <td>{price_str}₽</td>
-                            <td class="{trend_class}">{trend_symbol} {data['trend']}</td>
-                            <td class="bull">+{data['return_bull']:.2f}%</td>
-                            <td>{data['success_bull']:.0f}%</td>
-                            <td class="bear">+{data['return_bear']:.2f}%</td>
-                            <td>{data['success_bear']:.0f}%</td>
-                        </tr>
-        """
-    
+        html += f"<tr><td>{data['name']}</td><td>{ticker}</td><td>{price_str}₽</td><td class='{trend_class}'>{trend_symbol} {data['trend']}</td><td class='bull'>+{data['return_bull']:.2f}%</td><td class='bear'>+{data['return_bear']:.2f}%</td></tr>"
     html += f"""
-                    </tbody>
-                </table>
-            </div>
-            
-            <div class="footer">
-                📊 Данные обновляются автоматически каждые 5 минут | {datetime.now(pytz.timezone('Europe/Moscow')).strftime('%d.%m.%Y %H:%M:%S')}
-            </div>
+            </tbody>
+        </table>
         </div>
+        <div class="footer">📊 Данные обновляются каждые 5 минут | {now.strftime('%d.%m.%Y %H:%M:%S')}</div>
+    </div>
     </body>
     </html>
     """
     return web.Response(text=html, content_type='text/html')
 
-# === ВЕБ-СЕРВЕР ===
 async def handle_health(request):
     return web.Response(text="OK")
 
@@ -1417,8 +1018,7 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', 10000)
     await site.start()
-    print("🌐 Веб-сервер запущен на порту 10000")
-    print("📊 Дашборд доступен по адресу: https://moon-bot-55tl.onrender.com/dashboard")
+    print("🌐 Веб-сервер запущен")
 
 async def on_startup(dp):
     init_db()
@@ -1426,16 +1026,9 @@ async def on_startup(dp):
     asyncio.create_task(periodic_notification())
     asyncio.create_task(daily_summary_task())
     try:
-        await bot.send_message(MY_CHAT_ID, "🚀 **Бот обновлён!**\n\n"
-            "✅ НОВЫЕ ФУНКЦИИ:\n"
-            "   🔮 /forecast TICKER — прогноз на 7 дней\n"
-            "   🌐 Web-дашборд с графиками\n"
-            "   📅 Ежедневные сводки в канал\n\n"
-            "🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard\n\n"
-            "Нажмите /start для полного меню", parse_mode='Markdown')
-        print("✅ Бот запущен")
-    except: 
-        print("⚠️ Бот работает")
+        await bot.send_message(MY_CHAT_ID, "🚀 **Бот запущен!**\n\n🔮 /forecast TICKER — прогноз\n📊 /risk — риск портфеля\n📈 /compare — сравнение\n🏆 /best — топ активов\n🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard", parse_mode='Markdown')
+    except:
+        pass
 
 async def on_shutdown(dp):
     await data_fetcher.close()
@@ -1444,7 +1037,6 @@ async def on_shutdown(dp):
 if __name__ == "__main__":
     print("=" * 50)
     print("ПРОФ АНАЛИТИК | ЭФФЕКТ ДМИТРИЕВА")
-    print("НОВЫЕ ФУНКЦИИ: /forecast, Web-дашборд, ежедневная сводка")
     print("=" * 50)
     from aiogram.utils import executor
     executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
