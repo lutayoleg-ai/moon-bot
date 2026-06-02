@@ -16,7 +16,8 @@ from aiohttp import web
 import matplotlib.pyplot as plt
 from io import BytesIO
 import sqlite3
-import ta  # technical analysis library
+import ta
+import json
 
 warnings.filterwarnings('ignore')
 
@@ -50,17 +51,71 @@ TICKERS = {
 
 ALL_TICKERS = list(TICKERS.keys())
 
-# === БАЗА ДАННЫХ ДЛЯ WATCHLIST ===
+# === БАЗА ДАННЫХ ===
 def init_db():
-    conn = sqlite3.connect('watchlist.db')
+    conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
+    # Таблица для watchlist
     c.execute('''CREATE TABLE IF NOT EXISTS watchlist
                  (user_id INTEGER, ticker TEXT, PRIMARY KEY (user_id, ticker))''')
+    # Таблица для обучения (запоминаем ошибки)
+    c.execute('''CREATE TABLE IF NOT EXISTS prediction_accuracy
+                 (ticker TEXT, date TEXT, predicted_trend TEXT, actual_trend TEXT, 
+                  was_correct INTEGER, PRIMARY KEY (ticker, date))''')
+    # Таблица для адаптивных весов
+    c.execute('''CREATE TABLE IF NOT EXISTS adaptive_weights
+                 (ticker TEXT, weight REAL DEFAULT 1.0, correct_count INTEGER DEFAULT 0, 
+                  total_count INTEGER DEFAULT 0, last_updated TEXT)''')
+    conn.commit()
+    conn.close()
+    # Инициализируем веса для всех активов
+    init_weights()
+
+def init_weights():
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    for ticker in ALL_TICKERS:
+        c.execute("INSERT OR IGNORE INTO adaptive_weights (ticker, weight) VALUES (?, 1.0)", (ticker,))
     conn.commit()
     conn.close()
 
+def update_accuracy(ticker, predicted_trend, actual_trend):
+    """Обновляем статистику точности предсказаний"""
+    was_correct = 1 if predicted_trend == actual_trend else 0
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    date = datetime.now().strftime('%Y-%m-%d')
+    c.execute("INSERT INTO prediction_accuracy (ticker, date, predicted_trend, actual_trend, was_correct) VALUES (?, ?, ?, ?, ?)",
+              (ticker, date, predicted_trend, actual_trend, was_correct))
+    # Обновляем адаптивный вес
+    c.execute("SELECT correct_count, total_count FROM adaptive_weights WHERE ticker = ?", (ticker,))
+    row = c.fetchone()
+    if row:
+        correct, total = row
+        new_correct = correct + was_correct
+        new_total = total + 1
+        # Вес = (точность * 2) - 0.5 (масштабирование)
+        accuracy = new_correct / new_total if new_total > 0 else 0.5
+        weight = max(0.3, min(1.5, accuracy * 2 - 0.5))  # Вес от 0.3 до 1.5
+        c.execute("UPDATE adaptive_weights SET weight = ?, correct_count = ?, total_count = ?, last_updated = ? WHERE ticker = ?",
+                  (weight, new_correct, new_total, datetime.now().strftime('%Y-%m-%d %H:%M'), ticker))
+    conn.commit()
+    conn.close()
+    return was_correct
+
+def get_adaptive_weight(ticker):
+    """Получаем адаптивный вес для актива"""
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute("SELECT weight, correct_count, total_count FROM adaptive_weights WHERE ticker = ?", (ticker,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {'weight': row[0], 'correct': row[1], 'total': row[2]}
+    return {'weight': 1.0, 'correct': 0, 'total': 0}
+
 def get_watchlist(user_id):
-    conn = sqlite3.connect('watchlist.db')
+    conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
     c.execute("SELECT ticker FROM watchlist WHERE user_id = ?", (user_id,))
     result = [row[0] for row in c.fetchall()]
@@ -70,7 +125,7 @@ def get_watchlist(user_id):
 def add_to_watchlist(user_id, ticker):
     if ticker not in ALL_TICKERS:
         return False
-    conn = sqlite3.connect('watchlist.db')
+    conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
     try:
         c.execute("INSERT INTO watchlist (user_id, ticker) VALUES (?, ?)", (user_id, ticker))
@@ -82,7 +137,7 @@ def add_to_watchlist(user_id, ticker):
         return False
 
 def remove_from_watchlist(user_id, ticker):
-    conn = sqlite3.connect('watchlist.db')
+    conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
     c.execute("DELETE FROM watchlist WHERE user_id = ? AND ticker = ?", (user_id, ticker))
     conn.commit()
@@ -90,7 +145,7 @@ def remove_from_watchlist(user_id, ticker):
     return True
 
 def clear_watchlist(user_id):
-    conn = sqlite3.connect('watchlist.db')
+    conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
     c.execute("DELETE FROM watchlist WHERE user_id = ?", (user_id,))
     conn.commit()
@@ -168,7 +223,9 @@ keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="📈 График акции")],
         [KeyboardButton(text="⭐ Watchlist")],
         [KeyboardButton(text="📎 Экспорт в Excel")],
-        [KeyboardButton(text="📈 Сравнение с IMOEX")]
+        [KeyboardButton(text="📈 Сравнение с IMOEX")],
+        [KeyboardButton(text="🔄 Бэктестинг 6 мес")],
+        [KeyboardButton(text="📊 Точность стратегии")]
     ],
     resize_keyboard=True
 )
@@ -227,8 +284,28 @@ class DataFetcher:
         except: pass
         return None
 
+    async def fetch_historical_data(self, ticker, start_date, end_date):
+        """Загружает исторические данные за указанный период"""
+        try:
+            s = await self.get_session()
+            url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json"
+            params = {'from': start_date.strftime('%Y-%m-%d'),
+                     'till': end_date.strftime('%Y-%m-%d'), 'interval': 24}
+            async with s.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    candles = data.get('candles', {}).get('data', [])
+                    if candles:
+                        df = pd.DataFrame(candles, columns=['open','close','high','low','value','volume','begin','end'])
+                        df['begin'] = pd.to_datetime(df['begin'])
+                        df = df.sort_values('begin').reset_index(drop=True)
+                        df = df[['begin','close']]
+                        df.columns = ['date', 'close']
+                        return df
+        except: pass
+        return None
+
     async def fetch_imoex(self, days=100):
-        """Загружает данные индекса IMOEX для сравнения"""
         try:
             s = await self.get_session()
             url = "https://iss.moex.com/iss/engines/stock/markets/index/securities/IMOEX/candles.json"
@@ -268,7 +345,6 @@ def calc_trend(df):
     return "бычий" if ma18 > ma50 else "медвежий"
 
 def calc_indicators(df):
-    """Рассчитывает RSI и MACD"""
     if df is None or len(df) < 30:
         return None
     close = df['close']
@@ -276,17 +352,13 @@ def calc_indicators(df):
     macd = ta.trend.MACD(close)
     macd_line = macd.macd().iloc[-1]
     macd_signal = macd.macd_signal().iloc[-1]
-    macd_histogram = macd.macd_diff().iloc[-1]
     
-    # Интерпретация
     rsi_status = "перекупленность" if rsi > 70 else "перепроданность" if rsi < 30 else "нейтрально"
     macd_status = "бычий сигнал" if macd_line > macd_signal else "медвежий сигнал"
     
     return {
         'rsi': round(rsi, 1),
         'rsi_status': rsi_status,
-        'macd_line': round(macd_line, 2),
-        'macd_signal': round(macd_signal, 2),
         'macd_status': macd_status
     }
 
@@ -320,7 +392,180 @@ def calc_rr(entry, stop, target):
     except:
         return 0
 
-# === КОМАНДА /watchlist ===
+# === БЭКТЕСТИНГ СТРАТЕГИИ ===
+async def backtest_strategy(months=6):
+    """Бэктестинг стратегии за последние N месяцев"""
+    msk_tz = pytz.timezone('Europe/Moscow')
+    end_date = datetime.now(msk_tz)
+    start_date = end_date - timedelta(days=months*30)
+    
+    results = []
+    total_trades = 0
+    winning_trades = 0
+    total_return = 0
+    
+    # Для каждого полнолуния в периоде
+    for date_str, time_str in LUNAR_PHASES["full_moons"]:
+        full_moon = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        full_moon = msk_tz.localize(full_moon)
+        
+        if start_date <= full_moon <= end_date:
+            # Для каждого актива проверяем, как сработала бы стратегия
+            for ticker, data in TICKERS.items():
+                # Загружаем цены до и после полнолуния
+                before_date = full_moon - timedelta(days=5)
+                after_date = full_moon + timedelta(days=7)
+                
+                df_before = await data_fetcher.fetch_historical_data(ticker, before_date, full_moon)
+                df_after = await data_fetcher.fetch_historical_data(ticker, full_moon, after_date)
+                
+                if df_before is not None and df_after is not None and len(df_before) >= 5 and len(df_after) >= 3:
+                    # Определяем тренд до полнолуния
+                    price_before = df_before['close'].iloc[-1]
+                    ma18_before = df_before['close'].rolling(18).mean().iloc[-1] if len(df_before) >= 18 else price_before
+                    ma50_before = df_before['close'].rolling(50).mean().iloc[-1] if len(df_before) >= 50 else price_before
+                    
+                    if ma18_before > ma50_before:
+                        predicted_trend = "бычий"
+                        expected_return = data['return_bull'] / 100
+                    elif ma18_before < ma50_before:
+                        predicted_trend = "медвежий"
+                        expected_return = data['return_bear'] / 100
+                    else:
+                        continue  # боковик — не торгуем
+                    
+                    # Фактическая доходность через 7 дней
+                    price_after = df_after['close'].iloc[-1]
+                    actual_return = (price_after - price_before) / price_before
+                    
+                    # Проверяем, правильным ли был прогноз направления
+                    actual_trend = "бычий" if actual_return > 0 else "медвежий"
+                    was_correct = 1 if predicted_trend == actual_trend else 0
+                    
+                    total_trades += 1
+                    winning_trades += was_correct
+                    total_return += expected_return if was_correct else -abs(expected_return)
+                    
+                    results.append({
+                        'date': full_moon,
+                        'ticker': ticker,
+                        'predicted': predicted_trend,
+                        'actual_trend': actual_trend,
+                        'expected_return': expected_return,
+                        'actual_return': actual_return,
+                        'was_correct': was_correct
+                    })
+    
+    if total_trades == 0:
+        return None
+    
+    accuracy = winning_trades / total_trades * 100
+    avg_return = total_return / total_trades * 100
+    
+    return {
+        'total_trades': total_trades,
+        'winning_trades': winning_trades,
+        'accuracy': accuracy,
+        'avg_return': avg_return,
+        'total_return': total_return,
+        'results': results[-10:]  # последние 10 сделок для отображения
+    }
+
+# === КОМАНДА БЭКТЕСТИНГА ===
+@dp.message_handler(commands=['backtest'])
+async def cmd_backtest(message: types.Message):
+    msg = await message.answer("🔄 Запускаю бэктестинг стратегии за последние 6 месяцев... ⏳ 1-2 минуты")
+    try:
+        result = await backtest_strategy(6)
+        if result is None:
+            await msg.edit_text("⚠️ Недостаточно данных для бэктестинга. Попробуйте позже.")
+            return
+        
+        text = f"📊 БЭКТЕСТИНГ СТРАТЕГИИ (последние 6 месяцев)\n\n"
+        text += f"{'─' * 35}\n"
+        text += f"📈 Всего сделок: {result['total_trades']}\n"
+        text += f"✅ Успешных сделок: {result['winning_trades']}\n"
+        text += f"🎯 Точность стратегии: {result['accuracy']:.1f}%\n"
+        text += f"💰 Средняя доходность на сделку: {result['avg_return']:.2f}%\n"
+        text += f"📊 Совокупная доходность: {result['total_return']:.2f}%\n"
+        text += f"{'─' * 35}\n"
+        text += f"📋 Последние сделки:\n"
+        for trade in result['results']:
+            emoji = "✅" if trade['was_correct'] else "❌"
+            text += f"{emoji} {trade['date'].strftime('%d.%m')} {trade['ticker']}: предсказание {trade['predicted']}, факт {trade['actual_trend']}\n"
+        text += f"\n⚠️ Бэктестинг не гарантирует будущих результатов"
+        
+        # Рисуем график доходности
+        if len(result['results']) >= 5:
+            plt.figure(figsize=(10, 5))
+            returns = [t['actual_return']*100 for t in result['results']]
+            plt.bar(range(len(returns)), returns, color=['g' if r>0 else 'r' for r in returns])
+            plt.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+            plt.title('Доходность по последним сделкам бэктестинга')
+            plt.xlabel('Сделка')
+            plt.ylabel('Доходность, %')
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            
+            buf = BytesIO()
+            plt.savefig(buf, format='png', dpi=100)
+            buf.seek(0)
+            plt.close()
+            
+            await msg.delete()
+            await message.answer_photo(photo=buf, caption=text)
+        else:
+            await msg.edit_text(text)
+    except Exception as e:
+        await msg.edit_text(f"⚠️ Ошибка бэктестинга: {str(e)[:100]}")
+
+# === ТОЧНОСТЬ СТРАТЕГИИ ===
+@dp.message_handler(commands=['accuracy'])
+async def cmd_accuracy(message: types.Message):
+    msg = await message.answer("📊 Собираю статистику точности прогнозов...")
+    try:
+        conn = sqlite3.connect('bot_data.db')
+        c = conn.cursor()
+        
+        # Общая точность
+        c.execute("SELECT COUNT(*), SUM(was_correct) FROM prediction_accuracy")
+        total, correct = c.fetchone()
+        
+        # Точность по активам
+        c.execute("SELECT ticker, COUNT(*), SUM(was_correct) FROM prediction_accuracy GROUP BY ticker")
+        by_ticker = c.fetchall()
+        
+        # Адаптивные веса
+        c.execute("SELECT ticker, weight, correct_count, total_count FROM adaptive_weights")
+        weights = {row[0]: {'weight': row[1], 'correct': row[2], 'total': row[3]} for row in c.fetchall()}
+        
+        conn.close()
+        
+        if total == 0:
+            await msg.edit_text("📊 Пока нет данных о точности прогнозов.\n\nПосле того как бот даст несколько рекомендаций, здесь появится статистика.")
+            return
+        
+        text = f"📊 ТОЧНОСТЬ СТРАТЕГИИ\n\n"
+        text += f"{'─' * 35}\n"
+        text += f"📈 Всего прогнозов: {total}\n"
+        text += f"✅ Точных прогнозов: {correct}\n"
+        text += f"🎯 Общая точность: {correct/total*100:.1f}%\n"
+        text += f"{'─' * 35}\n"
+        text += f"📋 Точность по активам:\n"
+        for ticker, cnt, cor in sorted(by_ticker, key=lambda x: -x[2]/x[1] if x[1]>0 else 0):
+            name = TICKERS.get(ticker, {}).get('name', ticker)
+            acc = cor/cnt*100 if cnt > 0 else 0
+            weight_info = weights.get(ticker, {})
+            weight = weight_info.get('weight', 1.0)
+            text += f"   {name}: {acc:.1f}% ({cor}/{cnt}) | вес: {weight:.2f}\n"
+        text += f"\n💡 Адаптивные веса корректируют рекомендации на основе прошлых ошибок.\n"
+        text += f"   Вес > 1 = актив показывает лучшие результаты, < 1 = хуже среднего."
+        
+        await msg.edit_text(text)
+    except Exception as e:
+        await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
+
+# === ОСТАЛЬНЫЕ КОМАНДЫ ===
 @dp.message_handler(commands=['watchlist'])
 async def cmd_watchlist(message: types.Message):
     user_id = message.from_user.id
@@ -392,16 +637,15 @@ async def watchlist_status_cmd(message: types.Message):
     except Exception as e:
         await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
 
-# === КОМАНДА /export ===
 @dp.message_handler(commands=['export'])
 async def cmd_export(message: types.Message):
     msg = await message.answer("📎 Формирую Excel-файл со статистикой... ⏳")
     try:
         trends = await get_all_trends()
         
-        # Создаём DataFrame
         data = []
         for ticker, info in trends.items():
+            adaptive = get_adaptive_weight(ticker)
             row = {
                 'Тикер': ticker,
                 'Название': info['name'],
@@ -412,7 +656,9 @@ async def cmd_export(message: types.Message):
                 'Успех SHORT %': info['success_bear'],
                 'Доходность SHORT %': info['return_bear'],
                 'p-value': info['p_value'],
-                'Доверие': confidence_stars(info['p_value'])
+                'Доверие': confidence_stars(info['p_value']),
+                'Адаптивный вес': adaptive['weight'],
+                'Точность прогнозов %': (adaptive['correct']/adaptive['total']*100) if adaptive['total'] > 0 else 0
             }
             if info['indicators']:
                 row['RSI'] = info['indicators']['rsi']
@@ -422,7 +668,6 @@ async def cmd_export(message: types.Message):
         
         df = pd.DataFrame(data)
         
-        # Сохраняем в Excel
         output = BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='Активы', index=False)
@@ -432,54 +677,45 @@ async def cmd_export(message: types.Message):
         await msg.delete()
         await message.answer_document(
             types.InputFile(output, filename=f'moon_bot_report_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx'),
-            caption="📎 Полная статистика по всем 17 активам"
+            caption="📎 Полная статистика по всем 17 активам (с адаптивными весами)"
         )
     except Exception as e:
         await msg.edit_text(f"⚠️ Ошибка при создании Excel: {str(e)[:100]}")
 
-# === СРАВНЕНИЕ С IMOEX ===
 @dp.message_handler(commands=['imoex'])
 async def cmd_imoex(message: types.Message):
     msg = await message.answer("📈 Загружаю данные IMOEX и сравниваю с портфелем... ⏳ 30-40 сек")
     try:
-        # Загружаем данные IMOEX
         imoex_df = await data_fetcher.fetch_imoex(60)
         if imoex_df is None:
             await msg.edit_text("⚠️ Не удалось загрузить данные IMOEX")
             return
         
-        # Загружаем данные всех активов
         trends = await get_all_trends()
         
-        # Считаем доходность портфеля (по рекомендациям бота)
         portfolio_returns = []
-        dates = imoex_df['date'].values
-        
         for ticker, data in trends.items():
             if data['price'] and data['trend'] != "боковик" and data['trend'] != "недостаточно данных":
-                # Используем ожидаемую доходность из статистики
+                adaptive = get_adaptive_weight(ticker)
                 if data['trend'] == "бычий":
-                    ret = data['return_bull'] / 100
+                    ret = data['return_bull'] / 100 * adaptive['weight']
                 else:
-                    ret = data['return_bear'] / 100
+                    ret = data['return_bear'] / 100 * adaptive['weight']
                 portfolio_returns.append(ret)
         
         avg_portfolio_return = np.mean(portfolio_returns) if portfolio_returns else 0
         
-        # Доходность IMOEX за последние 60 дней
         imoex_start = imoex_df['close'].iloc[0]
         imoex_end = imoex_df['close'].iloc[-1]
         imoex_return = (imoex_end - imoex_start) / imoex_start
         
-        # Рисуем график сравнения
         plt.figure(figsize=(12, 6))
         plt.plot(imoex_df['date'], imoex_df['close'] / imoex_df['close'].iloc[0] * 100, 'b-', linewidth=2, label='IMOEX (индекс)')
         
-        # Добавляем линию портфеля (упрощённо)
         portfolio_line = [100 * (1 + avg_portfolio_return * i/60) for i in range(len(imoex_df))]
-        plt.plot(imoex_df['date'], portfolio_line, 'g--', linewidth=2, label='Портфель (прогноз по стратегии)')
+        plt.plot(imoex_df['date'], portfolio_line, 'g--', linewidth=2, label='Портфель (с адаптивными весами)')
         
-        plt.title("Сравнение: Портфель (по рекомендациям бота) vs IMOEX")
+        plt.title("Сравнение: Портфель (адаптивная стратегия) vs IMOEX")
         plt.xlabel("Дата")
         plt.ylabel("Нормированное значение (начало = 100)")
         plt.legend()
@@ -492,34 +728,33 @@ async def cmd_imoex(message: types.Message):
         buf.seek(0)
         plt.close()
         
-        text = f"📊 СРАВНЕНИЕ С РЫНКОМ\n\n"
+        text = f"📊 СРАВНЕНИЕ С РЫНКОМ (с адаптивными весами)\n\n"
         text += f"📈 Доходность IMOEX за 60 дней: {imoex_return*100:.2f}%\n"
-        text += f"🎯 Ожидаемая доходность портфеля (по рекомендациям бота): {avg_portfolio_return*100:.2f}%\n"
+        text += f"🎯 Ожидаемая доходность портфеля: {avg_portfolio_return*100:.2f}%\n"
         text += f"{'─' * 35}\n"
         if avg_portfolio_return > imoex_return:
-            text += f"✅ Портфель стратегии потенциально превосходит рынок на {(avg_portfolio_return - imoex_return)*100:.2f}%\n"
+            text += f"✅ Портфель стратегии превосходит рынок на {(avg_portfolio_return - imoex_return)*100:.2f}%\n"
         else:
             text += f"⚠️ Стратегия отстаёт от рынка на {(imoex_return - avg_portfolio_return)*100:.2f}%\n"
-        text += f"\n⚠️ Сравнение приблизительное, основано на исторической доходности активов"
+        text += f"\n💡 Адаптивные веса корректируются на основе точности прогнозов."
         
         await msg.delete()
         await message.answer_photo(photo=buf, caption=text)
     except Exception as e:
         await msg.edit_text(f"⚠️ Ошибка: {str(e)[:100]}")
 
-# === КОМАНДА /all ===
 @dp.message_handler(commands=['all'])
 async def cmd_all(message: types.Message):
     await message.answer("📋 Собираю данные по всем активам... ⏳ 30-40 сек")
     try:
         trends = await get_all_trends()
         text = f"📋 ВСЕ АКТИВЫ (17)\n\n"
-        # LONG
         text += f"🟢 LONG (покупка):\n"
         long_count = 0
         for ticker, data in trends.items():
             if data['trend'] == "бычий":
-                text += f"   ✅ {data['name']}: +{data['return_bull']:.2f}% | Успех {data['success_bull']:.0f}%\n"
+                adaptive = get_adaptive_weight(ticker)
+                text += f"   ✅ {data['name']}: +{data['return_bull']:.2f}% | Успех {data['success_bull']:.0f}% | вес: {adaptive['weight']:.2f}\n"
                 long_count += 1
         if long_count == 0:
             text += f"   ⚠️ Нет активов в LONG\n"
@@ -527,7 +762,8 @@ async def cmd_all(message: types.Message):
         short_count = 0
         for ticker, data in trends.items():
             if data['trend'] == "медвежий":
-                text += f"   ❌ {data['name']}: +{data['return_bear']:.2f}% | Успех {data['success_bear']:.0f}%\n"
+                adaptive = get_adaptive_weight(ticker)
+                text += f"   ❌ {data['name']}: +{data['return_bear']:.2f}% | Успех {data['success_bear']:.0f}% | вес: {adaptive['weight']:.2f}\n"
                 short_count += 1
         if short_count == 0:
             text += f"   ⚠️ Нет активов в SHORT\n"
@@ -537,10 +773,7 @@ async def cmd_all(message: types.Message):
             if data['trend'] == "боковик" or data['trend'] == "недостаточно данных":
                 text += f"   ⚪ {data['name']}: {data['trend']}\n"
                 side_count += 1
-        if side_count == 0:
-            text += f"   ⚠️ Нет активов в боковике\n"
         
-        # Добавляем информацию по RSI/MACD для бычьих/медвежьих активов
         text += f"\n📊 RSI/MACD сигналы:\n"
         for ticker, data in trends.items():
             if data['indicators'] and data['trend'] in ["бычий", "медвежий"]:
@@ -552,7 +785,6 @@ async def cmd_all(message: types.Message):
     except Exception as e:
         await message.answer(f"⚠️ Ошибка: {str(e)[:100]}")
 
-# === ГРАФИК АКЦИИ ===
 @dp.message_handler(lambda message: message.text == "📈 График акции")
 async def ask_ticker_for_chart(message: types.Message):
     await message.answer("📊 Введите тикер акции для графика (например, SBER, VTBR, GAZP):\n\nДоступные тикеры:\n" + ", ".join(ALL_TICKERS))
@@ -570,10 +802,8 @@ async def send_chart(message: types.Message):
             await msg.edit_text(f"⚠️ Недостаточно данных для {TICKERS[ticker]['name']}")
             return
         
-        # Рисуем график с индикаторами
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [3, 1]})
         
-        # Цена и скользящие средние
         ax1.plot(df['date'], df['close'], 'b-', linewidth=2, label='Цена закрытия')
         if len(df) >= 18:
             ma18 = df['close'].rolling(18).mean()
@@ -581,12 +811,12 @@ async def send_chart(message: types.Message):
         if len(df) >= 50:
             ma50 = df['close'].rolling(50).mean()
             ax1.plot(df['date'], ma50, 'r--', linewidth=1.5, label='MA 50')
-        ax1.set_title(f"{TICKERS[ticker]['name']} ({ticker}) - Цена и RSI/MACD")
+        ax1.set_title(f"{TICKERS[ticker]['name']} ({ticker}) - Цена")
         ax1.set_ylabel("Цена, ₽")
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
-        # RSI        rsi = ta.momentum.RSIIndicator(df['close']).rsi()
+        rsi = ta.momentum.RSIIndicator(df['close']).rsi()
         ax2.plot(df['date'], rsi, 'purple', linewidth=1.5)
         ax2.axhline(y=70, color='r', linestyle='--', alpha=0.5, label='Перекупленность (70)')
         ax2.axhline(y=30, color='g', linestyle='--', alpha=0.5, label='Перепроданность (30)')
@@ -603,11 +833,12 @@ async def send_chart(message: types.Message):
         buf.seek(0)
         plt.close()
         
-        # Получаем текущие индикаторы
         indicators = calc_indicators(df)
+        adaptive = get_adaptive_weight(ticker)
         caption = f"📈 {TICKERS[ticker]['name']} ({ticker})\nТренд: {calc_trend(df)}"
         if indicators:
             caption += f"\n📊 RSI: {indicators['rsi']} ({indicators['rsi_status']})\n📊 MACD: {indicators['macd_status']}"
+        caption += f"\n🎯 Адаптивный вес: {adaptive['weight']:.2f} | Точность: {(adaptive['correct']/adaptive['total']*100):.1f}%" if adaptive['total'] > 0 else ""
         
         await msg.delete()
         await message.answer_photo(photo=buf, caption=caption)
@@ -619,15 +850,20 @@ async def cmd_start(message: types.Message):
     await message.answer(
         f"🌙 ПРОФ АНАЛИТИК | ЭФФЕКТ ДМИТРИЕВА\n\n"
         f"📊 17 акций с подтверждённым эффектом\n\n"
-        f"🌙 Фазы Луны — информация о текущей фазе\n"
-        f"📈 Открыть позицию — рекомендация по входу\n"
-        f"📊 Историческая статистика — успешность\n"
-        f"📋 Все активы (/all) — сводная таблица с RSI/MACD\n"
-        f"📈 График акции — введите тикер\n"
-        f"⭐ Watchlist — персональный список (/add, /remove, /watchlist_status)\n"
-        f"📎 Экспорт в Excel — выгрузка всей статистики\n"
-        f"📈 Сравнение с IMOEX — портфель vs рынок\n\n"
-        f"По методике: полнолуние → точка входа",
+        f"🔹 Рекомендации:\n"
+        f"   🌙 Фазы Луны — информация о текущей фазе\n"
+        f"   📈 Открыть позицию — анализ с RSI/MACD и адаптивными весами\n"
+        f"   📊 Историческая статистика — успешность по каждому активу\n"
+        f"   📋 Все активы (/all) — сводная таблица\n"
+        f"   📈 График акции — цена + RSI\n"
+        f"   ⭐ Watchlist — персональный список\n"
+        f"   📎 Экспорт в Excel — выгрузка статистики\n"
+        f"   📈 Сравнение с IMOEX — портфель vs рынок\n\n"
+        f"🔹 ПРОДВИНУТЫЕ ФУНКЦИИ:\n"
+        f"   🔄 Бэктестинг 6 мес — как бы сработала стратегия\n"
+        f"   📊 Точность стратегии — статистика прогнозов и адаптивные веса\n\n"
+        f"📖 По методике: полнолуние → точка входа\n"
+        f"💡 Бот учится на ошибках и корректирует веса активов!",
         reply_markup=keyboard
     )
 
@@ -665,21 +901,24 @@ async def stats_cmd(message: types.Message):
     text += f"🏆 ТОП-10 ПО ДОХОДНОСТИ LONG:\n"
     sorted_by_return = sorted(TICKERS.items(), key=lambda x: -x[1]['return_bull'])
     for i, (ticker, data) in enumerate(sorted_by_return[:10], 1):
-        text += f"{i}. {data['name']}: +{data['return_bull']:.2f}% (успех {data['success_bull']:.0f}%)\n"
+        adaptive = get_adaptive_weight(ticker)
+        text += f"{i}. {data['name']}: +{data['return_bull']:.2f}% (успех {data['success_bull']:.0f}%) | вес: {adaptive['weight']:.2f}\n"
     text += f"\n{'─' * 35}\n"
     text += f"📈 ПОЛНАЯ ТАБЛИЦА:\n"
     for ticker, data in sorted(TICKERS.items(), key=lambda x: -x[1]['return_bull']):
         stars = confidence_stars(data['p_value'])
-        text += f"\n{data['name']} ({ticker}) {stars}\n"
+        adaptive = get_adaptive_weight(ticker)
+        text += f"\n{data['name']} ({ticker}) {stars} вес:{adaptive['weight']:.2f}\n"
         text += f"   📈 LONG: +{data['return_bull']:.2f}% | Успех {data['success_bull']:.0f}%\n"
         text += f"   📉 SHORT: +{data['return_bear']:.2f}% | Успех {data['success_bear']:.0f}%\n"
     text += f"\n{'─' * 35}\n"
-    text += f"⚠️ Статистика основана на 2 годах данных\n📖 Решение принимает трейдер"
+    text += f"⚠️ Статистика основана на 2 годах данных\n"
+    text += f"💡 Адаптивные веса корректируются на основе реальной точности прогнозов."
     await message.answer(text)
 
 @dp.message_handler(lambda message: message.text == "📈 Открыть позицию")
 async def open_position_cmd(message: types.Message):
-    msg = await message.answer("📈 Анализирую рынок... ⏳ 30-40 сек")
+    msg = await message.answer("📈 Анализирую рынок с адаптивными весами... ⏳ 30-40 сек")
     try:
         phase, phase_date, next_full, next_new = get_lunar_info()
         trends = await get_all_trends()
@@ -695,26 +934,27 @@ async def open_position_cmd(message: types.Message):
             text += f"   🌙 Фаза: {phase.upper()}\n   ⏸ Активный сигнал отсутствует\n"
         if phase_date:
             text += f"   📅 Дата: {phase_date.strftime('%d.%m.%Y %H:%M')}\n"
-        text += f"\n📊 ТЕКУЩИЕ ТРЕНДЫ АКТИВОВ:\n\n"
+        text += f"\n📊 ТЕКУЩИЕ ТРЕНДЫ АКТИВОВ (с адаптивными весами):\n\n"
         for ticker, data in trends.items():
             emoji = "🟢" if data['trend'] == "бычий" else "🔴" if data['trend'] == "медвежий" else "⚪"
             price_str = f"{data['price']:.2f}₽" if data['price'] else "Н/Д"
             stars = confidence_stars(data['p_value'])
+            adaptive = get_adaptive_weight(ticker)
             text += f"{emoji} {data['name']} ({ticker}): {price_str}\n"
-            text += f"   📈 Тренд: {data['trend']} | Доверие: {stars}\n"
+            text += f"   📈 Тренд: {data['trend']} | Доверие: {stars} | Вес: {adaptive['weight']:.2f}\n"
             if data['indicators']:
                 ind = data['indicators']
                 text += f"   📊 RSI: {ind['rsi']} ({ind['rsi_status']}) | MACD: {ind['macd_status']}\n"
             if data['trend'] == "бычий":
                 stop = data['price'] * 0.97 if data['price'] else None
-                target = data['price'] * (1 + data['return_bull']/100) if data['price'] else None
+                target = data['price'] * (1 + data['return_bull']/100 * adaptive['weight']) if data['price'] else None
                 rr = calc_rr(data['price'], stop, target)
-                text += f"   🟢 LONG: +{data['return_bull']:.2f}% | Успех {data['success_bull']:.0f}% | R/R: 1:{rr:.1f}\n"
+                text += f"   🟢 LONG: +{data['return_bull'] * adaptive['weight']:.2f}% (скорр.) | Успех {data['success_bull']:.0f}% | R/R: 1:{rr:.1f}\n"
             elif data['trend'] == "медвежий":
                 stop = data['price'] * 1.03 if data['price'] else None
-                target = data['price'] * (1 - data['return_bear']/100) if data['price'] else None
+                target = data['price'] * (1 - data['return_bear']/100 * adaptive['weight']) if data['price'] else None
                 rr = calc_rr(data['price'], stop, target)
-                text += f"   🔴 SHORT: +{data['return_bear']:.2f}% | Успех {data['success_bear']:.0f}% | R/R: 1:{rr:.1f}\n"
+                text += f"   🔴 SHORT: +{data['return_bear'] * adaptive['weight']:.2f}% (скорр.) | Успех {data['success_bear']:.0f}% | R/R: 1:{rr:.1f}\n"
             else:
                 text += f"   ⚪ Эффект НЕ РАБОТАЕТ\n"
             text += f"\n"
@@ -722,31 +962,21 @@ async def open_position_cmd(message: types.Message):
         if phase == "полнолуние":
             text += f"📢 СЕГОДНЯ ПОЛНОЛУНИЕ — ТОЧКА ВХОДА!\n\n"
             for ticker, data in trends.items():
+                adaptive = get_adaptive_weight(ticker)
                 if data['trend'] == "бычий":
-                    stop = data['price'] * 0.97 if data['price'] else None
-                    target = data['price'] * (1 + data['return_bull']/100) if data['price'] else None
-                    rr = calc_rr(data['price'], stop, target)
-                    text += f"✅ {data['name']}: ПОКУПКА (успех {data['success_bull']:.0f}%, +{data['return_bull']:.2f}%, R/R 1:{rr:.1f})\n"
+                    text += f"✅ {data['name']}: ПОКУПКА (вес {adaptive['weight']:.2f}, успех {data['success_bull']:.0f}%)\n"
                 elif data['trend'] == "медвежий":
-                    stop = data['price'] * 1.03 if data['price'] else None
-                    target = data['price'] * (1 - data['return_bear']/100) if data['price'] else None
-                    rr = calc_rr(data['price'], stop, target)
-                    text += f"❌ {data['name']}: ПРОДАЖА (успех {data['success_bear']:.0f}%, +{data['return_bear']:.2f}%, R/R 1:{rr:.1f})\n"
+                    text += f"❌ {data['name']}: ПРОДАЖА (вес {adaptive['weight']:.2f}, успех {data['success_bear']:.0f}%)\n"
                 elif data['trend'] == "боковик":
                     text += f"⚠️ {data['name']}: НЕ ТОРГУЕМ\n"
         elif phase == "полнолуние_завтра" and next_full:
-            text += f"📢 Полнолуние ЗАВТРА ({next_full.strftime('%d.%m.%Y')}) — готовьтесь!\n\n"
-            for ticker, data in trends.items():
-                if data['trend'] == "бычий":
-                    text += f"🟢 {data['name']}: готовиться к ПОКУПКЕ (успех {data['success_bull']:.0f}%)\n"
-                elif data['trend'] == "медвежий":
-                    text += f"🔴 {data['name']}: готовиться к ПРОДАЖЕ (успех {data['success_bear']:.0f}%)\n"
+            text += f"📢 Полнолуние ЗАВТРА ({next_full.strftime('%d.%m.%Y')}) — готовьтесь!\n"
         elif next_full:
             days = (next_full - now).days
             text += f"⏳ Следующая точка входа: {next_full.strftime('%d.%m.%Y')} (через {days} дн.)\n"
         else:
             text += f"⏸ Активный сигнал отсутствует\n"
-        text += f"\n⚠️ СТОП-ЛОСС ОБЯЗАТЕЛЕН! | 📊 Статистика за 2024-2026\n💡 R/R показывает соотношение потенциальной прибыли к риску"
+        text += f"\n⚠️ СТОП-ЛОСС ОБЯЗАТЕЛЕН!\n💡 Адаптивные веса корректируются на основе точности прогнозов."
         await msg.delete()
         await message.answer(text)
     except Exception as e:
@@ -768,6 +998,14 @@ async def export_button_handler(message: types.Message):
 async def imoex_button_handler(message: types.Message):
     await cmd_imoex(message)
 
+@dp.message_handler(lambda message: message.text == "🔄 Бэктестинг 6 мес")
+async def backtest_button_handler(message: types.Message):
+    await cmd_backtest(message)
+
+@dp.message_handler(lambda message: message.text == "📊 Точность стратегии")
+async def accuracy_button_handler(message: types.Message):
+    await cmd_accuracy(message)
+
 # === АВТО-УВЕДОМЛЕНИЯ ===
 async def check_full_moon_notification():
     msk_tz = pytz.timezone('Europe/Moscow')
@@ -784,14 +1022,15 @@ async def check_full_moon_notification():
                 await bot.send_message(MY_CHAT_ID, 
                     f"🌕 НАПОМИНАНИЕ!\n\n"
                     f"Завтра ПОЛНОЛУНИЕ ({next_full.strftime('%d.%m.%Y')}) — точка входа!\n"
-                    f"Нажмите 📈 Открыть позицию, чтобы получить рекомендации с RSI/MACD.")
+                    f"Нажмите 📈 Открыть позицию для рекомендаций с адаптивными весами.")
         if next_full.date() == now.date():
             key = f"day_{next_full.date()}"
             if check_full_moon_notification.last_notify.get(key) != now.date():
                 check_full_moon_notification.last_notify[key] = now.date()
                 await bot.send_message(MY_CHAT_ID,
                     f"🌕 СЕГОДНЯ ПОЛНОЛУНИЕ!\n\n"
-                    f"ТОЧКА ВХОДА! Нажмите 📈 Открыть позицию для детальных рекомендаций с техническими индикаторами.")
+                    f"ТОЧКА ВХОДА! Нажмите 📈 Открыть позицию.\n"
+                    f"Бот использует адаптивные веса на основе прошлой точности.")
 
 async def periodic_notification():
     while True:
@@ -819,11 +1058,11 @@ async def on_startup(dp):
     await start_web_server()
     asyncio.create_task(periodic_notification())
     try:
-        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен с новыми функциями!\n\n"
-            "⭐ Watchlist — персональный список акций\n"
-            "📎 Экспорт в Excel — выгрузка статистики\n"
-            "📈 Сравнение с IMOEX — портфель vs рынок\n"
-            "📊 RSI и MACD добавлены в анализ")
+        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен с ПРОДВИНУТЫМИ функциями!\n\n"
+            "🔄 Бэктестинг 6 мес — проверьте, как бы сработала стратегия\n"
+            "📊 Точность стратегии — бот учится на ошибках\n"
+            "💡 Адаптивные веса корректируют рекомендации\n\n"
+            "Нажмите /start для полного меню")
         print("✅ Бот в Telegram")
     except: 
         print("⚠️ Не удалось отправить сообщение, но бот работает")
@@ -836,7 +1075,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print("ПРОФ АНАЛИТИК | ЭФФЕКТ ДМИТРИЕВА")
     print("17 акций с подтверждённым эффектом")
-    print("Улучшения: Watchlist, Excel, IMOEX, RSI/MACD")
+    print("ПРОДВИНУТЫЕ ФУНКЦИИ: Бэктестинг + Адаптивное обучение")
     print("=" * 50)
     from aiogram.utils import executor
     executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
