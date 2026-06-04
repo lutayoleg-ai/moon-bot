@@ -29,7 +29,18 @@ if not BOT_TOKEN:
     raise ValueError("❌ Токен не найден")
 
 # === КОМИССИЯ БРОКЕРА ===
-COMMISSION = 0.003  # 0.3% при покупке и продаже
+COMMISSION = 0.003  # 0.3%
+
+# === ОПТИМИЗИРОВАННЫЕ ПАРАМЕТРЫ ===
+STRATEGY = {
+    'MA_FAST': 10,        # Быстрая MA (было 20)
+    'MA_SLOW': 30,        # Медленная MA (было 50)
+    'ADX_THRESHOLD': 20,  # Ниже порога — флет (было 25)
+    'STOP_LOSS': 0.06,    # 6% (было 5%)
+    'TAKE_PROFIT': 0.12,  # 12% (было 8%)
+    'DAILY_LOSS_LIMIT': 0.03,
+    'LUNAR_BLACKOUT_DAYS': 2  # Не торговать за 2 дня до/после полнолуния
+}
 
 # === КЭШ ===
 data_cache = {}
@@ -71,27 +82,11 @@ TICKERS = {
 }
 ALL_TICKERS = list(TICKERS.keys())
 
-# === ПАРАМЕТРЫ СТРАТЕГИИ ===
-STRATEGY = {
-    'MA_FAST': 20,
-    'MA_SLOW': 50,
-    'RSI_OVERBOUGHT': 75,
-    'RSI_OVERSOLD': 30,
-    'VOLUME_RATIO_LONG': 1.5,
-    'VOLUME_RATIO_SHORT': 1.5,
-    'ADX_THRESHOLD': 25,
-    'STOP_LOSS': 0.05,
-    'TAKE_PROFIT': 0.08,
-    'DAILY_LOSS_LIMIT': 0.03
-}
-
 # === СОСТОЯНИЕ ===
 current_position = {'type': None, 'entry_price': None, 'entry_time': None, 'signal_type': None, 'is_manual': False}
 last_signal_sent = {'signal': None, 'price': None, 'time': None}
 daily_pnl = 0.0
 last_reset_date = None
-total_pnl = 0.0
-trades_history = []
 
 # === БАЗА ДАННЫХ ===
 def init_db():
@@ -99,16 +94,12 @@ def init_db():
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, type TEXT, entry REAL, exit REAL, pnl REAL, commission REAL, is_manual INTEGER)''')
         c.execute('''CREATE TABLE IF NOT EXISTS daily_summary (date TEXT PRIMARY KEY, summary TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS stats (key TEXT PRIMARY KEY, value REAL)''')
 
 def save_trade(trade_type, entry, exit_price, pnl, commission, is_manual=False):
-    global total_pnl, trades_history
     with sqlite3.connect('bot_data.db') as conn:
         c = conn.cursor()
         c.execute("INSERT INTO trades (date, type, entry, exit, pnl, commission, is_manual) VALUES (?, ?, ?, ?, ?, ?, ?)",
                   (datetime.now().isoformat(), trade_type, entry, exit_price, pnl, commission, 1 if is_manual else 0))
-    total_pnl += pnl
-    trades_history.insert(0, {'type': trade_type, 'entry': entry, 'exit': exit_price, 'pnl': pnl, 'date': datetime.now()})
 
 def get_stats():
     with sqlite3.connect('bot_data.db') as conn:
@@ -116,18 +107,11 @@ def get_stats():
         c.execute("SELECT COUNT(*), SUM(pnl), AVG(pnl), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) FROM trades")
         row = c.fetchone()
         total_trades = row[0] or 0
-        total_pnl_db = row[1] or 0
+        total_pnl = row[1] or 0
         avg_pnl = row[2] or 0
         winning_trades = row[3] or 0
         win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
-        return {
-            'total_trades': total_trades,
-            'total_pnl': total_pnl_db,
-            'avg_pnl': avg_pnl,
-            'win_rate': win_rate,
-            'winning_trades': winning_trades,
-            'losing_trades': total_trades - winning_trades
-        }
+        return {'total_trades': total_trades, 'total_pnl': total_pnl, 'avg_pnl': avg_pnl, 'win_rate': win_rate, 'winning_trades': winning_trades, 'losing_trades': total_trades - winning_trades}
 
 def get_last_summary_date():
     with sqlite3.connect('bot_data.db') as conn:
@@ -141,7 +125,7 @@ def save_daily_summary(date, summary):
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO daily_summary (date, summary) VALUES (?, ?)", (date, summary))
 
-# === ЛУННЫЕ ДАННЫЕ ===
+# === ЛУННЫЕ ДАННЫЕ С ФИЛЬТРОМ ===
 LUNAR_PHASES = {
     "full_moons": [
         ("2026-01-03", "13:04"), ("2026-02-02", "01:10"), ("2026-03-03", "14:39"),
@@ -149,12 +133,6 @@ LUNAR_PHASES = {
         ("2026-06-30", "02:58"), ("2026-07-29", "17:37"), ("2026-08-28", "07:19"),
         ("2026-09-26", "19:50"), ("2026-10-26", "07:13"), ("2026-11-24", "17:55"),
         ("2026-12-24", "04:29"),
-    ],
-    "new_moons": [
-        ("2026-01-18", "22:53"), ("2026-02-17", "15:03"), ("2026-03-19", "04:26"),
-        ("2026-04-17", "14:54"), ("2026-05-16", "23:03"), ("2026-06-15", "05:56"),
-        ("2026-07-14", "12:45"), ("2026-08-12", "20:37"), ("2026-09-11", "06:27"),
-        ("2026-10-10", "18:50"), ("2026-11-09", "10:02"), ("2026-12-09", "03:52"),
     ]
 }
 
@@ -174,6 +152,17 @@ def get_lunar_info():
         if (dt - now).days == 1:
             return "полнолуние_завтра", dt, next_full
     return "обычный день", None, next_full
+
+def is_lunar_blackout():
+    """Запрет торговли за 2 дня до и 2 дня после полнолуния"""
+    msk = pytz.timezone('Europe/Moscow')
+    now = datetime.now(msk).date()
+    for date_str, _ in LUNAR_PHASES["full_moons"]:
+        full_moon_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        days_diff = (full_moon_date - now).days
+        if abs(days_diff) <= STRATEGY['LUNAR_BLACKOUT_DAYS']:
+            return True, full_moon_date
+    return False, None
 
 # === MOEX ===
 class DataFetcher:
@@ -236,11 +225,7 @@ class DataFetcher:
                     cols = candles.get('columns', [])
                     if rows and len(rows) >= 3:
                         idx_date = next((i for i, c in enumerate(cols) if c.lower() in ('begin', 'date')), None)
-                        idx_open = next((i for i, c in enumerate(cols) if c.lower() == 'open'), None)
-                        idx_high = next((i for i, c in enumerate(cols) if c.lower() == 'high'), None)
-                        idx_low = next((i for i, c in enumerate(cols) if c.lower() == 'low'), None)
                         idx_close = next((i for i, c in enumerate(cols) if c.lower() in ('close', 'value')), None)
-                        idx_volume = next((i for i, c in enumerate(cols) if c.lower() == 'volume'), None)
                         if idx_date is not None and idx_close is not None:
                             records = []
                             for row in rows:
@@ -248,11 +233,7 @@ class DataFetcher:
                                     try:
                                         records.append({
                                             'date': pd.to_datetime(row[idx_date]),
-                                            'open': float(row[idx_open]) if idx_open is not None and len(row) > idx_open else None,
-                                            'high': float(row[idx_high]) if idx_high is not None and len(row) > idx_high else None,
-                                            'low': float(row[idx_low]) if idx_low is not None and len(row) > idx_low else None,
-                                            'close': float(row[idx_close]),
-                                            'volume': float(row[idx_volume]) if idx_volume is not None and len(row) > idx_volume else 0
+                                            'close': float(row[idx_close])
                                         })
                                     except:
                                         pass
@@ -261,48 +242,7 @@ class DataFetcher:
                                 set_to_cache(key, df)
                                 return df
         except Exception as e:
-            print(f"Ошибка fetch_candles_daily: {e}")
-        return None
-
-    async def fetch_candles_intraday(self, ticker, minutes=60):
-        key = f"intraday_{ticker}_{minutes}"
-        cached = get_from_cache(key)
-        if cached is not None:
-            return cached
-        try:
-            s = await self.get_session()
-            end = datetime.now()
-            start = end - timedelta(minutes=minutes)
-            url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json"
-            params = {'from': start.strftime('%Y-%m-%d'), 'till': end.strftime('%Y-%m-%d'), 'interval': 15}
-            async with s.get(url, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    candles = data.get('candles', {})
-                    rows = candles.get('data', [])
-                    cols = candles.get('columns', [])
-                    if rows and len(rows) >= 10:
-                        idx_date = next((i for i, c in enumerate(cols) if c.lower() in ('begin', 'date')), None)
-                        idx_close = next((i for i, c in enumerate(cols) if c.lower() in ('close', 'value')), None)
-                        idx_volume = next((i for i, c in enumerate(cols) if c.lower() == 'volume'), None)
-                        if idx_date is not None and idx_close is not None:
-                            records = []
-                            for row in rows[-minutes//15:]:
-                                if len(row) > max(idx_date, idx_close):
-                                    try:
-                                        records.append({
-                                            'date': pd.to_datetime(row[idx_date]),
-                                            'close': float(row[idx_close]),
-                                            'volume': float(row[idx_volume]) if idx_volume is not None and len(row) > idx_volume else 0
-                                        })
-                                    except:
-                                        pass
-                            if len(records) >= 5:
-                                df = pd.DataFrame(records).sort_values('date').reset_index(drop=True)
-                                set_to_cache(key, df)
-                                return df
-        except Exception as e:
-            print(f"Ошибка fetch_candles_intraday: {e}")
+            print(f"Ошибка: {e}")
         return None
 
     async def close(self):
@@ -311,14 +251,7 @@ class DataFetcher:
 
 data_fetcher = DataFetcher()
 
-# === РАСЧЁТ ИНДИКАТОРОВ ===
-def calculate_macd(series, fast=12, slow=26, signal=9):
-    ema_fast = series.ewm(span=fast, adjust=False).mean()
-    ema_slow = series.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line, macd_line - signal_line
-
+# === УПРОЩЁННЫЙ РАСЧЁТ ИНДИКАТОРОВ (только MA + ADX) ===
 def calculate_adx(df, period=14):
     if len(df) < period + 5:
         return 20
@@ -343,110 +276,86 @@ def calculate_adx(df, period=14):
 def calc_trend(df):
     if df is None or len(df) < 30:
         return "недостаточно данных"
-    ma20 = df['close'].rolling(20).mean().iloc[-1]
-    ma50 = df['close'].rolling(50).mean().iloc[-1] if len(df) >= 50 else ma20
-    if np.isnan(ma20) or np.isnan(ma50):
+    ma10 = df['close'].rolling(STRATEGY['MA_FAST']).mean().iloc[-1]
+    ma30 = df['close'].rolling(STRATEGY['MA_SLOW']).mean().iloc[-1]
+    if np.isnan(ma10) or np.isnan(ma30):
         return "недостаточно данных"
-    spread = abs(ma20 - ma50) / ma50 * 100
-    return "боковик" if spread < 0.7 else ("бычий" if ma20 > ma50 else "медвежий")
+    return "бычий" if ma10 > ma30 else "медвежий" if ma10 < ma30 else "боковик"
 
-def calc_indicators(df):
-    if df is None or len(df) < 30:
-        return None
-    rsi = ta.momentum.RSIIndicator(df['close'], window=14).rsi().iloc[-1]
-    macd_line, macd_signal, _ = calculate_macd(df['close'], 12, 26, 9)
-    return {
-        'rsi': round(rsi, 1),
-        'rsi_status': "перекупленность" if rsi > 70 else "перепроданность" if rsi < 30 else "нейтрально",
-        'macd_status': "бычий" if macd_line.iloc[-1] > macd_signal.iloc[-1] else "медвежий"
-    }
-
-# === ГЕНЕРАЦИЯ СИГНАЛОВ ===
-async def get_sber_swing_signal(df, price):
+# === УПРОЩЁННЫЙ СИГНАЛ (только MA пересечения + ADX) ===
+async def get_sber_signal(df, price):
+    """Сигнал только на основе MA пересечений и ADX"""
     if df is None or len(df) < 50:
         return None, None
     
     last = df.iloc[-1]
     prev = df.iloc[-2] if len(df) > 1 else last
     
-    ma20 = df['close'].rolling(20).mean()
-    ma50 = df['close'].rolling(50).mean()
-    last_ma20 = ma20.iloc[-1]
-    last_ma50 = ma50.iloc[-1]
-    prev_ma20 = ma20.iloc[-2] if len(ma20) > 1 else last_ma20
-    prev_ma50 = ma50.iloc[-2] if len(ma50) > 1 else last_ma50
+    ma10 = df['close'].rolling(STRATEGY['MA_FAST']).mean()
+    ma30 = df['close'].rolling(STRATEGY['MA_SLOW']).mean()
     
-    rsi = ta.momentum.RSIIndicator(df['close'], window=14).rsi().iloc[-1]
-    macd_line, macd_signal, _ = calculate_macd(df['close'], 12, 26, 9)
-    macd_bullish = macd_line.iloc[-1] > macd_signal.iloc[-1]
+    last_ma10 = ma10.iloc[-1]
+    last_ma30 = ma30.iloc[-1]
+    prev_ma10 = ma10.iloc[-2] if len(ma10) > 1 else last_ma10
+    prev_ma30 = ma30.iloc[-2] if len(ma30) > 1 else last_ma30
+    
     adx = calculate_adx(df)
     
-    volume_ratio = 1.0
-    if 'volume' in df.columns and len(df) > 20:
-        vol_avg = df['volume'].rolling(20).mean().iloc[-1]
-        volume_ratio = df['volume'].iloc[-1] / vol_avg if vol_avg > 0 else 1.0
+    # Золотое пересечение (бычий сигнал)
+    golden_cross = (last_ma10 > last_ma30) and (prev_ma10 <= prev_ma30)
+    # Мёртвое пересечение (медвежий сигнал)
+    dead_cross = (last_ma10 < last_ma30) and (prev_ma10 >= prev_ma30)
     
-    ma_cross_up = (last_ma20 > last_ma50) and (prev_ma20 <= prev_ma50)
-    ma_cross_down = (last_ma20 < last_ma50) and (prev_ma20 >= prev_ma50)
+    # Трендовый сигнал (уже в тренде)
+    trend_long = (price > last_ma30) and (last_ma10 > last_ma30) and (adx > STRATEGY['ADX_THRESHOLD'])
+    trend_short = (price < last_ma30) and (last_ma10 < last_ma30) and (adx > STRATEGY['ADX_THRESHOLD'])
     
-    long_cond = ((price > last_ma50 and last_ma20 > last_ma50) or ma_cross_up) and volume_ratio > STRATEGY['VOLUME_RATIO_LONG'] and rsi < STRATEGY['RSI_OVERBOUGHT'] and adx > STRATEGY['ADX_THRESHOLD']
-    short_cond = ((price < last_ma50 and last_ma20 < last_ma50) or ma_cross_down) and volume_ratio > STRATEGY['VOLUME_RATIO_SHORT'] and rsi > STRATEGY['RSI_OVERSOLD'] and adx > STRATEGY['ADX_THRESHOLD']
-    
-    if long_cond:
-        return "LONG", {'price': price, 'target': price * (1 + STRATEGY['TAKE_PROFIT']), 'stop': price * (1 - STRATEGY['STOP_LOSS']), 'rsi': round(rsi, 1), 'adx': round(adx, 1), 'ma20': round(last_ma20, 2), 'ma50': round(last_ma50, 2), 'volume_ratio': round(volume_ratio, 1), 'macd': "бычий" if macd_bullish else "медвежий"}
-    if short_cond:
-        return "SHORT", {'price': price, 'target': price * (1 - STRATEGY['TAKE_PROFIT']), 'stop': price * (1 + STRATEGY['STOP_LOSS']), 'rsi': round(rsi, 1), 'adx': round(adx, 1), 'ma20': round(last_ma20, 2), 'ma50': round(last_ma50, 2), 'volume_ratio': round(volume_ratio, 1), 'macd': "медвежий" if not macd_bullish else "бычий"}
-    
-    return None, None
-
-async def get_sber_intraday_signal(df, price):
-    if df is None or len(df) < 20:
-        return None, None
-    
-    last = df.iloc[-1]
-    ma10 = df['close'].rolling(10).mean().iloc[-1]
-    rsi = ta.momentum.RSIIndicator(df['close'], window=10).rsi().iloc[-1]
-    macd_line, macd_signal, _ = calculate_macd(df['close'], 5, 13, 5)
-    macd_bullish = macd_line.iloc[-1] > macd_signal.iloc[-1]
-    
-    volume_ratio = 1.0
-    if 'volume' in df.columns and len(df) > 10:
-        vol_avg = df['volume'].rolling(10).mean().iloc[-1]
-        volume_ratio = df['volume'].iloc[-1] / vol_avg if vol_avg > 0 else 1.0
-    
-    long_cond = price > ma10 and volume_ratio > 1.2 and 35 < rsi < 65 and macd_bullish and last['close'] > df['close'].iloc[-2] * 1.001
-    short_cond = price < ma10 and volume_ratio > 1.2 and 35 < rsi < 65 and not macd_bullish and last['close'] < df['close'].iloc[-2] * 0.999
-    
-    if long_cond:
-        return "LONG", {'price': price, 'target': price * 1.01, 'stop': price * 0.995, 'rsi': round(rsi, 1), 'volume_ratio': round(volume_ratio, 1)}
-    if short_cond:
-        return "SHORT", {'price': price, 'target': price * 0.99, 'stop': price * 1.005, 'rsi': round(rsi, 1), 'volume_ratio': round(volume_ratio, 1)}
+    if golden_cross or trend_long:
+        return "LONG", {
+            'price': price,
+            'target': price * (1 + STRATEGY['TAKE_PROFIT']),
+            'stop': price * (1 - STRATEGY['STOP_LOSS']),
+            'adx': round(adx, 1),
+            'ma10': round(last_ma10, 2),
+            'ma30': round(last_ma30, 2),
+            'signal_type': "ЗОЛОТОЕ ПЕРЕСЕЧЕНИЕ" if golden_cross else "ТРЕНД"
+        }
+    if dead_cross or trend_short:
+        return "SHORT", {
+            'price': price,
+            'target': price * (1 - STRATEGY['TAKE_PROFIT']),
+            'stop': price * (1 + STRATEGY['STOP_LOSS']),
+            'adx': round(adx, 1),
+            'ma10': round(last_ma10, 2),
+            'ma30': round(last_ma30, 2),
+            'signal_type': "МЁРТВОЕ ПЕРЕСЕЧЕНИЕ" if dead_cross else "ТРЕНД"
+        }
     
     return None, None
 
 async def get_exit_signal(df, price, position_type):
+    """Выход при обратном пересечении MA"""
     if df is None or len(df) < 20 or position_type is None:
         return False, None
     
-    rsi = ta.momentum.RSIIndicator(df['close'], window=14).rsi().iloc[-1]
-    macd_line, macd_signal, _ = calculate_macd(df['close'], 12, 26, 9)
-    ma20 = df['close'].rolling(20).mean().iloc[-1]
-    ma50 = df['close'].rolling(50).mean().iloc[-1]
+    ma10 = df['close'].rolling(STRATEGY['MA_FAST']).mean()
+    ma30 = df['close'].rolling(STRATEGY['MA_SLOW']).mean()
+    
+    last_ma10 = ma10.iloc[-1]
+    last_ma30 = ma30.iloc[-1]
+    prev_ma10 = ma10.iloc[-2] if len(ma10) > 1 else last_ma10
+    prev_ma30 = ma30.iloc[-2] if len(ma30) > 1 else last_ma30
     
     if position_type == 'long':
-        if rsi > STRATEGY['RSI_OVERBOUGHT']:
-            return True, f"RSI={rsi:.1f} (перекупленность)"
-        if macd_line.iloc[-1] < macd_signal.iloc[-1]:
-            return True, "MACD разворот вниз"
-        if ma20 < ma50:
-            return True, "MA20 ниже MA50"
+        # Выход из лонга при мёртвом пересечении
+        dead_cross = (last_ma10 < last_ma30) and (prev_ma10 >= prev_ma30)
+        if dead_cross:
+            return True, "MA10 ниже MA30 (мёртвое пересечение)"
     elif position_type == 'short':
-        if rsi < STRATEGY['RSI_OVERSOLD']:
-            return True, f"RSI={rsi:.1f} (перепроданность)"
-        if macd_line.iloc[-1] > macd_signal.iloc[-1]:
-            return True, "MACD разворот вверх"
-        if ma20 > ma50:
-            return True, "MA20 выше MA50"
+        # Выход из шорта при золотом пересечении
+        golden_cross = (last_ma10 > last_ma30) and (prev_ma10 <= prev_ma30)
+        if golden_cross:
+            return True, "MA10 выше MA30 (золотое пересечение)"
     
     return False, None
 
@@ -467,11 +376,16 @@ async def send_sber_signal():
     
     await reset_daily_pnl()
     
-    df_daily = await data_fetcher.fetch_candles_daily("SBER", 100)
-    df_intraday = await data_fetcher.fetch_candles_intraday("SBER", 120)
+    # Проверка лунного запрета
+    lunar_blackout, full_moon_date = is_lunar_blackout()
+    if lunar_blackout:
+        # Не отправляем сигналы, но не спамим
+        return
+    
+    df = await data_fetcher.fetch_candles_daily("SBER", 100)
     price = await data_fetcher.get_price("SBER")
     
-    if df_daily is None or price is None:
+    if df is None or price is None:
         return
     
     if daily_pnl < -STRATEGY['DAILY_LOSS_LIMIT']:
@@ -481,33 +395,28 @@ async def send_sber_signal():
             current_position['type'] = None
         return
     
-    swing_signal, swing_data = await get_sber_swing_signal(df_daily, price)
-    intra_signal, intra_data = await get_sber_intraday_signal(df_intraday, price)
-    exit_needed, exit_reason = await get_exit_signal(df_daily, price, current_position['type'])
+    signal, data = await get_sber_signal(df, price)
+    exit_needed, exit_reason = await get_exit_signal(df, price, current_position['type'])
     
     now = datetime.now(pytz.timezone('Europe/Moscow'))
-    signal_key = f"{swing_signal}_{intra_signal}_{current_position['type']}"
+    signal_key = f"{signal}_{current_position['type']}"
     if signal_key == last_signal_sent.get('signal') and (now - last_signal_sent.get('time', datetime.min)).seconds < 300:
         return
     
-    msg = f"📊 <b>СБЕР</b> {now.strftime('%d.%m %H:%M')}\n━━━━━━━━━━━━━━━━━━━\n💰 Цена: <b>{price:.2f} ₽</b>\n\n"
+    msg = f"📊 <b>СБЕР</b> {now.strftime('%d.%m %H:%M')}\n━━━━━━━━━━━━━━━━━━━\n💰 Цена: <b>{price:.2f} ₽</b>\n"
     
-    if intra_signal:
-        msg += f"🟢 ВНУТРИДНЕВНОЙ: {intra_signal}\n   🎯 {intra_data['target']:.2f} | 🛑 {intra_data['stop']:.2f}\n   RSI: {intra_data['rsi']} | Объём: {intra_data['volume_ratio']}x\n\n"
+    if signal:
+        msg += f"\n🟢 СИГНАЛ: {signal}\n   📊 {data['signal_type']}\n   🎯 {data['target']:.2f} | 🛑 {data['stop']:.2f}\n   ADX: {data['adx']} | MA10: {data['ma10']} | MA30: {data['ma30']}\n"
     else:
-        msg += f"⚪ ВНУТРИДНЕВНОЙ: НЕТ\n\n"
-    
-    if swing_signal:
-        msg += f"🟢 СВИНГ: {swing_signal}\n   🎯 {swing_data['target']:.2f} | 🛑 {swing_data['stop']:.2f}\n   MA20: {swing_data['ma20']} | MA50: {swing_data['ma50']}\n   RSI: {swing_data['rsi']} | ADX: {swing_data['adx']} | Объём: {swing_data['volume_ratio']}x\n\n"
-    else:
-        msg += f"⚪ СВИНГ: НЕТ (ADX<25 или флет)\n\n"
+        adx = calculate_adx(df)
+        msg += f"\n⚪ СИГНАЛ: НЕТ\n   ADX: {adx:.1f} (тренд {'есть' if adx > 20 else 'отсутствует'})\n"
     
     if current_position['type']:
         pnl = (price - current_position['entry_price']) / current_position['entry_price'] * 100
         if current_position['type'] == 'short':
             pnl = -pnl
         manual_mark = " (ручная)" if current_position.get('is_manual') else ""
-        msg += f"📌 ПОЗИЦИЯ: {current_position['type'].upper()}{manual_mark}\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n"
+        msg += f"\n📌 ПОЗИЦИЯ: {current_position['type'].upper()}{manual_mark}\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n"
     
     if exit_needed:
         msg += f"\n🚨 ВЫХОД: {exit_reason}\n"
@@ -520,22 +429,18 @@ async def send_sber_signal():
         save_trade(current_position['type'], current_position['entry_price'], price, pnl_after_commission, commission_cost, current_position.get('is_manual', False))
         current_position['type'] = None
     
-    elif not current_position['type']:
-        if swing_signal:
-            current_position['type'] = swing_signal.lower()
-            current_position['entry_price'] = swing_data['price']
-            current_position['entry_time'] = now
-            current_position['signal_type'] = 'swing'
-            current_position['is_manual'] = False
-            msg += f"\n✅ ВХОД {swing_signal} (свинг)\n"
-        elif intra_signal:
-            if now.hour < 18 or (now.hour == 18 and now.minute < 45):
-                current_position['type'] = intra_signal.lower()
-                current_position['entry_price'] = intra_data['price']
-                current_position['entry_time'] = now
-                current_position['signal_type'] = 'intraday'
-                current_position['is_manual'] = False
-                msg += f"\n✅ ВХОД {intra_signal} (внутридневной)\n"
+    elif not current_position['type'] and signal:
+        current_position['type'] = signal.lower()
+        current_position['entry_price'] = data['price']
+        current_position['entry_time'] = now
+        current_position['signal_type'] = data['signal_type']
+        current_position['is_manual'] = False
+        msg += f"\n✅ ВХОД {signal}\n"
+    
+    # Информация о лунном запрете
+    if lunar_blackout and full_moon_date:
+        days = (full_moon_date - datetime.now(pytz.timezone('Europe/Moscow')).date()).days
+        msg += f"\n🌕 ЛУННЫЙ ЗАПРЕТ: {'за ' + str(abs(days)) + ' дн. до' if days > 0 else 'после'} полнолуния\n   Торговля приостановлена"
     
     msg += f"\n🤖 Следующий сигнал через 15 мин"
     
@@ -552,23 +457,23 @@ async def sber_signal_loop():
         await asyncio.sleep(15 * 60)
         await send_sber_signal()
 
-# === НОВЫЕ КОМАНДЫ УРОВЕНЬ 1 ===
+# === КОМАНДЫ ===
 @dp.message_handler(commands=['status'])
 async def status_cmd(m):
     price = await data_fetcher.get_price("SBER")
-    df_daily = await data_fetcher.fetch_candles_daily("SBER", 100)
+    df = await data_fetcher.fetch_candles_daily("SBER", 100)
     
-    if price is None or df_daily is None:
+    if price is None or df is None:
         await m.answer("⚠️ Нет данных")
         return
     
-    last = df_daily.iloc[-1]
-    rsi = ta.momentum.RSIIndicator(df_daily['close'], window=14).rsi().iloc[-1]
-    ma20 = df_daily['close'].rolling(20).mean().iloc[-1]
-    ma50 = df_daily['close'].rolling(50).mean().iloc[-1]
-    trend = "бычий 📈" if ma20 > ma50 else "медвежий 📉" if ma20 < ma50 else "боковик ⚪"
+    ma10 = df['close'].rolling(STRATEGY['MA_FAST']).mean().iloc[-1]
+    ma30 = df['close'].rolling(STRATEGY['MA_SLOW']).mean().iloc[-1]
+    adx = calculate_adx(df)
+    trend = "бычий 📈" if ma10 > ma30 else "медвежий 📉" if ma10 < ma30 else "боковик ⚪"
+    lunar_blackout, full_moon_date = is_lunar_blackout()
     
-    msg = f"📊 <b>СБЕР - СТАТУС</b>\n━━━━━━━━━━━━━━━━━━━\n💰 Цена: <b>{price:.2f} ₽</b>\n📈 RSI: {rsi:.1f}\n📉 Тренд: {trend}\n📊 MA20: {ma20:.2f} | MA50: {ma50:.2f}\n\n"
+    msg = f"📊 <b>СБЕР - СТАТУС</b>\n━━━━━━━━━━━━━━━━━━━\n💰 Цена: <b>{price:.2f} ₽</b>\n📈 Тренд: {trend}\n📊 MA10: {ma10:.2f} | MA30: {ma30:.2f}\n📈 ADX: {adx:.1f} ({'тренд есть' if adx > 20 else 'флет'})\n\n"
     
     if current_position['type']:
         pnl = (price - current_position['entry_price']) / current_position['entry_price'] * 100
@@ -577,17 +482,21 @@ async def status_cmd(m):
         commission_cost = COMMISSION * 2 * 100
         pnl_with_comm = pnl - commission_cost
         manual_mark = " (ручная)" if current_position.get('is_manual') else ""
-        msg += f"📌 ПОЗИЦИЯ: {current_position['type'].upper()}{manual_mark}\n   💰 Вход: {current_position['entry_price']:.2f} ₽\n   📊 Текущий P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n   💸 P&L с комиссией: {'+' if pnl_with_comm >= 0 else ''}{pnl_with_comm:.2f}%\n"
+        msg += f"📌 ПОЗИЦИЯ: {current_position['type'].upper()}{manual_mark}\n   💰 Вход: {current_position['entry_price']:.2f} ₽\n   📊 P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n   💸 С комиссией: {'+' if pnl_with_comm >= 0 else ''}{pnl_with_comm:.2f}%\n"
         if current_position['type'] == 'long':
             stop = current_position['entry_price'] * (1 - STRATEGY['STOP_LOSS'])
             take = current_position['entry_price'] * (1 + STRATEGY['TAKE_PROFIT'])
-            msg += f"   🛑 Стоп: {stop:.2f} (-{STRATEGY['STOP_LOSS']*100:.0f}%)\n   🎯 Тейк: {take:.2f} (+{STRATEGY['TAKE_PROFIT']*100:.0f}%)\n"
+            msg += f"   🛑 Стоп: {stop:.2f} | 🎯 Тейк: {take:.2f}\n"
         else:
             stop = current_position['entry_price'] * (1 + STRATEGY['STOP_LOSS'])
             take = current_position['entry_price'] * (1 - STRATEGY['TAKE_PROFIT'])
-            msg += f"   🛑 Стоп: {stop:.2f} (+{STRATEGY['STOP_LOSS']*100:.0f}%)\n   🎯 Тейк: {take:.2f} (-{STRATEGY['TAKE_PROFIT']*100:.0f}%)\n"
+            msg += f"   🛑 Стоп: {stop:.2f} | 🎯 Тейк: {take:.2f}\n"
     else:
         msg += "📌 ПОЗИЦИЯ: НЕТ\n"
+    
+    if lunar_blackout and full_moon_date:
+        days = (full_moon_date - datetime.now(pytz.timezone('Europe/Moscow')).date()).days
+        msg += f"\n🌕 ЛУННЫЙ ЗАПРЕТ: {'за ' + str(abs(days)) + ' дн. до' if days > 0 else 'после'} полнолуния\n   Новые сигналы не принимаются\n"
     
     msg += f"\n📅 Дневной P&L: {'+' if daily_pnl*100 >= 0 else ''}{daily_pnl*100:.2f}% (лимит -{STRATEGY['DAILY_LOSS_LIMIT']*100:.0f}%)"
     
@@ -604,6 +513,11 @@ async def open_cmd(m):
     
     if current_position['type'] is not None:
         await m.answer(f"⚠️ Уже есть открытая позиция {current_position['type'].upper()}. Сначала закройте её /close")
+        return
+    
+    lunar_blackout, full_moon_date = is_lunar_blackout()
+    if lunar_blackout:
+        await m.answer(f"🌕 ЛУННЫЙ ЗАПРЕТ: торговля приостановлена на {STRATEGY['LUNAR_BLACKOUT_DAYS']} дн. до/после полнолуния")
         return
     
     direction = parts[1].upper()
@@ -629,11 +543,11 @@ async def open_cmd(m):
     if direction == 'LONG':
         stop = entry_price * (1 - STRATEGY['STOP_LOSS'])
         take = entry_price * (1 + STRATEGY['TAKE_PROFIT'])
-        msg += f"🛑 Стоп: {stop:.2f} (-{STRATEGY['STOP_LOSS']*100:.0f}%)\n🎯 Тейк: {take:.2f} (+{STRATEGY['TAKE_PROFIT']*100:.0f}%)"
+        msg += f"🛑 Стоп: {stop:.2f} | 🎯 Тейк: {take:.2f}"
     else:
         stop = entry_price * (1 + STRATEGY['STOP_LOSS'])
         take = entry_price * (1 - STRATEGY['TAKE_PROFIT'])
-        msg += f"🛑 Стоп: {stop:.2f} (+{STRATEGY['STOP_LOSS']*100:.0f}%)\n🎯 Тейк: {take:.2f} (-{STRATEGY['TAKE_PROFIT']*100:.0f}%)"
+        msg += f"🛑 Стоп: {stop:.2f} | 🎯 Тейк: {take:.2f}"
     
     await m.answer(msg, parse_mode='HTML')
 
@@ -657,7 +571,7 @@ async def close_cmd(m):
     commission_cost = COMMISSION * 2 * 100
     pnl_after_commission = pnl - commission_cost
     
-    msg = f"✅ <b>РУЧНОЕ ЗАКРЫТИЕ ПОЗИЦИИ</b>\n\n📌 {current_position['type'].upper()}\n💰 Вход: {current_position['entry_price']:.2f} ₽\n💰 Выход: {price:.2f} ₽\n📊 P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n💸 P&L с комиссией ({COMMISSION*100:.1f}%): {'+' if pnl_after_commission >= 0 else ''}{pnl_after_commission:.2f}%\n"
+    msg = f"✅ <b>РУЧНОЕ ЗАКРЫТИЕ ПОЗИЦИИ</b>\n\n📌 {current_position['type'].upper()}\n💰 Вход: {current_position['entry_price']:.2f} ₽\n💰 Выход: {price:.2f} ₽\n📊 P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n💸 С комиссией: {'+' if pnl_after_commission >= 0 else ''}{pnl_after_commission:.2f}%\n"
     
     daily_pnl += pnl_after_commission / 100
     save_trade(current_position['type'], current_position['entry_price'], price, pnl_after_commission, commission_cost, current_position.get('is_manual', False))
@@ -679,7 +593,7 @@ async def balance_cmd(m):
     msg += f"   Убыточных: {stats['losing_trades']}\n"
     msg += f"   Win Rate: {stats['win_rate']:.1f}%\n"
     msg += f"   Общий P&L: {'+' if stats['total_pnl'] >= 0 else ''}{stats['total_pnl']:.2f}%\n"
-    msg += f"   Средний P&L на сделку: {'+' if stats['avg_pnl'] >= 0 else ''}{stats['avg_pnl']:.2f}%\n\n"
+    msg += f"   Средний P&L: {'+' if stats['avg_pnl'] >= 0 else ''}{stats['avg_pnl']:.2f}%\n\n"
     
     msg += f"📅 <b>СЕГОДНЯ</b>\n"
     msg += f"   P&L: {'+' if daily_pnl*100 >= 0 else ''}{daily_pnl*100:.2f}%\n"
@@ -693,7 +607,7 @@ async def balance_cmd(m):
         msg += f"\n📌 <b>ТЕКУЩАЯ ПОЗИЦИЯ</b>\n"
         msg += f"   {current_position['type'].upper()} | Вход: {current_position['entry_price']:.2f}\n"
         msg += f"   Текущий P&L: {'+' if pnl_current >= 0 else ''}{pnl_current:.2f}%\n"
-        msg += f"   P&L с комиссией: {'+' if pnl_current - commission_cost >= 0 else ''}{pnl_current - commission_cost:.2f}%\n"
+        msg += f"   С комиссией: {'+' if pnl_current - commission_cost >= 0 else ''}{pnl_current - commission_cost:.2f}%\n"
     
     await m.answer(msg, parse_mode='HTML')
 
@@ -724,20 +638,18 @@ keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# === КОМАНДЫ ===
 @dp.message_handler(commands=['start'])
 async def start_cmd(m):
     await m.answer(
         "📊 **АНАЛИТИК**\n\n"
-        "📊 17 акций\n\n"
+        "🔹 **СТРАТЕГИЯ:** MA10/MA30 + ADX\n"
+        "🔹 **ЛУННЫЙ ФИЛЬТР:** запрет за 2 дня до/после полнолуния\n"
+        "🔹 **СТОП/ТЕЙК:** 6% / 12%\n\n"
         "🔹 **КОМАНДЫ:**\n"
         "   /status — текущее состояние\n"
         "   /open LONG 310 — открыть позицию\n"
         "   /close — закрыть позицию\n"
-        "   /balance — статистика\n"
-        "   📈 Открыть позицию\n"
-        "   📊 Историческая статистика\n"
-        "   📈 График акции\n\n"
+        "   /balance — статистика\n\n"
         "🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard",
         reply_markup=keyboard, parse_mode='Markdown')
 
@@ -745,9 +657,13 @@ async def start_cmd(m):
 async def btn_lunar(m):
     ph, dt, nxt = get_lunar_info()
     now = datetime.now(pytz.timezone('Europe/Moscow'))
+    lunar_blackout, full_moon_date = is_lunar_blackout()
     txt = f"🌙 {ph.upper()}\n📅 {now.strftime('%d.%m.%Y')}\n"
     if nxt:
-        txt += f"🌕 Полнолуние: {nxt.strftime('%d.%m.%Y %H:%M')}"
+        txt += f"🌕 Полнолуние: {nxt.strftime('%d.%m.%Y %H:%M')}\n"
+    if lunar_blackout and full_moon_date:
+        days = (full_moon_date - now.date()).days
+        txt += f"\n⚠️ ЛУННЫЙ ЗАПРЕТ: {'за ' + str(abs(days)) + ' дн. до' if days > 0 else 'после'} полнолуния\n   Новые сигналы не принимаются"
     await m.answer(txt)
 
 @dp.message_handler(lambda msg: msg.text == "📊 Историческая статистика")
@@ -776,20 +692,18 @@ async def chart(m):
         return
     plt.figure(figsize=(12,5))
     plt.plot(df['date'], df['close'], 'b-', label='Цена')
-    if len(df) >= 20:
-        plt.plot(df['date'], df['close'].rolling(20).mean(), 'g--', label='MA20')
-    if len(df) >= 50:
-        plt.plot(df['date'], df['close'].rolling(50).mean(), 'r--', label='MA50')
+    if len(df) >= STRATEGY['MA_FAST']:
+        plt.plot(df['date'], df['close'].rolling(STRATEGY['MA_FAST']).mean(), 'g--', label=f'MA{STRATEGY["MA_FAST"]}')
+    if len(df) >= STRATEGY['MA_SLOW']:
+        plt.plot(df['date'], df['close'].rolling(STRATEGY['MA_SLOW']).mean(), 'r--', label=f'MA{STRATEGY["MA_SLOW"]}')
     plt.title(TICKERS[ticker]['name'])
     plt.grid()
     buf = BytesIO()
     plt.savefig(buf, format='png')
     buf.seek(0)
     plt.close()
-    ind = calc_indicators(df)
-    cap = f"{TICKERS[ticker]['name']}\nRSI: {ind['rsi']} ({ind['rsi_status']}) | {ind['macd_status']}" if ind else ""
     await msg.delete()
-    await m.answer_photo(buf, caption=cap)
+    await m.answer_photo(buf)
 
 # === ЕЖЕДНЕВНАЯ СВОДКА ===
 async def daily_job():
@@ -803,10 +717,14 @@ async def daily_job():
     tr = await get_all_trends()
     long = sum(1 for d in tr.values() if d['trend'] == 'бычий')
     short = sum(1 for d in tr.values() if d['trend'] == 'медвежий')
+    lunar_blackout, full_moon_date = is_lunar_blackout()
     txt = f"🌙 **{datetime.now(msk).strftime('%d.%m.%Y')}**\n"
     if nxt:
         txt += f"🌕 Полнолуние {nxt.strftime('%d.%m.%Y')}\n"
-    txt += f"🟢 LONG: {long}  🔴 SHORT: {short}\n💡 /status /balance"
+    txt += f"🟢 LONG: {long}  🔴 SHORT: {short}\n"
+    if lunar_blackout:
+        txt += f"⚠️ ЛУННЫЙ ЗАПРЕТ: торги приостановлены\n"
+    txt += f"💡 /status /balance"
     save_daily_summary(today, txt)
     try:
         await bot.send_message(CHANNEL_ID, txt, parse_mode='Markdown')
@@ -826,9 +744,9 @@ async def moon_notify():
         now = datetime.now(pytz.timezone('Europe/Moscow'))
         _, _, nxt = get_lunar_info()
         if nxt:
-            if (nxt - timedelta(days=1)).date() == now.date() and last.get('before') != nxt.date():
+            if (nxt - timedelta(days=STRATEGY['LUNAR_BLACKOUT_DAYS'])).date() == now.date() and last.get('before') != nxt.date():
                 last['before'] = nxt.date()
-                await bot.send_message(MY_CHAT_ID, f"🌕 ЗАВТРА ПОЛНОЛУНИЕ — точка входа")
+                await bot.send_message(MY_CHAT_ID, f"🌕 ЗА {STRATEGY['LUNAR_BLACKOUT_DAYS']} ДНЯ ДО ПОЛНОЛУНИЯ\nТорговля приостанавливается")
             if nxt.date() == now.date() and last.get('today') != nxt.date():
                 last['today'] = nxt.date()
                 await bot.send_message(MY_CHAT_ID, f"🌕 СЕГОДНЯ ПОЛНОЛУНИЕ — ТОЧКА ВХОДА")
@@ -894,7 +812,7 @@ async def on_startup(dp):
     asyncio.create_task(moon_notify())
     asyncio.create_task(sber_signal_loop())
     try:
-        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n📊 Аналитик | Сигналы по Сберу каждые 15 мин\n\n🔹 Команды:\n/status — текущее состояние\n/open LONG 310 — открыть позицию\n/close — закрыть позицию\n/balance — статистика\n\n🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard")
+        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n📊 Аналитик | Стратегия MA10/MA30\n🌕 Лунный фильтр: запрет за 2 дня до/после полнолуния\n\n🔹 Команды:\n/status — текущее состояние\n/open LONG 310 — открыть позицию\n/close — закрыть позицию\n/balance — статистика\n\n🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard")
     except:
         pass
 
@@ -904,7 +822,8 @@ async def on_shutdown(dp):
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("АНАЛИТИК | СБЕР СИГНАЛЫ КАЖДЫЕ 15 МИНУТ")
+    print("АНАЛИТИК | УПРОЩЁННАЯ СТРАТЕГИЯ MA10/MA30")
+    print("ЛУННЫЙ ФИЛЬТР | СТОП 6% | ТЕЙК 12%")
     print("КОМАНДЫ: /status, /open, /close, /balance")
     print("=" * 50)
     from aiogram.utils import executor
