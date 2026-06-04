@@ -27,8 +27,8 @@ CHANNEL_ID = os.environ.get("CHANNEL_ID")
 if not BOT_TOKEN:
     raise ValueError("❌ Токен не найден")
 
-# === ПАРАМЕТРЫ СТРАТЕГИИ ===
-STRATEGY = {
+# === ПАРАМЕТРЫ СТРАТЕГИИ СБЕРА ===
+SBER_STRATEGY = {
     'MA_FAST': 10,
     'MA_SLOW': 30,
     'ADX_THRESHOLD': 20,
@@ -38,6 +38,82 @@ STRATEGY = {
 }
 
 COMMISSION = 0.003
+
+# === 17 АКТИВОВ (лунная стратегия) ===
+TICKERS = {
+    "VTBR": {"name": "ВТБ", "return_bull": 5.31, "return_bear": 5.35},
+    "OZON": {"name": "OZON", "return_bull": 3.92, "return_bear": 4.65},
+    "SBER": {"name": "Сбер", "return_bull": 3.62, "return_bear": 4.52},
+    "MGNT": {"name": "Магнит", "return_bull": 4.62, "return_bear": 3.51},
+    "GMKN": {"name": "Норникель", "return_bull": 4.60, "return_bear": 3.55},
+    "NLMK": {"name": "НЛМК", "return_bull": 4.84, "return_bear": 3.91},
+    "MTLR": {"name": "Мечел", "return_bull": 5.41, "return_bear": 4.55},
+    "CBOM": {"name": "МКБ", "return_bull": 4.46, "return_bear": 3.65},
+    "ROSN": {"name": "Роснефть", "return_bull": 4.18, "return_bear": 3.04},
+    "ALRS": {"name": "Алроса", "return_bull": 4.73, "return_bear": 3.91},
+    "WUSH": {"name": "Whoosh", "return_bull": 4.86, "return_bear": 3.93},
+    "LKOH": {"name": "Лукойл", "return_bull": 2.98, "return_bear": 3.43},
+    "GAZP": {"name": "Газпром", "return_bull": 4.40, "return_bear": 3.35},
+    "AFLT": {"name": "Аэрофлот", "return_bull": 4.33, "return_bear": 4.58},
+    "YDEX": {"name": "Яндекс", "return_bull": 2.31, "return_bear": 3.52},
+    "TATN": {"name": "Татнефть", "return_bull": 3.26, "return_bear": 2.79},
+    "ASTR": {"name": "Астра", "return_bull": 3.77, "return_bear": 3.12},
+}
+ALL_TICKERS = list(TICKERS.keys())
+
+# === ЛУННЫЕ ДАННЫЕ (для стратегии Дмитриева) ===
+LUNAR_PHASES = {
+    "full_moons": [
+        ("2026-01-03", "13:04"), ("2026-02-02", "01:10"), ("2026-03-03", "14:39"),
+        ("2026-04-02", "05:13"), ("2026-05-01", "20:24"), ("2026-05-31", "11:46"),
+        ("2026-06-30", "02:58"), ("2026-07-29", "17:37"), ("2026-08-28", "07:19"),
+        ("2026-09-26", "19:50"), ("2026-10-26", "07:13"), ("2026-11-24", "17:55"),
+        ("2026-12-24", "04:29"),
+    ],
+    "new_moons": [
+        ("2026-01-18", "22:53"), ("2026-02-17", "15:03"), ("2026-03-19", "04:26"),
+        ("2026-04-17", "14:54"), ("2026-05-16", "23:03"), ("2026-06-15", "05:56"),
+        ("2026-07-14", "12:45"), ("2026-08-12", "20:37"), ("2026-09-11", "06:27"),
+        ("2026-10-10", "18:50"), ("2026-11-09", "10:02"), ("2026-12-09", "03:52"),
+    ]
+}
+
+def get_lunar_info():
+    """Возвращает текущую фазу луны и дату следующего полнолуния"""
+    msk = pytz.timezone('Europe/Moscow')
+    now = datetime.now(msk)
+    next_full = None
+    for date_str, time_str in LUNAR_PHASES["full_moons"]:
+        dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
+        if dt > now:
+            next_full = dt
+            break
+    for date_str, time_str in LUNAR_PHASES["full_moons"]:
+        dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
+        if (now - dt).days <= 1 and (now - dt).days >= 0:
+            return "полнолуние", dt, next_full
+        if (dt - now).days == 1:
+            return "полнолуние_завтра", dt, next_full
+    for date_str, time_str in LUNAR_PHASES["new_moons"]:
+        dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
+        if abs((now - dt).days) <= 1:
+            return "новолуние", dt, next_full
+    new_moons = [msk.localize(datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M")) for d, t in LUNAR_PHASES["new_moons"]]
+    last_new = max([d for d in new_moons if d <= now], default=None)
+    if last_new:
+        days = (now - last_new).days
+        return ("растущая" if days < 14 else "убывающая"), last_new, next_full
+    return "обычный день", None, next_full
+
+def get_days_until_full_moon():
+    """Возвращает количество дней до следующего полнолуния"""
+    msk = pytz.timezone('Europe/Moscow')
+    now = datetime.now(msk)
+    for date_str, time_str in LUNAR_PHASES["full_moons"]:
+        dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
+        if dt > now:
+            return (dt - now).days
+    return None
 
 # === КЭШ ===
 data_cache = {}
@@ -54,33 +130,12 @@ def get_from_cache(key):
 def set_to_cache(key, data):
     data_cache[key] = (data, datetime.now())
 
-# === АКТИВЫ ===
-TICKERS = {
-    "SBER": {"name": "Сбер", "return_bull": 3.62, "return_bear": 4.52},
-    "VTBR": {"name": "ВТБ", "return_bull": 5.31, "return_bear": 5.35},
-    "GAZP": {"name": "Газпром", "return_bull": 4.40, "return_bear": 3.35},
-    "LKOH": {"name": "Лукойл", "return_bull": 2.98, "return_bear": 3.43},
-    "ROSN": {"name": "Роснефть", "return_bull": 4.18, "return_bear": 3.04},
-    "TATN": {"name": "Татнефть", "return_bull": 3.26, "return_bear": 2.79},
-    "NLMK": {"name": "НЛМК", "return_bull": 4.84, "return_bear": 3.91},
-    "GMKN": {"name": "Норникель", "return_bull": 4.60, "return_bear": 3.55},
-    "MTLR": {"name": "Мечел", "return_bull": 5.41, "return_bear": 4.55},
-    "ALRS": {"name": "Алроса", "return_bull": 4.73, "return_bear": 3.91},
-    "AFLT": {"name": "Аэрофлот", "return_bull": 4.33, "return_bear": 4.58},
-    "YDEX": {"name": "Яндекс", "return_bull": 2.31, "return_bear": 3.52},
-    "OZON": {"name": "OZON", "return_bull": 3.92, "return_bear": 4.65},
-    "MGNT": {"name": "Магнит", "return_bull": 4.62, "return_bear": 3.51},
-    "CBOM": {"name": "МКБ", "return_bull": 4.46, "return_bear": 3.65},
-    "WUSH": {"name": "Whoosh", "return_bull": 4.86, "return_bear": 3.93},
-    "ASTR": {"name": "Астра", "return_bull": 3.77, "return_bear": 3.12},
-}
-ALL_TICKERS = list(TICKERS.keys())
-
-# === СОСТОЯНИЕ ===
+# === СОСТОЯНИЕ ДЛЯ СБЕРА ===
 current_position = {'type': None, 'entry_price': None, 'entry_time': None, 'is_manual': False}
 last_signal_sent = {'signal': None, 'price': None, 'time': None}
 daily_pnl = 0.0
 last_reset_date = None
+lunar_notified_days = set()
 
 # === БАЗА ДАННЫХ ===
 def init_db():
@@ -118,40 +173,6 @@ def save_daily_summary(date, summary):
     with sqlite3.connect('bot_data.db') as conn:
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO daily_summary (date, summary) VALUES (?, ?)", (date, summary))
-
-# === ЛУННЫЕ ДАННЫЕ (только для кнопки, не влияют на стратегию) ===
-LUNAR_PHASES = {
-    "full_moons": [
-        ("2026-01-03", "13:04"), ("2026-02-02", "01:10"), ("2026-03-03", "14:39"),
-        ("2026-04-02", "05:13"), ("2026-05-01", "20:24"), ("2026-05-31", "11:46"),
-        ("2026-06-30", "02:58"), ("2026-07-29", "17:37"), ("2026-08-28", "07:19"),
-        ("2026-09-26", "19:50"), ("2026-10-26", "07:13"), ("2026-11-24", "17:55"),
-        ("2026-12-24", "04:29"),
-    ],
-    "new_moons": [
-        ("2026-01-18", "22:53"), ("2026-02-17", "15:03"), ("2026-03-19", "04:26"),
-        ("2026-04-17", "14:54"), ("2026-05-16", "23:03"), ("2026-06-15", "05:56"),
-        ("2026-07-14", "12:45"), ("2026-08-12", "20:37"), ("2026-09-11", "06:27"),
-        ("2026-10-10", "18:50"), ("2026-11-09", "10:02"), ("2026-12-09", "03:52"),
-    ]
-}
-
-def get_lunar_info():
-    msk = pytz.timezone('Europe/Moscow')
-    now = datetime.now(msk)
-    next_full = None
-    for date_str, time_str in LUNAR_PHASES["full_moons"]:
-        dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
-        if dt > now:
-            next_full = dt
-            break
-    for date_str, time_str in LUNAR_PHASES["full_moons"]:
-        dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
-        if (now - dt).days <= 1 and (now - dt).days >= 0:
-            return "полнолуние", dt, next_full
-        if (dt - now).days == 1:
-            return "полнолуние_завтра", dt, next_full
-    return "обычный день", None, next_full
 
 # === MOEX ===
 class DataFetcher:
@@ -231,7 +252,7 @@ class DataFetcher:
                                 set_to_cache(key, df)
                                 return df
         except Exception as e:
-            print(f"Ошибка daily: {e}")
+            print(f"Ошибка: {e}")
         return None
 
     async def close(self):
@@ -273,15 +294,29 @@ def get_trend(df):
         return "bearish"
     return "neutral"
 
-def calc_trend(df):
+def calc_trend_for_ticker(df):
+    """Для лунной стратегии — определение тренда для одного тикера"""
     if df is None or len(df) < 30:
         return "недостаточно данных"
-    ma10 = df['close'].rolling(10).mean().iloc[-1]
-    ma30 = df['close'].rolling(30).mean().iloc[-1]
-    return "бычий" if ma10 > ma30 else "медвежий" if ma10 < ma30 else "боковик"
+    ma18 = df['close'].rolling(18).mean().iloc[-1]
+    ma50 = df['close'].rolling(50).mean().iloc[-1] if len(df) >= 50 else ma18
+    if np.isnan(ma18) or np.isnan(ma50):
+        return "недостаточно данных"
+    spread = abs(ma18 - ma50) / ma50 * 100
+    return "боковик" if spread < 0.7 else ("бычий" if ma18 > ma50 else "медвежий")
 
-# === СИГНАЛ (только дневной) ===
-async def get_signal():
+# === ЛУННАЯ СТРАТЕГИЯ: АНАЛИЗ ВСЕХ 17 АКТИВОВ ===
+async def get_all_trends():
+    results = {}
+    for ticker in ALL_TICKERS:
+        df = await data_fetcher.fetch_candles_daily(ticker, 100)
+        price = await data_fetcher.get_price(ticker)
+        trend = calc_trend_for_ticker(df)
+        results[ticker] = {**TICKERS[ticker], "price": price, "trend": trend}
+    return results
+
+# === СИГНАЛЫ ПО СБЕРУ (3 раза в день) ===
+async def get_sber_signal():
     df = await data_fetcher.fetch_candles_daily("SBER", 100)
     price = await data_fetcher.get_price("SBER")
     
@@ -301,19 +336,19 @@ async def get_signal():
     golden_cross = (last_ma10 > last_ma30) and (prev_ma10 <= prev_ma30)
     dead_cross = (last_ma10 < last_ma30) and (prev_ma10 >= prev_ma30)
     
-    long_cond = golden_cross or (trend == "bullish" and adx > STRATEGY['ADX_THRESHOLD'])
-    short_cond = dead_cross or (trend == "bearish" and adx > STRATEGY['ADX_THRESHOLD'])
+    long_cond = golden_cross or (trend == "bullish" and adx > SBER_STRATEGY['ADX_THRESHOLD'])
+    short_cond = dead_cross or (trend == "bearish" and adx > SBER_STRATEGY['ADX_THRESHOLD'])
     
-    if adx < STRATEGY['ADX_THRESHOLD']:
-        return None, {'trend': trend, 'adx': adx, 'price': price, 'note': f'ADX={adx:.1f} < {STRATEGY["ADX_THRESHOLD"]} (флет)'}
+    if adx < SBER_STRATEGY['ADX_THRESHOLD']:
+        return None, {'trend': trend, 'adx': adx, 'price': price, 'note': f'ADX={adx:.1f} < {SBER_STRATEGY["ADX_THRESHOLD"]} (флет)'}
     
     if long_cond:
         return "LONG", {
             'price': price,
             'trend': trend,
             'adx': round(adx, 1),
-            'target': price * (1 + STRATEGY['TAKE_PROFIT']),
-            'stop': price * (1 - STRATEGY['STOP_LOSS']),
+            'target': price * (1 + SBER_STRATEGY['TAKE_PROFIT']),
+            'stop': price * (1 - SBER_STRATEGY['STOP_LOSS']),
             'signal_type': "ЗОЛОТОЕ ПЕРЕСЕЧЕНИЕ" if golden_cross else "ТРЕНД"
         }
     if short_cond:
@@ -321,8 +356,8 @@ async def get_signal():
             'price': price,
             'trend': trend,
             'adx': round(adx, 1),
-            'target': price * (1 - STRATEGY['TAKE_PROFIT']),
-            'stop': price * (1 + STRATEGY['STOP_LOSS']),
+            'target': price * (1 - SBER_STRATEGY['TAKE_PROFIT']),
+            'stop': price * (1 + SBER_STRATEGY['STOP_LOSS']),
             'signal_type': "МЁРТВОЕ ПЕРЕСЕЧЕНИЕ" if dead_cross else "ТРЕНД"
         }
     
@@ -336,8 +371,7 @@ async def reset_daily_pnl():
         daily_pnl = 0.0
         last_reset_date = today
 
-# === ОТПРАВКА СИГНАЛА ===
-async def send_signal():
+async def send_sber_signal():
     global current_position, last_signal_sent, daily_pnl
     
     if not CHANNEL_ID:
@@ -345,14 +379,13 @@ async def send_signal():
     
     await reset_daily_pnl()
     
-    signal, data = await get_signal()
+    signal, data = await get_sber_signal()
     price = data['price'] if data else None
-    df = await data_fetcher.fetch_candles_daily("SBER", 100)
     
-    if df is None or price is None:
+    if price is None:
         return
     
-    if daily_pnl < -STRATEGY['DAILY_LOSS_LIMIT']:
+    if daily_pnl < -SBER_STRATEGY['DAILY_LOSS_LIMIT']:
         if current_position['type']:
             await bot.send_message(CHANNEL_ID, f"🚨 Дневной лимит просадки ({daily_pnl*100:.1f}%)\nТорговля остановлена", parse_mode='HTML')
             current_position['type'] = None
@@ -367,17 +400,17 @@ async def send_signal():
             pnl_check = -pnl_check
         
         if current_position['type'] == 'long':
-            if pnl_check <= -STRATEGY['STOP_LOSS'] * 100:
+            if pnl_check <= -SBER_STRATEGY['STOP_LOSS'] * 100:
                 exit_needed = True
                 exit_reason = f"Стоп-лосс: {pnl_check:.1f}%"
-            elif pnl_check >= STRATEGY['TAKE_PROFIT'] * 100:
+            elif pnl_check >= SBER_STRATEGY['TAKE_PROFIT'] * 100:
                 exit_needed = True
                 exit_reason = f"Тейк-профит: {pnl_check:.1f}%"
         else:
-            if pnl_check <= -STRATEGY['STOP_LOSS'] * 100:
+            if pnl_check <= -SBER_STRATEGY['STOP_LOSS'] * 100:
                 exit_needed = True
                 exit_reason = f"Стоп-лосс: {pnl_check:.1f}%"
-            elif pnl_check >= STRATEGY['TAKE_PROFIT'] * 100:
+            elif pnl_check >= SBER_STRATEGY['TAKE_PROFIT'] * 100:
                 exit_needed = True
                 exit_reason = f"Тейк-профит: {pnl_check:.1f}%"
     
@@ -427,9 +460,9 @@ async def send_signal():
             await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
             last_signal_sent = {'signal': signal_key, 'price': price, 'time': now}
         except Exception as e:
-            print(f"Ошибка отправки: {e}")
+            print(f"Ошибка: {e}")
 
-async def signal_loop():
+async def sber_signal_loop():
     """Три сигнала в день: 10:00, 14:00, 18:00"""
     await asyncio.sleep(5)
     last_sent_hour = None
@@ -442,9 +475,53 @@ async def signal_loop():
         
         send_hours = [10, 14, 18]
         if current_hour in send_hours and current_minute < 5 and last_sent_hour != current_hour:
-            await send_signal()
+            await send_sber_signal()
             last_sent_hour = current_hour
         
+        await asyncio.sleep(60)
+
+# === ЛУННАЯ СТРАТЕГИЯ: УВЕДОМЛЕНИЕ ЗА 3 ДНЯ ===
+async def lunar_notify():
+    global lunar_notified_days
+    while True:
+        days_until = get_days_until_full_moon()
+        if days_until is not None and days_until <= 3 and days_until not in lunar_notified_days:
+            lunar_notified_days.add(days_until)
+            if days_until == 3:
+                await bot.send_message(MY_CHAT_ID, f"🌕 ЧЕРЕЗ 3 ДНЯ ПОЛНОЛУНИЕ\nГотовьтесь к точке входа")
+            elif days_until == 2:
+                await bot.send_message(MY_CHAT_ID, f"🌕 ЧЕРЕЗ 2 ДНЯ ПОЛНОЛУНИЕ")
+            elif days_until == 1:
+                await bot.send_message(MY_CHAT_ID, f"🌕 ЗАВТРА ПОЛНОЛУНИЕ — ТОЧКА ВХОДА")
+        await asyncio.sleep(3600)
+
+# === ЕЖЕДНЕВНАЯ СВОДКА (лунная стратегия) ===
+async def daily_lunar_summary():
+    if not CHANNEL_ID:
+        return
+    msk = pytz.timezone('Europe/Moscow')
+    today = datetime.now(msk).strftime('%Y-%m-%d')
+    if get_last_summary_date() == today:
+        return
+    ph, _, nxt = get_lunar_info()
+    tr = await get_all_trends()
+    long = sum(1 for d in tr.values() if d['trend'] == 'бычий')
+    short = sum(1 for d in tr.values() if d['trend'] == 'медвежий')
+    txt = f"🌙 **{datetime.now(msk).strftime('%d.%m.%Y')}**\n"
+    if nxt:
+        txt += f"🌕 Полнолуние {nxt.strftime('%d.%m.%Y')}\n"
+    txt += f"🟢 LONG: {long}  🔴 SHORT: {short}\n💡 /status /balance"
+    save_daily_summary(today, txt)
+    try:
+        await bot.send_message(CHANNEL_ID, txt, parse_mode='Markdown')
+    except:
+        pass
+
+async def daily_loop():
+    while True:
+        now = datetime.now(pytz.timezone('Europe/Moscow'))
+        if now.hour == 10 and now.minute < 5:
+            await daily_lunar_summary()
         await asyncio.sleep(60)
 
 # === НАСТРОЙКА БОТА ===
@@ -468,14 +545,12 @@ keyboard = ReplyKeyboardMarkup(
 async def start_cmd(m):
     await m.answer(
         "📊 **АНАЛИТИК**\n\n"
-        "🔹 Сигналы 3 раза в день: 10:00, 14:00, 18:00\n"
-        "🔹 Стратегия: MA10/MA30 + ADX\n"
-        "🔹 Стоп 6% | Тейк 12%\n\n"
-        "🔹 **КОМАНДЫ:**\n"
-        "   /status — текущее состояние\n"
-        "   /open LONG 310 — открыть позицию\n"
-        "   /close — закрыть позицию\n"
-        "   /balance — статистика\n\n"
+        "🔹 <b>СБЕР (сигналы 3 раза в день)</b>\n"
+        "   Стратегия: MA10/MA30 + ADX | Стоп 6% | Тейк 12%\n"
+        "   Команды: /status, /open, /close, /balance\n\n"
+        "🔹 <b>ЛУННАЯ СТРАТЕГИЯ (17 акций)</b>\n"
+        "   Ежедневная сводка в 10:00 | Уведомление за 3 дня до полнолуния\n"
+        "   Кнопка «📈 Открыть позицию» — точка входа в полнолуние\n\n"
         "🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard",
         reply_markup=keyboard, parse_mode='HTML')
 
@@ -522,7 +597,7 @@ async def open_cmd(m):
     
     parts = m.text.split()
     if len(parts) != 3 or parts[1].upper() not in ['LONG', 'SHORT']:
-        await m.answer("📝 /open LONG 310.50\nили /open SHORT 310.50")
+        await m.answer("📝 /open LONG 310.50\nили\n📝 /open SHORT 310.50")
         return
     
     if current_position['type']:
@@ -542,8 +617,8 @@ async def open_cmd(m):
     current_position['entry_time'] = now
     current_position['is_manual'] = True
     
-    stop = entry_price * (1 - STRATEGY['STOP_LOSS']) if direction == 'LONG' else entry_price * (1 + STRATEGY['STOP_LOSS'])
-    take = entry_price * (1 + STRATEGY['TAKE_PROFIT']) if direction == 'LONG' else entry_price * (1 - STRATEGY['TAKE_PROFIT'])
+    stop = entry_price * (1 - SBER_STRATEGY['STOP_LOSS']) if direction == 'LONG' else entry_price * (1 + SBER_STRATEGY['STOP_LOSS'])
+    take = entry_price * (1 + SBER_STRATEGY['TAKE_PROFIT']) if direction == 'LONG' else entry_price * (1 - SBER_STRATEGY['TAKE_PROFIT'])
     
     msg = f"✅ Ручное открытие {direction}\n💰 Вход: {entry_price:.2f}\n🛑 Стоп: {stop:.2f}\n🎯 Тейк: {take:.2f}"
     await m.answer(msg)
@@ -598,10 +673,22 @@ async def balance_cmd(m):
 async def btn_lunar(m):
     ph, dt, nxt = get_lunar_info()
     now = datetime.now(pytz.timezone('Europe/Moscow'))
+    days = get_days_until_full_moon()
     txt = f"🌙 {ph.upper()}\n📅 {now.strftime('%d.%m.%Y')}"
     if nxt:
         txt += f"\n🌕 Полнолуние: {nxt.strftime('%d.%m.%Y %H:%M')}"
+    if days is not None:
+        txt += f"\n⏳ До полнолуния: {days} дн."
     await m.answer(txt)
+
+@dp.message_handler(lambda msg: msg.text == "📈 Открыть позицию")
+async def btn_open_position(m):
+    ph, _, _ = get_lunar_info()
+    if ph == "полнолуние":
+        await m.answer("🌕 **ТОЧКА ВХОДА!**\n📝 Используйте /open LONG ЦЕНА или /open SHORT ЦЕНА")
+    else:
+        days = get_days_until_full_moon()
+        await m.answer(f"⏸ Сигнала нет\n⏳ Следующее полнолуние через {days} дн.\n📝 Для ручного входа: /open LONG 310")
 
 @dp.message_handler(lambda msg: msg.text == "📊 Историческая статистика")
 async def btn_stats(m):
@@ -610,10 +697,6 @@ async def btn_stats(m):
     for i, (t, d) in enumerate(s[:10], 1):
         txt += f"{i}. {d['name']}: +{d['return_bull']:.2f}%\n"
     await m.answer(txt, parse_mode='Markdown')
-
-@dp.message_handler(lambda msg: msg.text == "📈 Открыть позицию")
-async def btn_open(m):
-    await m.answer("📝 /open LONG 310.50")
 
 @dp.message_handler(lambda msg: msg.text == "📈 График акции")
 async def btn_chart(m):
@@ -629,10 +712,10 @@ async def chart(m):
         return
     plt.figure(figsize=(12,5))
     plt.plot(df['date'], df['close'], 'b-', label='Цена')
-    if len(df) >= 10:
-        plt.plot(df['date'], df['close'].rolling(10).mean(), 'g--', label='MA10')
-    if len(df) >= 30:
-        plt.plot(df['date'], df['close'].rolling(30).mean(), 'r--', label='MA30')
+    if len(df) >= 18:
+        plt.plot(df['date'], df['close'].rolling(18).mean(), 'g--', label='MA18')
+    if len(df) >= 50:
+        plt.plot(df['date'], df['close'].rolling(50).mean(), 'r--', label='MA50')
     plt.title(TICKERS[ticker]['name'])
     plt.grid()
     buf = BytesIO()
@@ -642,37 +725,10 @@ async def chart(m):
     await msg.delete()
     await m.answer_photo(buf)
 
-# === ЕЖЕДНЕВНАЯ СВОДКА ===
-async def daily_job():
-    if not CHANNEL_ID:
-        return
-    msk = pytz.timezone('Europe/Moscow')
-    today = datetime.now(msk).strftime('%Y-%m-%d')
-    if get_last_summary_date() == today:
-        return
-    ph, _, _ = get_lunar_info()
-    await bot.send_message(CHANNEL_ID, f"🌙 {datetime.now(msk).strftime('%d.%m.%Y')}\n💡 /status /balance", parse_mode='Markdown')
-    save_daily_summary(today, "sent")
-
-async def daily_loop():
-    while True:
-        now = datetime.now(pytz.timezone('Europe/Moscow'))
-        if now.hour == 10 and now.minute < 5:
-            await daily_job()
-        await asyncio.sleep(60)
-
 # === ВЕБ-ДАШБОРД ===
-async def get_all_trends():
-    results = {}
-    for ticker in ALL_TICKERS:
-        df = await data_fetcher.fetch_candles_daily(ticker, 100)
-        price = await data_fetcher.get_price(ticker)
-        trend = calc_trend(df)
-        results[ticker] = {**TICKERS[ticker], "price": price, "trend": trend}
-    return results
-
 async def dashboard(req):
     tr = await get_all_trends()
+    ph, _, nxt = get_lunar_info()
     now = datetime.now(pytz.timezone('Europe/Moscow'))
     long = sum(1 for d in tr.values() if d['trend'] == 'бычий')
     short = sum(1 for d in tr.values() if d['trend'] == 'медвежий')
@@ -696,13 +752,14 @@ async def dashboard(req):
         th,td{{padding:12px;text-align:left;border-bottom:1px solid #2a2a3e;}}
         th{{background:#f0c04020;color:#f0c040;}}
         .bull{{color:#4ade80;}}.bear{{color:#f87171;}}.neutral{{color:#facc15;}}
+        .footer{{text-align:center;color:#666;margin-top:20px;}}
     </style>
     </head>
     <body>
-    <div class="card"><h1>📊 АНАЛИТИК</h1><div>{now.strftime('%d.%m.%Y %H:%M')}</div></div>
+    <div class="card"><h1>📊 АНАЛИТИК</h1><div>{now.strftime('%d.%m.%Y %H:%M')}</div><div>{ph}</div><div>🌕 Полнолуние: {nxt.strftime('%d.%m.%Y') if nxt else '—'}</div></div>
     <div class="grid"><div class="stat"><div class="num">{long}</div><div>LONG</div></div><div class="stat"><div class="num">{short}</div><div>SHORT</div></div><div class="stat"><div class="num">{side}</div><div>БОКОВИК</div></div></div>
     <table><thead><tr><th>Актив</th><th>Тикер</th><th>Цена</th><th>Тренд</th><th>LONG</th><th>SHORT</th></tr></thead><tbody>{rows}</tbody></table>
-    <div class="footer">Сигналы в 10:00, 14:00, 18:00</div>
+    <div class="footer">Сигналы по Сберу в 10:00, 14:00, 18:00 | Лунная стратегия</div>
     </body></html>
     """
     return web.Response(text=html, content_type='text/html')
@@ -725,9 +782,10 @@ async def on_startup(dp):
     init_db()
     await web_server()
     asyncio.create_task(daily_loop())
-    asyncio.create_task(signal_loop())
+    asyncio.create_task(lunar_notify())
+    asyncio.create_task(sber_signal_loop())
     try:
-        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n📊 Сигналы в 10:00, 14:00, 18:00\n\n/status — состояние\n/open LONG 310 — открыть\n/close — закрыть\n/balance — статистика")
+        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n\n🔹 СБЕР: сигналы в 10:00, 14:00, 18:00\n🔹 ЛУННАЯ СТРАТЕГИЯ: сводка в 10:00, уведомления за 3 дня\n\n/status — состояние Сбера\n/open LONG 310 — открыть\n/close — закрыть\n/balance — статистика")
     except:
         pass
 
@@ -737,8 +795,9 @@ async def on_shutdown(dp):
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("АНАЛИТИК | СИГНАЛЫ 3 РАЗА В ДЕНЬ")
-    print("Стратегия: MA10/MA30 + ADX")
+    print("АНАЛИТИК | ЛУННАЯ СТРАТЕГИЯ + СБЕР")
+    print("Сигналы Сбера: 10:00, 14:00, 18:00")
+    print("Луна: уведомление за 3 дня до полнолуния")
     print("=" * 50)
     from aiogram.utils import executor
     executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
