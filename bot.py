@@ -28,9 +28,12 @@ CHANNEL_ID = os.environ.get("CHANNEL_ID")
 if not BOT_TOKEN:
     raise ValueError("❌ Токен не найден")
 
+# === КОМИССИЯ БРОКЕРА ===
+COMMISSION = 0.003  # 0.3% при покупке и продаже
+
 # === КЭШ ===
 data_cache = {}
-cache_ttl = 60  # 1 минута для реального времени
+cache_ttl = 60
 
 def get_from_cache(key):
     if key in data_cache:
@@ -77,29 +80,54 @@ STRATEGY = {
     'VOLUME_RATIO_LONG': 1.5,
     'VOLUME_RATIO_SHORT': 1.5,
     'ADX_THRESHOLD': 25,
-    'STOP_LOSS': 0.05,      # 5% стоп
-    'TAKE_PROFIT': 0.08,    # 8% тейк
-    'DAILY_LOSS_LIMIT': 0.03 # 3% просадка в день
+    'STOP_LOSS': 0.05,
+    'TAKE_PROFIT': 0.08,
+    'DAILY_LOSS_LIMIT': 0.03
 }
 
 # === СОСТОЯНИЕ ===
-current_position = {'type': None, 'entry_price': None, 'entry_time': None, 'signal_type': None}
+current_position = {'type': None, 'entry_price': None, 'entry_time': None, 'signal_type': None, 'is_manual': False}
 last_signal_sent = {'signal': None, 'price': None, 'time': None}
 daily_pnl = 0.0
 last_reset_date = None
+total_pnl = 0.0
+trades_history = []
 
 # === БАЗА ДАННЫХ ===
 def init_db():
     with sqlite3.connect('bot_data.db') as conn:
         c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, type TEXT, entry REAL, exit REAL, pnl REAL)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, type TEXT, entry REAL, exit REAL, pnl REAL, commission REAL, is_manual INTEGER)''')
         c.execute('''CREATE TABLE IF NOT EXISTS daily_summary (date TEXT PRIMARY KEY, summary TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS stats (key TEXT PRIMARY KEY, value REAL)''')
 
-def save_trade(trade_type, entry, exit_price, pnl):
+def save_trade(trade_type, entry, exit_price, pnl, commission, is_manual=False):
+    global total_pnl, trades_history
     with sqlite3.connect('bot_data.db') as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO trades (date, type, entry, exit, pnl) VALUES (?, ?, ?, ?, ?)",
-                  (datetime.now().isoformat(), trade_type, entry, exit_price, pnl))
+        c.execute("INSERT INTO trades (date, type, entry, exit, pnl, commission, is_manual) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                  (datetime.now().isoformat(), trade_type, entry, exit_price, pnl, commission, 1 if is_manual else 0))
+    total_pnl += pnl
+    trades_history.insert(0, {'type': trade_type, 'entry': entry, 'exit': exit_price, 'pnl': pnl, 'date': datetime.now()})
+
+def get_stats():
+    with sqlite3.connect('bot_data.db') as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*), SUM(pnl), AVG(pnl), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) FROM trades")
+        row = c.fetchone()
+        total_trades = row[0] or 0
+        total_pnl_db = row[1] or 0
+        avg_pnl = row[2] or 0
+        winning_trades = row[3] or 0
+        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+        return {
+            'total_trades': total_trades,
+            'total_pnl': total_pnl_db,
+            'avg_pnl': avg_pnl,
+            'win_rate': win_rate,
+            'winning_trades': winning_trades,
+            'losing_trades': total_trades - winning_trades
+        }
 
 def get_last_summary_date():
     with sqlite3.connect('bot_data.db') as conn:
@@ -190,7 +218,6 @@ class DataFetcher:
         return None
 
     async def fetch_candles_daily(self, ticker, days=100):
-        """Дневные свечи для свинг-анализа"""
         key = f"daily_{ticker}_{days}"
         cached = get_from_cache(key)
         if cached is not None:
@@ -238,7 +265,6 @@ class DataFetcher:
         return None
 
     async def fetch_candles_intraday(self, ticker, minutes=60):
-        """15-минутные свечи для внутридневного анализа"""
         key = f"intraday_{ticker}_{minutes}"
         cached = get_from_cache(key)
         if cached is not None:
@@ -287,16 +313,13 @@ data_fetcher = DataFetcher()
 
 # === РАСЧЁТ ИНДИКАТОРОВ ===
 def calculate_macd(series, fast=12, slow=26, signal=9):
-    """Правильный MACD"""
     ema_fast = series.ewm(span=fast, adjust=False).mean()
     ema_slow = series.ewm(span=slow, adjust=False).mean()
     macd_line = ema_fast - ema_slow
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
+    return macd_line, signal_line, macd_line - signal_line
 
 def calculate_adx(df, period=14):
-    """ADX для определения тренда"""
     if len(df) < period + 5:
         return 20
     high = df['high'] if 'high' in df.columns else df['close']
@@ -340,14 +363,12 @@ def calc_indicators(df):
 
 # === ГЕНЕРАЦИЯ СИГНАЛОВ ===
 async def get_sber_swing_signal(df, price):
-    """Свинг-сигнал (дневные данные)"""
     if df is None or len(df) < 50:
         return None, None
     
     last = df.iloc[-1]
     prev = df.iloc[-2] if len(df) > 1 else last
     
-    # MA
     ma20 = df['close'].rolling(20).mean()
     ma50 = df['close'].rolling(50).mean()
     last_ma20 = ma20.iloc[-1]
@@ -355,145 +376,71 @@ async def get_sber_swing_signal(df, price):
     prev_ma20 = ma20.iloc[-2] if len(ma20) > 1 else last_ma20
     prev_ma50 = ma50.iloc[-2] if len(ma50) > 1 else last_ma50
     
-    # RSI
     rsi = ta.momentum.RSIIndicator(df['close'], window=14).rsi().iloc[-1]
-    
-    # MACD правильный
     macd_line, macd_signal, _ = calculate_macd(df['close'], 12, 26, 9)
     macd_bullish = macd_line.iloc[-1] > macd_signal.iloc[-1]
-    
-    # ADX
     adx = calculate_adx(df)
     
-    # Объём
     volume_ratio = 1.0
     if 'volume' in df.columns and len(df) > 20:
         vol_avg = df['volume'].rolling(20).mean().iloc[-1]
         volume_ratio = df['volume'].iloc[-1] / vol_avg if vol_avg > 0 else 1.0
     
-    # Пересечения MA
     ma_cross_up = (last_ma20 > last_ma50) and (prev_ma20 <= prev_ma50)
     ma_cross_down = (last_ma20 < last_ma50) and (prev_ma20 >= prev_ma50)
     
-    # LONG условия
-    long_cond = (
-        (price > last_ma50 and last_ma20 > last_ma50) or ma_cross_up
-    ) and volume_ratio > STRATEGY['VOLUME_RATIO_LONG'] and rsi < STRATEGY['RSI_OVERBOUGHT'] and adx > STRATEGY['ADX_THRESHOLD']
-    
-    # SHORT условия
-    short_cond = (
-        (price < last_ma50 and last_ma20 < last_ma50) or ma_cross_down
-    ) and volume_ratio > STRATEGY['VOLUME_RATIO_SHORT'] and rsi > STRATEGY['RSI_OVERSOLD'] and adx > STRATEGY['ADX_THRESHOLD']
+    long_cond = ((price > last_ma50 and last_ma20 > last_ma50) or ma_cross_up) and volume_ratio > STRATEGY['VOLUME_RATIO_LONG'] and rsi < STRATEGY['RSI_OVERBOUGHT'] and adx > STRATEGY['ADX_THRESHOLD']
+    short_cond = ((price < last_ma50 and last_ma20 < last_ma50) or ma_cross_down) and volume_ratio > STRATEGY['VOLUME_RATIO_SHORT'] and rsi > STRATEGY['RSI_OVERSOLD'] and adx > STRATEGY['ADX_THRESHOLD']
     
     if long_cond:
-        return "LONG", {
-            'price': price,
-            'target': price * (1 + STRATEGY['TAKE_PROFIT']),
-            'stop': price * (1 - STRATEGY['STOP_LOSS']),
-            'rsi': round(rsi, 1),
-            'adx': round(adx, 1),
-            'ma20': round(last_ma20, 2),
-            'ma50': round(last_ma50, 2),
-            'volume_ratio': round(volume_ratio, 1),
-            'macd': "бычий" if macd_bullish else "медвежий"
-        }
+        return "LONG", {'price': price, 'target': price * (1 + STRATEGY['TAKE_PROFIT']), 'stop': price * (1 - STRATEGY['STOP_LOSS']), 'rsi': round(rsi, 1), 'adx': round(adx, 1), 'ma20': round(last_ma20, 2), 'ma50': round(last_ma50, 2), 'volume_ratio': round(volume_ratio, 1), 'macd': "бычий" if macd_bullish else "медвежий"}
     if short_cond:
-        return "SHORT", {
-            'price': price,
-            'target': price * (1 - STRATEGY['TAKE_PROFIT']),
-            'stop': price * (1 + STRATEGY['STOP_LOSS']),
-            'rsi': round(rsi, 1),
-            'adx': round(adx, 1),
-            'ma20': round(last_ma20, 2),
-            'ma50': round(last_ma50, 2),
-            'volume_ratio': round(volume_ratio, 1),
-            'macd': "медвежий" if not macd_bullish else "бычий"
-        }
+        return "SHORT", {'price': price, 'target': price * (1 - STRATEGY['TAKE_PROFIT']), 'stop': price * (1 + STRATEGY['STOP_LOSS']), 'rsi': round(rsi, 1), 'adx': round(adx, 1), 'ma20': round(last_ma20, 2), 'ma50': round(last_ma50, 2), 'volume_ratio': round(volume_ratio, 1), 'macd': "медвежий" if not macd_bullish else "бычий"}
     
     return None, None
 
 async def get_sber_intraday_signal(df, price):
-    """Внутридневной сигнал (15-минутные данные)"""
     if df is None or len(df) < 20:
         return None, None
     
     last = df.iloc[-1]
-    
-    # Быстрая MA для внутридневного
     ma10 = df['close'].rolling(10).mean().iloc[-1]
-    
-    # RSI на 15-минутках
     rsi = ta.momentum.RSIIndicator(df['close'], window=10).rsi().iloc[-1]
-    
-    # MACD быстрый
     macd_line, macd_signal, _ = calculate_macd(df['close'], 5, 13, 5)
     macd_bullish = macd_line.iloc[-1] > macd_signal.iloc[-1]
     
-    # Объём
     volume_ratio = 1.0
     if 'volume' in df.columns and len(df) > 10:
         vol_avg = df['volume'].rolling(10).mean().iloc[-1]
         volume_ratio = df['volume'].iloc[-1] / vol_avg if vol_avg > 0 else 1.0
     
-    # LONG
-    long_cond = (
-        price > ma10 and
-        volume_ratio > 1.2 and
-        35 < rsi < 65 and
-        macd_bullish and
-        last['close'] > df['close'].iloc[-2] * 1.001  # небольшой рост
-    )
-    
-    # SHORT
-    short_cond = (
-        price < ma10 and
-        volume_ratio > 1.2 and
-        35 < rsi < 65 and
-        not macd_bullish and
-        last['close'] < df['close'].iloc[-2] * 0.999  # небольшое падение
-    )
+    long_cond = price > ma10 and volume_ratio > 1.2 and 35 < rsi < 65 and macd_bullish and last['close'] > df['close'].iloc[-2] * 1.001
+    short_cond = price < ma10 and volume_ratio > 1.2 and 35 < rsi < 65 and not macd_bullish and last['close'] < df['close'].iloc[-2] * 0.999
     
     if long_cond:
-        return "LONG", {
-            'price': price,
-            'target': price * 1.01,
-            'stop': price * 0.995,
-            'rsi': round(rsi, 1),
-            'volume_ratio': round(volume_ratio, 1)
-        }
+        return "LONG", {'price': price, 'target': price * 1.01, 'stop': price * 0.995, 'rsi': round(rsi, 1), 'volume_ratio': round(volume_ratio, 1)}
     if short_cond:
-        return "SHORT", {
-            'price': price,
-            'target': price * 0.99,
-            'stop': price * 1.005,
-            'rsi': round(rsi, 1),
-            'volume_ratio': round(volume_ratio, 1)
-        }
+        return "SHORT", {'price': price, 'target': price * 0.99, 'stop': price * 1.005, 'rsi': round(rsi, 1), 'volume_ratio': round(volume_ratio, 1)}
     
     return None, None
 
 async def get_exit_signal(df, price, position_type):
-    """Сигнал на выход из позиции"""
     if df is None or len(df) < 20 or position_type is None:
         return False, None
     
     rsi = ta.momentum.RSIIndicator(df['close'], window=14).rsi().iloc[-1]
     macd_line, macd_signal, _ = calculate_macd(df['close'], 12, 26, 9)
-    
     ma20 = df['close'].rolling(20).mean().iloc[-1]
     ma50 = df['close'].rolling(50).mean().iloc[-1]
     
     if position_type == 'long':
-        # Выход из лонга
         if rsi > STRATEGY['RSI_OVERBOUGHT']:
             return True, f"RSI={rsi:.1f} (перекупленность)"
         if macd_line.iloc[-1] < macd_signal.iloc[-1]:
             return True, "MACD разворот вниз"
         if ma20 < ma50:
             return True, "MA20 ниже MA50"
-            
     elif position_type == 'short':
-        # Выход из шорта
         if rsi < STRATEGY['RSI_OVERSOLD']:
             return True, f"RSI={rsi:.1f} (перепроданность)"
         if macd_line.iloc[-1] > macd_signal.iloc[-1]:
@@ -518,10 +465,8 @@ async def send_sber_signal():
     if not CHANNEL_ID:
         return
     
-    # Сброс дневного P&L
     await reset_daily_pnl()
     
-    # Получаем данные
     df_daily = await data_fetcher.fetch_candles_daily("SBER", 100)
     df_intraday = await data_fetcher.fetch_candles_intraday("SBER", 120)
     price = await data_fetcher.get_price("SBER")
@@ -529,7 +474,6 @@ async def send_sber_signal():
     if df_daily is None or price is None:
         return
     
-    # Проверка лимита дневной просадки
     if daily_pnl < -STRATEGY['DAILY_LOSS_LIMIT']:
         if current_position['type']:
             msg = f"🚨 ДНЕВНОЙ ЛИМИТ ПРОСАДКИ ({daily_pnl*100:.1f}%)\nТорговля на сегодня остановлена"
@@ -537,73 +481,64 @@ async def send_sber_signal():
             current_position['type'] = None
         return
     
-    # Генерируем сигналы
     swing_signal, swing_data = await get_sber_swing_signal(df_daily, price)
     intra_signal, intra_data = await get_sber_intraday_signal(df_intraday, price)
-    
-    # Проверяем выход из позиции
     exit_needed, exit_reason = await get_exit_signal(df_daily, price, current_position['type'])
     
     now = datetime.now(pytz.timezone('Europe/Moscow'))
-    
-    # Формируем сообщение ТОЛЬКО если сигнал изменился
     signal_key = f"{swing_signal}_{intra_signal}_{current_position['type']}"
     if signal_key == last_signal_sent.get('signal') and (now - last_signal_sent.get('time', datetime.min)).seconds < 300:
-        return  # Не спамим
+        return
     
     msg = f"📊 <b>СБЕР</b> {now.strftime('%d.%m %H:%M')}\n━━━━━━━━━━━━━━━━━━━\n💰 Цена: <b>{price:.2f} ₽</b>\n\n"
     
-    # Внутридневной сигнал
     if intra_signal:
         msg += f"🟢 ВНУТРИДНЕВНОЙ: {intra_signal}\n   🎯 {intra_data['target']:.2f} | 🛑 {intra_data['stop']:.2f}\n   RSI: {intra_data['rsi']} | Объём: {intra_data['volume_ratio']}x\n\n"
     else:
         msg += f"⚪ ВНУТРИДНЕВНОЙ: НЕТ\n\n"
     
-    # Свинг-сигнал
     if swing_signal:
         msg += f"🟢 СВИНГ: {swing_signal}\n   🎯 {swing_data['target']:.2f} | 🛑 {swing_data['stop']:.2f}\n   MA20: {swing_data['ma20']} | MA50: {swing_data['ma50']}\n   RSI: {swing_data['rsi']} | ADX: {swing_data['adx']} | Объём: {swing_data['volume_ratio']}x\n\n"
     else:
         msg += f"⚪ СВИНГ: НЕТ (ADX<25 или флет)\n\n"
     
-    # Текущая позиция
     if current_position['type']:
         pnl = (price - current_position['entry_price']) / current_position['entry_price'] * 100
         if current_position['type'] == 'short':
             pnl = -pnl
-        msg += f"📌 ПОЗИЦИЯ: {current_position['type'].upper()}\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n"
+        manual_mark = " (ручная)" if current_position.get('is_manual') else ""
+        msg += f"📌 ПОЗИЦИЯ: {current_position['type'].upper()}{manual_mark}\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n"
     
-    # Выход
     if exit_needed:
         msg += f"\n🚨 ВЫХОД: {exit_reason}\n"
-        # Закрываем позицию
         pnl_final = (price - current_position['entry_price']) / current_position['entry_price'] * 100
         if current_position['type'] == 'short':
             pnl_final = -pnl_final
-        daily_pnl += pnl_final / 100
-        save_trade(current_position['type'], current_position['entry_price'], price, pnl_final)
+        commission_cost = COMMISSION * 2 * 100
+        pnl_after_commission = pnl_final - commission_cost
+        daily_pnl += pnl_after_commission / 100
+        save_trade(current_position['type'], current_position['entry_price'], price, pnl_after_commission, commission_cost, current_position.get('is_manual', False))
         current_position['type'] = None
     
-    # Вход в новую позицию (только если нет открытой)
     elif not current_position['type']:
-        # Приоритет: свинг сильнее, но если его нет — внутридневной
         if swing_signal:
             current_position['type'] = swing_signal.lower()
             current_position['entry_price'] = swing_data['price']
             current_position['entry_time'] = now
             current_position['signal_type'] = 'swing'
+            current_position['is_manual'] = False
             msg += f"\n✅ ВХОД {swing_signal} (свинг)\n"
         elif intra_signal:
-            # Проверяем, не поздно ли (до 18:45)
             if now.hour < 18 or (now.hour == 18 and now.minute < 45):
                 current_position['type'] = intra_signal.lower()
                 current_position['entry_price'] = intra_data['price']
                 current_position['entry_time'] = now
                 current_position['signal_type'] = 'intraday'
+                current_position['is_manual'] = False
                 msg += f"\n✅ ВХОД {intra_signal} (внутридневной)\n"
     
     msg += f"\n🤖 Следующий сигнал через 15 мин"
     
-    # Отправляем
     try:
         await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
         last_signal_sent = {'signal': signal_key, 'price': price, 'time': now}
@@ -616,6 +551,151 @@ async def sber_signal_loop():
     while True:
         await asyncio.sleep(15 * 60)
         await send_sber_signal()
+
+# === НОВЫЕ КОМАНДЫ УРОВЕНЬ 1 ===
+@dp.message_handler(commands=['status'])
+async def status_cmd(m):
+    price = await data_fetcher.get_price("SBER")
+    df_daily = await data_fetcher.fetch_candles_daily("SBER", 100)
+    
+    if price is None or df_daily is None:
+        await m.answer("⚠️ Нет данных")
+        return
+    
+    last = df_daily.iloc[-1]
+    rsi = ta.momentum.RSIIndicator(df_daily['close'], window=14).rsi().iloc[-1]
+    ma20 = df_daily['close'].rolling(20).mean().iloc[-1]
+    ma50 = df_daily['close'].rolling(50).mean().iloc[-1]
+    trend = "бычий 📈" if ma20 > ma50 else "медвежий 📉" if ma20 < ma50 else "боковик ⚪"
+    
+    msg = f"📊 <b>СБЕР - СТАТУС</b>\n━━━━━━━━━━━━━━━━━━━\n💰 Цена: <b>{price:.2f} ₽</b>\n📈 RSI: {rsi:.1f}\n📉 Тренд: {trend}\n📊 MA20: {ma20:.2f} | MA50: {ma50:.2f}\n\n"
+    
+    if current_position['type']:
+        pnl = (price - current_position['entry_price']) / current_position['entry_price'] * 100
+        if current_position['type'] == 'short':
+            pnl = -pnl
+        commission_cost = COMMISSION * 2 * 100
+        pnl_with_comm = pnl - commission_cost
+        manual_mark = " (ручная)" if current_position.get('is_manual') else ""
+        msg += f"📌 ПОЗИЦИЯ: {current_position['type'].upper()}{manual_mark}\n   💰 Вход: {current_position['entry_price']:.2f} ₽\n   📊 Текущий P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n   💸 P&L с комиссией: {'+' if pnl_with_comm >= 0 else ''}{pnl_with_comm:.2f}%\n"
+        if current_position['type'] == 'long':
+            stop = current_position['entry_price'] * (1 - STRATEGY['STOP_LOSS'])
+            take = current_position['entry_price'] * (1 + STRATEGY['TAKE_PROFIT'])
+            msg += f"   🛑 Стоп: {stop:.2f} (-{STRATEGY['STOP_LOSS']*100:.0f}%)\n   🎯 Тейк: {take:.2f} (+{STRATEGY['TAKE_PROFIT']*100:.0f}%)\n"
+        else:
+            stop = current_position['entry_price'] * (1 + STRATEGY['STOP_LOSS'])
+            take = current_position['entry_price'] * (1 - STRATEGY['TAKE_PROFIT'])
+            msg += f"   🛑 Стоп: {stop:.2f} (+{STRATEGY['STOP_LOSS']*100:.0f}%)\n   🎯 Тейк: {take:.2f} (-{STRATEGY['TAKE_PROFIT']*100:.0f}%)\n"
+    else:
+        msg += "📌 ПОЗИЦИЯ: НЕТ\n"
+    
+    msg += f"\n📅 Дневной P&L: {'+' if daily_pnl*100 >= 0 else ''}{daily_pnl*100:.2f}% (лимит -{STRATEGY['DAILY_LOSS_LIMIT']*100:.0f}%)"
+    
+    await m.answer(msg, parse_mode='HTML')
+
+@dp.message_handler(commands=['open'])
+async def open_cmd(m):
+    global current_position, daily_pnl
+    
+    parts = m.text.split()
+    if len(parts) != 3 or parts[1].upper() not in ['LONG', 'SHORT']:
+        await m.answer("📝 /open LONG 310.50\nили\n📝 /open SHORT 310.50")
+        return
+    
+    if current_position['type'] is not None:
+        await m.answer(f"⚠️ Уже есть открытая позиция {current_position['type'].upper()}. Сначала закройте её /close")
+        return
+    
+    direction = parts[1].upper()
+    try:
+        entry_price = float(parts[2])
+    except:
+        await m.answer("❌ Неверная цена")
+        return
+    
+    current_price = await data_fetcher.get_price("SBER")
+    if current_price is None:
+        await m.answer("⚠️ Не могу получить текущую цену")
+        return
+    
+    now = datetime.now(pytz.timezone('Europe/Moscow'))
+    current_position['type'] = direction.lower()
+    current_position['entry_price'] = entry_price
+    current_position['entry_time'] = now
+    current_position['signal_type'] = 'manual'
+    current_position['is_manual'] = True
+    
+    msg = f"✅ <b>РУЧНОЕ ОТКРЫТИЕ ПОЗИЦИИ</b>\n\n📌 {direction}\n💰 Вход: {entry_price:.2f} ₽\n📅 Время: {now.strftime('%H:%M:%S')}\n\n"
+    if direction == 'LONG':
+        stop = entry_price * (1 - STRATEGY['STOP_LOSS'])
+        take = entry_price * (1 + STRATEGY['TAKE_PROFIT'])
+        msg += f"🛑 Стоп: {stop:.2f} (-{STRATEGY['STOP_LOSS']*100:.0f}%)\n🎯 Тейк: {take:.2f} (+{STRATEGY['TAKE_PROFIT']*100:.0f}%)"
+    else:
+        stop = entry_price * (1 + STRATEGY['STOP_LOSS'])
+        take = entry_price * (1 - STRATEGY['TAKE_PROFIT'])
+        msg += f"🛑 Стоп: {stop:.2f} (+{STRATEGY['STOP_LOSS']*100:.0f}%)\n🎯 Тейк: {take:.2f} (-{STRATEGY['TAKE_PROFIT']*100:.0f}%)"
+    
+    await m.answer(msg, parse_mode='HTML')
+
+@dp.message_handler(commands=['close'])
+async def close_cmd(m):
+    global current_position, daily_pnl
+    
+    if current_position['type'] is None:
+        await m.answer("⚠️ Нет открытой позиции")
+        return
+    
+    price = await data_fetcher.get_price("SBER")
+    if price is None:
+        await m.answer("⚠️ Не могу получить текущую цену")
+        return
+    
+    pnl = (price - current_position['entry_price']) / current_position['entry_price'] * 100
+    if current_position['type'] == 'short':
+        pnl = -pnl
+    
+    commission_cost = COMMISSION * 2 * 100
+    pnl_after_commission = pnl - commission_cost
+    
+    msg = f"✅ <b>РУЧНОЕ ЗАКРЫТИЕ ПОЗИЦИИ</b>\n\n📌 {current_position['type'].upper()}\n💰 Вход: {current_position['entry_price']:.2f} ₽\n💰 Выход: {price:.2f} ₽\n📊 P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n💸 P&L с комиссией ({COMMISSION*100:.1f}%): {'+' if pnl_after_commission >= 0 else ''}{pnl_after_commission:.2f}%\n"
+    
+    daily_pnl += pnl_after_commission / 100
+    save_trade(current_position['type'], current_position['entry_price'], price, pnl_after_commission, commission_cost, current_position.get('is_manual', False))
+    
+    current_position['type'] = None
+    
+    await m.answer(msg, parse_mode='HTML')
+
+@dp.message_handler(commands=['balance'])
+async def balance_cmd(m):
+    stats = get_stats()
+    price = await data_fetcher.get_price("SBER")
+    
+    msg = f"📊 <b>СТАТИСТИКА ПО СДЕЛКАМ</b>\n━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"💰 Текущая цена: {price:.2f} ₽\n\n" if price else ""
+    msg += f"📈 <b>ОБЩАЯ СТАТИСТИКА</b>\n"
+    msg += f"   Всего сделок: {stats['total_trades']}\n"
+    msg += f"   Прибыльных: {stats['winning_trades']}\n"
+    msg += f"   Убыточных: {stats['losing_trades']}\n"
+    msg += f"   Win Rate: {stats['win_rate']:.1f}%\n"
+    msg += f"   Общий P&L: {'+' if stats['total_pnl'] >= 0 else ''}{stats['total_pnl']:.2f}%\n"
+    msg += f"   Средний P&L на сделку: {'+' if stats['avg_pnl'] >= 0 else ''}{stats['avg_pnl']:.2f}%\n\n"
+    
+    msg += f"📅 <b>СЕГОДНЯ</b>\n"
+    msg += f"   P&L: {'+' if daily_pnl*100 >= 0 else ''}{daily_pnl*100:.2f}%\n"
+    msg += f"   Лимит дня: -{STRATEGY['DAILY_LOSS_LIMIT']*100:.0f}%\n"
+    
+    if current_position['type']:
+        pnl_current = (price - current_position['entry_price']) / current_position['entry_price'] * 100
+        if current_position['type'] == 'short':
+            pnl_current = -pnl_current
+        commission_cost = COMMISSION * 2 * 100
+        msg += f"\n📌 <b>ТЕКУЩАЯ ПОЗИЦИЯ</b>\n"
+        msg += f"   {current_position['type'].upper()} | Вход: {current_position['entry_price']:.2f}\n"
+        msg += f"   Текущий P&L: {'+' if pnl_current >= 0 else ''}{pnl_current:.2f}%\n"
+        msg += f"   P&L с комиссией: {'+' if pnl_current - commission_cost >= 0 else ''}{pnl_current - commission_cost:.2f}%\n"
+    
+    await m.answer(msg, parse_mode='HTML')
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 async def get_all_trends():
@@ -651,6 +731,10 @@ async def start_cmd(m):
         "📊 **АНАЛИТИК**\n\n"
         "📊 17 акций\n\n"
         "🔹 **КОМАНДЫ:**\n"
+        "   /status — текущее состояние\n"
+        "   /open LONG 310 — открыть позицию\n"
+        "   /close — закрыть позицию\n"
+        "   /balance — статистика\n"
         "   📈 Открыть позицию\n"
         "   📊 Историческая статистика\n"
         "   📈 График акции\n\n"
@@ -676,13 +760,7 @@ async def btn_stats(m):
 
 @dp.message_handler(lambda msg: msg.text == "📈 Открыть позицию")
 async def btn_open(m):
-    ph, _, nxt = get_lunar_info()
-    now = datetime.now(pytz.timezone('Europe/Moscow'))
-    if ph == "полнолуние":
-        await m.answer("🌕 **ТОЧКА ВХОДА!**")
-    else:
-        days = (nxt - now).days if nxt else 0
-        await m.answer(f"⏸ Сигнала нет\n⏳ Следующее полнолуние: {nxt.strftime('%d.%m.%Y') if nxt else '—'} (через {days} дн.)")
+    await m.answer("📝 Используйте команду /open LONG 310.50\nили /open SHORT 310.50")
 
 @dp.message_handler(lambda msg: msg.text == "📈 График акции")
 async def btn_chart(m):
@@ -728,7 +806,7 @@ async def daily_job():
     txt = f"🌙 **{datetime.now(msk).strftime('%d.%m.%Y')}**\n"
     if nxt:
         txt += f"🌕 Полнолуние {nxt.strftime('%d.%m.%Y')}\n"
-    txt += f"🟢 LONG: {long}  🔴 SHORT: {short}"
+    txt += f"🟢 LONG: {long}  🔴 SHORT: {short}\n💡 /status /balance"
     save_daily_summary(today, txt)
     try:
         await bot.send_message(CHANNEL_ID, txt, parse_mode='Markdown')
@@ -816,7 +894,7 @@ async def on_startup(dp):
     asyncio.create_task(moon_notify())
     asyncio.create_task(sber_signal_loop())
     try:
-        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n📊 Аналитик | Сигналы по Сберу каждые 15 мин\n🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard")
+        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n📊 Аналитик | Сигналы по Сберу каждые 15 мин\n\n🔹 Команды:\n/status — текущее состояние\n/open LONG 310 — открыть позицию\n/close — закрыть позицию\n/balance — статистика\n\n🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard")
     except:
         pass
 
@@ -827,6 +905,7 @@ async def on_shutdown(dp):
 if __name__ == "__main__":
     print("=" * 50)
     print("АНАЛИТИК | СБЕР СИГНАЛЫ КАЖДЫЕ 15 МИНУТ")
+    print("КОМАНДЫ: /status, /open, /close, /balance")
     print("=" * 50)
     from aiogram.utils import executor
     executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
