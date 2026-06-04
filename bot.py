@@ -30,7 +30,7 @@ if not BOT_TOKEN:
 
 # === КЭШ ===
 data_cache = {}
-cache_ttl = 300
+cache_ttl = 60  # 1 минута для реального времени
 
 def get_from_cache(key):
     if key in data_cache:
@@ -68,16 +68,38 @@ TICKERS = {
 }
 ALL_TICKERS = list(TICKERS.keys())
 
+# === ПАРАМЕТРЫ СТРАТЕГИИ ===
+STRATEGY = {
+    'MA_FAST': 20,
+    'MA_SLOW': 50,
+    'RSI_OVERBOUGHT': 75,
+    'RSI_OVERSOLD': 30,
+    'VOLUME_RATIO_LONG': 1.5,
+    'VOLUME_RATIO_SHORT': 1.5,
+    'ADX_THRESHOLD': 25,
+    'STOP_LOSS': 0.05,      # 5% стоп
+    'TAKE_PROFIT': 0.08,    # 8% тейк
+    'DAILY_LOSS_LIMIT': 0.03 # 3% просадка в день
+}
+
+# === СОСТОЯНИЕ ===
+current_position = {'type': None, 'entry_price': None, 'entry_time': None, 'signal_type': None}
+last_signal_sent = {'signal': None, 'price': None, 'time': None}
+daily_pnl = 0.0
+last_reset_date = None
+
 # === БАЗА ДАННЫХ ===
 def init_db():
     with sqlite3.connect('bot_data.db') as conn:
         c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, type TEXT, entry REAL, exit REAL, pnl REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS daily_summary (date TEXT PRIMARY KEY, summary TEXT)''')
 
-def save_daily_summary(date, summary):
+def save_trade(trade_type, entry, exit_price, pnl):
     with sqlite3.connect('bot_data.db') as conn:
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO daily_summary (date, summary) VALUES (?, ?)", (date, summary))
+        c.execute("INSERT INTO trades (date, type, entry, exit, pnl) VALUES (?, ?, ?, ?, ?)",
+                  (datetime.now().isoformat(), trade_type, entry, exit_price, pnl))
 
 def get_last_summary_date():
     with sqlite3.connect('bot_data.db') as conn:
@@ -85,6 +107,11 @@ def get_last_summary_date():
         c.execute("SELECT date FROM daily_summary ORDER BY date DESC LIMIT 1")
         row = c.fetchone()
     return row[0] if row else None
+
+def save_daily_summary(date, summary):
+    with sqlite3.connect('bot_data.db') as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO daily_summary (date, summary) VALUES (?, ?)", (date, summary))
 
 # === ЛУННЫЕ ДАННЫЕ ===
 LUNAR_PHASES = {
@@ -106,16 +133,11 @@ LUNAR_PHASES = {
 def get_lunar_info():
     msk = pytz.timezone('Europe/Moscow')
     now = datetime.now(msk)
-    next_full = next_new = None
+    next_full = None
     for date_str, time_str in LUNAR_PHASES["full_moons"]:
         dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
         if dt > now:
             next_full = dt
-            break
-    for date_str, time_str in LUNAR_PHASES["new_moons"]:
-        dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
-        if dt > now:
-            next_new = dt
             break
     for date_str, time_str in LUNAR_PHASES["full_moons"]:
         dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
@@ -123,32 +145,7 @@ def get_lunar_info():
             return "полнолуние", dt, next_full
         if (dt - now).days == 1:
             return "полнолуние_завтра", dt, next_full
-    for date_str, time_str in LUNAR_PHASES["new_moons"]:
-        dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
-        if abs((now - dt).days) <= 1:
-            return "новолуние", dt, next_full
-    new_moons = [msk.localize(datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M")) for d, t in LUNAR_PHASES["new_moons"]]
-    last_new = max([d for d in new_moons if d <= now], default=None)
-    if last_new:
-        days = (now - last_new).days
-        return ("растущая" if days < 14 else "убывающая"), last_new, next_full
-    return "неизвестно", None, next_full
-
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
-dp.middleware.setup(LoggingMiddleware())
-
-# === КЛАВИАТУРА (только нужные кнопки) ===
-keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🌙 Фазы Луны")],
-        [KeyboardButton(text="📈 Открыть позицию")],
-        [KeyboardButton(text="📊 Историческая статистика")],
-        [KeyboardButton(text="📈 График акции")],
-    ],
-    resize_keyboard=True
-)
+    return "обычный день", None, next_full
 
 # === MOEX ===
 class DataFetcher:
@@ -192,8 +189,9 @@ class DataFetcher:
             pass
         return None
 
-    async def fetch_candles(self, ticker, days=100):
-        key = f"candles_{ticker}_{days}"
+    async def fetch_candles_daily(self, ticker, days=100):
+        """Дневные свечи для свинг-анализа"""
+        key = f"daily_{ticker}_{days}"
         cached = get_from_cache(key)
         if cached is not None:
             return cached
@@ -211,24 +209,74 @@ class DataFetcher:
                     cols = candles.get('columns', [])
                     if rows and len(rows) >= 3:
                         idx_date = next((i for i, c in enumerate(cols) if c.lower() in ('begin', 'date')), None)
+                        idx_open = next((i for i, c in enumerate(cols) if c.lower() == 'open'), None)
+                        idx_high = next((i for i, c in enumerate(cols) if c.lower() == 'high'), None)
+                        idx_low = next((i for i, c in enumerate(cols) if c.lower() == 'low'), None)
                         idx_close = next((i for i, c in enumerate(cols) if c.lower() in ('close', 'value')), None)
+                        idx_volume = next((i for i, c in enumerate(cols) if c.lower() == 'volume'), None)
                         if idx_date is not None and idx_close is not None:
                             records = []
                             for row in rows:
                                 if len(row) > max(idx_date, idx_close):
                                     try:
-                                        d = pd.to_datetime(row[idx_date])
-                                        v = float(row[idx_close])
-                                        if 1 < v < 20000:
-                                            records.append({'date': d, 'close': v})
+                                        records.append({
+                                            'date': pd.to_datetime(row[idx_date]),
+                                            'open': float(row[idx_open]) if idx_open is not None and len(row) > idx_open else None,
+                                            'high': float(row[idx_high]) if idx_high is not None and len(row) > idx_high else None,
+                                            'low': float(row[idx_low]) if idx_low is not None and len(row) > idx_low else None,
+                                            'close': float(row[idx_close]),
+                                            'volume': float(row[idx_volume]) if idx_volume is not None and len(row) > idx_volume else 0
+                                        })
                                     except:
                                         pass
                             if len(records) >= 5:
                                 df = pd.DataFrame(records).sort_values('date').reset_index(drop=True)
                                 set_to_cache(key, df)
                                 return df
-        except:
-            pass
+        except Exception as e:
+            print(f"Ошибка fetch_candles_daily: {e}")
+        return None
+
+    async def fetch_candles_intraday(self, ticker, minutes=60):
+        """15-минутные свечи для внутридневного анализа"""
+        key = f"intraday_{ticker}_{minutes}"
+        cached = get_from_cache(key)
+        if cached is not None:
+            return cached
+        try:
+            s = await self.get_session()
+            end = datetime.now()
+            start = end - timedelta(minutes=minutes)
+            url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json"
+            params = {'from': start.strftime('%Y-%m-%d'), 'till': end.strftime('%Y-%m-%d'), 'interval': 15}
+            async with s.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    candles = data.get('candles', {})
+                    rows = candles.get('data', [])
+                    cols = candles.get('columns', [])
+                    if rows and len(rows) >= 10:
+                        idx_date = next((i for i, c in enumerate(cols) if c.lower() in ('begin', 'date')), None)
+                        idx_close = next((i for i, c in enumerate(cols) if c.lower() in ('close', 'value')), None)
+                        idx_volume = next((i for i, c in enumerate(cols) if c.lower() == 'volume'), None)
+                        if idx_date is not None and idx_close is not None:
+                            records = []
+                            for row in rows[-minutes//15:]:
+                                if len(row) > max(idx_date, idx_close):
+                                    try:
+                                        records.append({
+                                            'date': pd.to_datetime(row[idx_date]),
+                                            'close': float(row[idx_close]),
+                                            'volume': float(row[idx_volume]) if idx_volume is not None and len(row) > idx_volume else 0
+                                        })
+                                    except:
+                                        pass
+                            if len(records) >= 5:
+                                df = pd.DataFrame(records).sort_values('date').reset_index(drop=True)
+                                set_to_cache(key, df)
+                                return df
+        except Exception as e:
+            print(f"Ошибка fetch_candles_intraday: {e}")
         return None
 
     async def close(self):
@@ -237,36 +285,364 @@ class DataFetcher:
 
 data_fetcher = DataFetcher()
 
+# === РАСЧЁТ ИНДИКАТОРОВ ===
+def calculate_macd(series, fast=12, slow=26, signal=9):
+    """Правильный MACD"""
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+def calculate_adx(df, period=14):
+    """ADX для определения тренда"""
+    if len(df) < period + 5:
+        return 20
+    high = df['high'] if 'high' in df.columns else df['close']
+    low = df['low'] if 'low' in df.columns else df['close']
+    close = df['close']
+    
+    plus_dm = high.diff()
+    minus_dm = low.diff()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm > 0] = 0
+    
+    tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+    
+    plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
+    minus_di = 100 * (abs(minus_dm).rolling(period).mean() / atr)
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+    adx = dx.rolling(period).mean().iloc[-1]
+    return adx if not np.isnan(adx) else 20
+
 def calc_trend(df):
     if df is None or len(df) < 30:
         return "недостаточно данных"
-    ma18 = df['close'].rolling(18).mean().iloc[-1]
-    ma50 = df['close'].rolling(50).mean().iloc[-1] if len(df) >= 50 else ma18
-    if np.isnan(ma18) or np.isnan(ma50):
+    ma20 = df['close'].rolling(20).mean().iloc[-1]
+    ma50 = df['close'].rolling(50).mean().iloc[-1] if len(df) >= 50 else ma20
+    if np.isnan(ma20) or np.isnan(ma50):
         return "недостаточно данных"
-    spread = abs(ma18 - ma50) / ma50 * 100
-    return "боковик" if spread < 0.7 else ("бычий" if ma18 > ma50 else "медвежий")
+    spread = abs(ma20 - ma50) / ma50 * 100
+    return "боковик" if spread < 0.7 else ("бычий" if ma20 > ma50 else "медвежий")
 
 def calc_indicators(df):
     if df is None or len(df) < 30:
         return None
     rsi = ta.momentum.RSIIndicator(df['close'], window=14).rsi().iloc[-1]
-    macd = ta.trend.MACD(df['close'])
-    macd_line, macd_signal = macd.macd().iloc[-1], macd.macd_signal().iloc[-1]
+    macd_line, macd_signal, _ = calculate_macd(df['close'], 12, 26, 9)
     return {
         'rsi': round(rsi, 1),
         'rsi_status': "перекупленность" if rsi > 70 else "перепроданность" if rsi < 30 else "нейтрально",
-        'macd_status': "бычий" if macd_line > macd_signal else "медвежий"
+        'macd_status': "бычий" if macd_line.iloc[-1] > macd_signal.iloc[-1] else "медвежий"
     }
 
+# === ГЕНЕРАЦИЯ СИГНАЛОВ ===
+async def get_sber_swing_signal(df, price):
+    """Свинг-сигнал (дневные данные)"""
+    if df is None or len(df) < 50:
+        return None, None
+    
+    last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else last
+    
+    # MA
+    ma20 = df['close'].rolling(20).mean()
+    ma50 = df['close'].rolling(50).mean()
+    last_ma20 = ma20.iloc[-1]
+    last_ma50 = ma50.iloc[-1]
+    prev_ma20 = ma20.iloc[-2] if len(ma20) > 1 else last_ma20
+    prev_ma50 = ma50.iloc[-2] if len(ma50) > 1 else last_ma50
+    
+    # RSI
+    rsi = ta.momentum.RSIIndicator(df['close'], window=14).rsi().iloc[-1]
+    
+    # MACD правильный
+    macd_line, macd_signal, _ = calculate_macd(df['close'], 12, 26, 9)
+    macd_bullish = macd_line.iloc[-1] > macd_signal.iloc[-1]
+    
+    # ADX
+    adx = calculate_adx(df)
+    
+    # Объём
+    volume_ratio = 1.0
+    if 'volume' in df.columns and len(df) > 20:
+        vol_avg = df['volume'].rolling(20).mean().iloc[-1]
+        volume_ratio = df['volume'].iloc[-1] / vol_avg if vol_avg > 0 else 1.0
+    
+    # Пересечения MA
+    ma_cross_up = (last_ma20 > last_ma50) and (prev_ma20 <= prev_ma50)
+    ma_cross_down = (last_ma20 < last_ma50) and (prev_ma20 >= prev_ma50)
+    
+    # LONG условия
+    long_cond = (
+        (price > last_ma50 and last_ma20 > last_ma50) or ma_cross_up
+    ) and volume_ratio > STRATEGY['VOLUME_RATIO_LONG'] and rsi < STRATEGY['RSI_OVERBOUGHT'] and adx > STRATEGY['ADX_THRESHOLD']
+    
+    # SHORT условия
+    short_cond = (
+        (price < last_ma50 and last_ma20 < last_ma50) or ma_cross_down
+    ) and volume_ratio > STRATEGY['VOLUME_RATIO_SHORT'] and rsi > STRATEGY['RSI_OVERSOLD'] and adx > STRATEGY['ADX_THRESHOLD']
+    
+    if long_cond:
+        return "LONG", {
+            'price': price,
+            'target': price * (1 + STRATEGY['TAKE_PROFIT']),
+            'stop': price * (1 - STRATEGY['STOP_LOSS']),
+            'rsi': round(rsi, 1),
+            'adx': round(adx, 1),
+            'ma20': round(last_ma20, 2),
+            'ma50': round(last_ma50, 2),
+            'volume_ratio': round(volume_ratio, 1),
+            'macd': "бычий" if macd_bullish else "медвежий"
+        }
+    if short_cond:
+        return "SHORT", {
+            'price': price,
+            'target': price * (1 - STRATEGY['TAKE_PROFIT']),
+            'stop': price * (1 + STRATEGY['STOP_LOSS']),
+            'rsi': round(rsi, 1),
+            'adx': round(adx, 1),
+            'ma20': round(last_ma20, 2),
+            'ma50': round(last_ma50, 2),
+            'volume_ratio': round(volume_ratio, 1),
+            'macd': "медвежий" if not macd_bullish else "бычий"
+        }
+    
+    return None, None
+
+async def get_sber_intraday_signal(df, price):
+    """Внутридневной сигнал (15-минутные данные)"""
+    if df is None or len(df) < 20:
+        return None, None
+    
+    last = df.iloc[-1]
+    
+    # Быстрая MA для внутридневного
+    ma10 = df['close'].rolling(10).mean().iloc[-1]
+    
+    # RSI на 15-минутках
+    rsi = ta.momentum.RSIIndicator(df['close'], window=10).rsi().iloc[-1]
+    
+    # MACD быстрый
+    macd_line, macd_signal, _ = calculate_macd(df['close'], 5, 13, 5)
+    macd_bullish = macd_line.iloc[-1] > macd_signal.iloc[-1]
+    
+    # Объём
+    volume_ratio = 1.0
+    if 'volume' in df.columns and len(df) > 10:
+        vol_avg = df['volume'].rolling(10).mean().iloc[-1]
+        volume_ratio = df['volume'].iloc[-1] / vol_avg if vol_avg > 0 else 1.0
+    
+    # LONG
+    long_cond = (
+        price > ma10 and
+        volume_ratio > 1.2 and
+        35 < rsi < 65 and
+        macd_bullish and
+        last['close'] > df['close'].iloc[-2] * 1.001  # небольшой рост
+    )
+    
+    # SHORT
+    short_cond = (
+        price < ma10 and
+        volume_ratio > 1.2 and
+        35 < rsi < 65 and
+        not macd_bullish and
+        last['close'] < df['close'].iloc[-2] * 0.999  # небольшое падение
+    )
+    
+    if long_cond:
+        return "LONG", {
+            'price': price,
+            'target': price * 1.01,
+            'stop': price * 0.995,
+            'rsi': round(rsi, 1),
+            'volume_ratio': round(volume_ratio, 1)
+        }
+    if short_cond:
+        return "SHORT", {
+            'price': price,
+            'target': price * 0.99,
+            'stop': price * 1.005,
+            'rsi': round(rsi, 1),
+            'volume_ratio': round(volume_ratio, 1)
+        }
+    
+    return None, None
+
+async def get_exit_signal(df, price, position_type):
+    """Сигнал на выход из позиции"""
+    if df is None or len(df) < 20 or position_type is None:
+        return False, None
+    
+    rsi = ta.momentum.RSIIndicator(df['close'], window=14).rsi().iloc[-1]
+    macd_line, macd_signal, _ = calculate_macd(df['close'], 12, 26, 9)
+    
+    ma20 = df['close'].rolling(20).mean().iloc[-1]
+    ma50 = df['close'].rolling(50).mean().iloc[-1]
+    
+    if position_type == 'long':
+        # Выход из лонга
+        if rsi > STRATEGY['RSI_OVERBOUGHT']:
+            return True, f"RSI={rsi:.1f} (перекупленность)"
+        if macd_line.iloc[-1] < macd_signal.iloc[-1]:
+            return True, "MACD разворот вниз"
+        if ma20 < ma50:
+            return True, "MA20 ниже MA50"
+            
+    elif position_type == 'short':
+        # Выход из шорта
+        if rsi < STRATEGY['RSI_OVERSOLD']:
+            return True, f"RSI={rsi:.1f} (перепроданность)"
+        if macd_line.iloc[-1] > macd_signal.iloc[-1]:
+            return True, "MACD разворот вверх"
+        if ma20 > ma50:
+            return True, "MA20 выше MA50"
+    
+    return False, None
+
+async def reset_daily_pnl():
+    global daily_pnl, last_reset_date
+    msk = pytz.timezone('Europe/Moscow')
+    today = datetime.now(msk).date()
+    if last_reset_date != today:
+        daily_pnl = 0.0
+        last_reset_date = today
+
+# === ОТПРАВКА СИГНАЛА ===
+async def send_sber_signal():
+    global current_position, last_signal_sent, daily_pnl
+    
+    if not CHANNEL_ID:
+        return
+    
+    # Сброс дневного P&L
+    await reset_daily_pnl()
+    
+    # Получаем данные
+    df_daily = await data_fetcher.fetch_candles_daily("SBER", 100)
+    df_intraday = await data_fetcher.fetch_candles_intraday("SBER", 120)
+    price = await data_fetcher.get_price("SBER")
+    
+    if df_daily is None or price is None:
+        return
+    
+    # Проверка лимита дневной просадки
+    if daily_pnl < -STRATEGY['DAILY_LOSS_LIMIT']:
+        if current_position['type']:
+            msg = f"🚨 ДНЕВНОЙ ЛИМИТ ПРОСАДКИ ({daily_pnl*100:.1f}%)\nТорговля на сегодня остановлена"
+            await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
+            current_position['type'] = None
+        return
+    
+    # Генерируем сигналы
+    swing_signal, swing_data = await get_sber_swing_signal(df_daily, price)
+    intra_signal, intra_data = await get_sber_intraday_signal(df_intraday, price)
+    
+    # Проверяем выход из позиции
+    exit_needed, exit_reason = await get_exit_signal(df_daily, price, current_position['type'])
+    
+    now = datetime.now(pytz.timezone('Europe/Moscow'))
+    
+    # Формируем сообщение ТОЛЬКО если сигнал изменился
+    signal_key = f"{swing_signal}_{intra_signal}_{current_position['type']}"
+    if signal_key == last_signal_sent.get('signal') and (now - last_signal_sent.get('time', datetime.min)).seconds < 300:
+        return  # Не спамим
+    
+    msg = f"📊 <b>СБЕР</b> {now.strftime('%d.%m %H:%M')}\n━━━━━━━━━━━━━━━━━━━\n💰 Цена: <b>{price:.2f} ₽</b>\n\n"
+    
+    # Внутридневной сигнал
+    if intra_signal:
+        msg += f"🟢 ВНУТРИДНЕВНОЙ: {intra_signal}\n   🎯 {intra_data['target']:.2f} | 🛑 {intra_data['stop']:.2f}\n   RSI: {intra_data['rsi']} | Объём: {intra_data['volume_ratio']}x\n\n"
+    else:
+        msg += f"⚪ ВНУТРИДНЕВНОЙ: НЕТ\n\n"
+    
+    # Свинг-сигнал
+    if swing_signal:
+        msg += f"🟢 СВИНГ: {swing_signal}\n   🎯 {swing_data['target']:.2f} | 🛑 {swing_data['stop']:.2f}\n   MA20: {swing_data['ma20']} | MA50: {swing_data['ma50']}\n   RSI: {swing_data['rsi']} | ADX: {swing_data['adx']} | Объём: {swing_data['volume_ratio']}x\n\n"
+    else:
+        msg += f"⚪ СВИНГ: НЕТ (ADX<25 или флет)\n\n"
+    
+    # Текущая позиция
+    if current_position['type']:
+        pnl = (price - current_position['entry_price']) / current_position['entry_price'] * 100
+        if current_position['type'] == 'short':
+            pnl = -pnl
+        msg += f"📌 ПОЗИЦИЯ: {current_position['type'].upper()}\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n"
+    
+    # Выход
+    if exit_needed:
+        msg += f"\n🚨 ВЫХОД: {exit_reason}\n"
+        # Закрываем позицию
+        pnl_final = (price - current_position['entry_price']) / current_position['entry_price'] * 100
+        if current_position['type'] == 'short':
+            pnl_final = -pnl_final
+        daily_pnl += pnl_final / 100
+        save_trade(current_position['type'], current_position['entry_price'], price, pnl_final)
+        current_position['type'] = None
+    
+    # Вход в новую позицию (только если нет открытой)
+    elif not current_position['type']:
+        # Приоритет: свинг сильнее, но если его нет — внутридневной
+        if swing_signal:
+            current_position['type'] = swing_signal.lower()
+            current_position['entry_price'] = swing_data['price']
+            current_position['entry_time'] = now
+            current_position['signal_type'] = 'swing'
+            msg += f"\n✅ ВХОД {swing_signal} (свинг)\n"
+        elif intra_signal:
+            # Проверяем, не поздно ли (до 18:45)
+            if now.hour < 18 or (now.hour == 18 and now.minute < 45):
+                current_position['type'] = intra_signal.lower()
+                current_position['entry_price'] = intra_data['price']
+                current_position['entry_time'] = now
+                current_position['signal_type'] = 'intraday'
+                msg += f"\n✅ ВХОД {intra_signal} (внутридневной)\n"
+    
+    msg += f"\n🤖 Следующий сигнал через 15 мин"
+    
+    # Отправляем
+    try:
+        await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
+        last_signal_sent = {'signal': signal_key, 'price': price, 'time': now}
+    except Exception as e:
+        print(f"Ошибка отправки: {e}")
+
+async def sber_signal_loop():
+    await asyncio.sleep(5)
+    await send_sber_signal()
+    while True:
+        await asyncio.sleep(15 * 60)
+        await send_sber_signal()
+
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 async def get_all_trends():
     results = {}
     for ticker in ALL_TICKERS:
-        df = await data_fetcher.fetch_candles(ticker, 100)
+        df = await data_fetcher.fetch_candles_daily(ticker, 100)
         price = await data_fetcher.get_price(ticker)
         trend = calc_trend(df)
         results[ticker] = {**TICKERS[ticker], "price": price, "trend": trend}
     return results
+
+# === НАСТРОЙКА ЛОГГИНГА ===
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
+dp.middleware.setup(LoggingMiddleware())
+
+# === КЛАВИАТУРА ===
+keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🌙 Фазы Луны")],
+        [KeyboardButton(text="📈 Открыть позицию")],
+        [KeyboardButton(text="📊 Историческая статистика")],
+        [KeyboardButton(text="📈 График акции")],
+    ],
+    resize_keyboard=True
+)
 
 # === КОМАНДЫ ===
 @dp.message_handler(commands=['start'])
@@ -281,7 +657,6 @@ async def start_cmd(m):
         "🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard",
         reply_markup=keyboard, parse_mode='Markdown')
 
-# === КНОПКИ ===
 @dp.message_handler(lambda msg: msg.text == "🌙 Фазы Луны")
 async def btn_lunar(m):
     ph, dt, nxt = get_lunar_info()
@@ -317,14 +692,14 @@ async def btn_chart(m):
 async def chart(m):
     ticker = m.text.upper()
     msg = await m.answer(f"📈 График {TICKERS[ticker]['name']}...")
-    df = await data_fetcher.fetch_candles(ticker, 100)
+    df = await data_fetcher.fetch_candles_daily(ticker, 100)
     if df is None:
         await msg.edit_text("Нет данных")
         return
     plt.figure(figsize=(12,5))
     plt.plot(df['date'], df['close'], 'b-', label='Цена')
-    if len(df) >= 18:
-        plt.plot(df['date'], df['close'].rolling(18).mean(), 'g--', label='MA18')
+    if len(df) >= 20:
+        plt.plot(df['date'], df['close'].rolling(20).mean(), 'g--', label='MA20')
     if len(df) >= 50:
         plt.plot(df['date'], df['close'].rolling(50).mean(), 'r--', label='MA50')
     plt.title(TICKERS[ticker]['name'])
@@ -381,120 +756,6 @@ async def moon_notify():
                 await bot.send_message(MY_CHAT_ID, f"🌕 СЕГОДНЯ ПОЛНОЛУНИЕ — ТОЧКА ВХОДА")
         await asyncio.sleep(3600)
 
-# === СБЕР СИГНАЛЫ КАЖДЫЕ 15 МИНУТ ===
-SBER_CONFIG = {
-    'STOP_LOSS': 0.08,
-    'TAKE_PROFIT': 0.15,
-    'EXIT_TIME': "18:45"
-}
-
-current_position = {'type': None, 'entry_price': None, 'entry_time': None}
-
-async def get_sber_signal(df, price):
-    if df is None or len(df) < 50:
-        return None, None
-    last = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) > 1 else last
-    df['MA20'] = df['close'].rolling(20).mean()
-    df['MA50'] = df['close'].rolling(50).mean()
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs)).iloc[-1] if loss.iloc[-1] != 0 else 50
-    volume_ratio = 1.0
-    if 'volume' in df.columns and len(df) > 20:
-        vol_avg = df['volume'].rolling(20).mean().iloc[-1]
-        volume_ratio = df['volume'].iloc[-1] / vol_avg if vol_avg > 0 else 1.0
-    ma_cross_up = (last['MA20'] > last['MA50']) and (prev['MA20'] <= prev['MA50'])
-    ma_cross_down = (last['MA20'] < last['MA50']) and (prev['MA20'] >= prev['MA50'])
-    long_cond = ((price > last['MA50'] and last['MA20'] > last['MA50']) or ma_cross_up) and volume_ratio > 1.2 and 30 < rsi < 70
-    short_cond = ((price < last['MA50'] and last['MA20'] < last['MA50']) or ma_cross_down) and volume_ratio > 1.2 and 30 < rsi < 70
-    if long_cond:
-        return "LONG", {'price': price, 'target': price * 1.15, 'stop': price * 0.92, 'rsi': round(rsi, 1)}
-    if short_cond:
-        return "SHORT", {'price': price, 'target': price * 0.85, 'stop': price * 1.08, 'rsi': round(rsi, 1)}
-    return None, None
-
-async def get_exit_signal(df, price, position_type):
-    if df is None or len(df) < 20 or position_type is None:
-        return False, None
-    last = df.iloc[-1]
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs)).iloc[-1] if loss.iloc[-1] != 0 else 50
-    df['MA20'] = df['close'].rolling(20).mean()
-    df['MA50'] = df['close'].rolling(50).mean()
-    if position_type == 'long':
-        if rsi > 75 or last['MA20'] < last['MA50']:
-            reasons = []
-            if rsi > 75: reasons.append(f"RSI={rsi:.1f}")
-            if last['MA20'] < last['MA50']: reasons.append("MA20 ниже MA50")
-            return True, ", ".join(reasons)
-    elif position_type == 'short':
-        if rsi < 25 or last['MA20'] > last['MA50']:
-            reasons = []
-            if rsi < 25: reasons.append(f"RSI={rsi:.1f}")
-            if last['MA20'] > last['MA50']: reasons.append("MA20 выше MA50")
-            return True, ", ".join(reasons)
-    return False, None
-
-async def check_intraday_close():
-    msk = pytz.timezone('Europe/Moscow')
-    now = datetime.now(msk)
-    exit_time = datetime.strptime("18:45", "%H:%M").time()
-    return now.time() >= exit_time
-
-async def send_sber_signal():
-    global current_position
-    if not CHANNEL_ID:
-        return
-    df = await data_fetcher.fetch_candles("SBER", 100)
-    price = await data_fetcher.get_price("SBER")
-    if df is None or price is None:
-        return
-    signal, data = await get_sber_signal(df, price)
-    exit_needed, exit_reason = await get_exit_signal(df, price, current_position['type'])
-    close_intraday = await check_intraday_close()
-    now = datetime.now(pytz.timezone('Europe/Moscow'))
-    msg = f"📊 <b>СБЕР</b> {now.strftime('%d.%m %H:%M')}\n━━━━━━━━━━━━━━━━━━━\n💰 Цена: <b>{price:.2f} ₽</b>\n\n"
-    if close_intraday and current_position.get('type'):
-        msg += f"⏰ ЗАКРЫТИЕ ПОЗИЦИИ (18:45)\n"
-        if current_position['type'] == 'long':
-            pnl = (price - current_position['entry_price']) / current_position['entry_price'] * 100
-            msg += f"💰 Результат: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n"
-        current_position['type'] = None
-    elif signal:
-        msg += f"🟢 СИГНАЛ: {signal}\n   🎯 {data['target']:.2f} | 🛑 {data['stop']:.2f}\n   RSI: {data['rsi']}\n\n"
-    else:
-        msg += f"⚪ СИГНАЛ: НЕТ\n\n"
-    if current_position['type']:
-        pnl = (price - current_position['entry_price']) / current_position['entry_price'] * 100
-        if current_position['type'] == 'short':
-            pnl = -pnl
-        msg += f"📌 ПОЗИЦИЯ: {current_position['type'].upper()}\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n"
-    if exit_needed:
-        msg += f"\n🚨 ВЫХОД: {exit_reason}\n"
-        current_position['type'] = None
-    msg += f"\n🤖 Следующий сигнал через 15 мин"
-    try:
-        await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
-    except Exception as e:
-        print(f"Ошибка: {e}")
-    if not current_position['type'] and signal and not close_intraday:
-        current_position['type'] = signal.lower()
-        current_position['entry_price'] = data['price']
-        current_position['entry_time'] = now
-
-async def sber_signal_loop():
-    await asyncio.sleep(5)
-    await send_sber_signal()
-    while True:
-        await asyncio.sleep(15 * 60)
-        await send_sber_signal()
-
 # === WEB ДАШБОРД ===
 async def dashboard(req):
     tr = await get_all_trends()
@@ -547,6 +808,7 @@ async def web_server():
     await web.TCPSite(runner, '0.0.0.0', 10000).start()
     print("🌐 Веб-сервер запущен")
 
+# === ЗАПУСК ===
 async def on_startup(dp):
     init_db()
     await web_server()
