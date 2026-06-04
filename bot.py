@@ -799,6 +799,178 @@ async def moon_notify():
                 await bot.send_message(MY_CHAT_ID, f"🌕 СЕГОДНЯ ПОЛНОЛУНИЕ — ТОЧКА ВХОДА")
         await asyncio.sleep(3600)
 
+# === СБЕР СИГНАЛЫ КАЖДЫЕ 15 МИНУТ ===
+SBER_CONFIG = {
+    'MA_FAST': 20,
+    'MA_SLOW': 50,
+    'RSI_OVERBOUGHT': 75,
+    'RSI_OVERSOLD': 30,
+    'VOLUME_RATIO_LONG': 1.5,
+    'VOLUME_RATIO_SHORT': 1.5,
+    'VOLUME_RATIO_SWING': 1.2,
+    'STOP_LOSS_INTRADAY': 0.008,
+    'TAKE_PROFIT_INTRADAY': 0.015,
+    'STOP_LOSS_SWING': 0.04,
+    'TAKE_PROFIT_SWING': 0.06,
+    'EXIT_TIME': "18:45"
+}
+
+current_position = {'type': None, 'entry_price': None, 'entry_time': None, 'signal_type': None}
+
+async def get_sber_intraday_signal(df, price):
+    if df is None or len(df) < 20:
+        return None, None
+    last = df.iloc[-1]
+    df['MA20_fast'] = df['close'].rolling(10).mean()
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(10).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(10).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs)).iloc[-1] if loss.iloc[-1] != 0 else 50
+    ema_fast = df['close'].ewm(span=5).mean()
+    ema_slow = df['close'].ewm(span=13).mean()
+    macd = (ema_fast - ema_slow).iloc[-1]
+    volume_ratio = 1.0
+    if 'volume' in df.columns and len(df) > 10:
+        vol_avg = df['volume'].rolling(10).mean().iloc[-1]
+        volume_ratio = df['volume'].iloc[-1] / vol_avg if vol_avg > 0 else 1.0
+    long_cond = (price > last['MA20_fast'] and volume_ratio > 1.5 and 40 < rsi < 60 and macd > 0)
+    short_cond = (price < last['MA20_fast'] and volume_ratio > 1.5 and 40 < rsi < 60 and macd < 0)
+    if long_cond:
+        return "LONG", {'price': price, 'target': price * 1.015, 'stop': price * 0.992, 'rsi': round(rsi, 1), 'volume_ratio': round(volume_ratio, 1)}
+    if short_cond:
+        return "SHORT", {'price': price, 'target': price * 0.985, 'stop': price * 1.008, 'rsi': round(rsi, 1), 'volume_ratio': round(volume_ratio, 1)}
+    return None, None
+
+async def get_sber_swing_signal(df, price):
+    if df is None or len(df) < 50:
+        return None, None
+    last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else last
+    df['MA20'] = df['close'].rolling(20).mean()
+    df['MA50'] = df['close'].rolling(50).mean()
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs)).iloc[-1] if loss.iloc[-1] != 0 else 50
+    volume_ratio = 1.0
+    if 'volume' in df.columns and len(df) > 20:
+        vol_avg = df['volume'].rolling(20).mean().iloc[-1]
+        volume_ratio = df['volume'].iloc[-1] / vol_avg if vol_avg > 0 else 1.0
+    ma_cross_up = (last['MA20'] > last['MA50']) and (prev['MA20'] <= prev['MA50'])
+    ma_cross_down = (last['MA20'] < last['MA50']) and (prev['MA20'] >= prev['MA50'])
+    long_cond = ((price > last['MA50'] and last['MA20'] > last['MA50']) or ma_cross_up) and volume_ratio > 1.2 and 30 < rsi < 70
+    short_cond = ((price < last['MA50'] and last['MA20'] < last['MA50']) or ma_cross_down) and volume_ratio > 1.2 and 30 < rsi < 70
+    if long_cond:
+        return "LONG", {'price': price, 'target': price * 1.06, 'stop': price * 0.96, 'rsi': round(rsi, 1), 'ma20': round(last['MA20'], 2), 'ma50': round(last['MA50'], 2), 'volume_ratio': round(volume_ratio, 1)}
+    if short_cond:
+        return "SHORT", {'price': price, 'target': price * 0.94, 'stop': price * 1.04, 'rsi': round(rsi, 1), 'ma20': round(last['MA20'], 2), 'ma50': round(last['MA50'], 2), 'volume_ratio': round(volume_ratio, 1)}
+    return None, None
+
+async def get_exit_signal(df, price, position_type):
+    if df is None or len(df) < 20 or position_type is None:
+        return False, None
+    last = df.iloc[-1]
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs)).iloc[-1] if loss.iloc[-1] != 0 else 50
+    ema_fast = df['close'].ewm(span=8).mean()
+    ema_slow = df['close'].ewm(span=17).mean()
+    macd = (ema_fast - ema_slow).iloc[-1]
+    df['MA20'] = df['close'].rolling(20).mean()
+    df['MA50'] = df['close'].rolling(50).mean()
+    if position_type == 'long':
+        if rsi > 75 or macd < 0 or last['MA20'] < last['MA50']:
+            reasons = []
+            if rsi > 75: reasons.append(f"RSI={rsi:.1f} перекупленность")
+            if macd < 0: reasons.append("MACD разворот вниз")
+            if last['MA20'] < last['MA50']: reasons.append("Мёртвое пересечение MA")
+            return True, ", ".join(reasons)
+    elif position_type == 'short':
+        if rsi < 25 or macd > 0 or last['MA20'] > last['MA50']:
+            reasons = []
+            if rsi < 25: reasons.append(f"RSI={rsi:.1f} перепроданность")
+            if macd > 0: reasons.append("MACD разворот вверх")
+            if last['MA20'] > last['MA50']: reasons.append("Золотое пересечение MA")
+            return True, ", ".join(reasons)
+    return False, None
+
+async def check_intraday_close():
+    msk = pytz.timezone('Europe/Moscow')
+    now = datetime.now(msk)
+    exit_time = datetime.strptime("18:45", "%H:%M").time()
+    return now.time() >= exit_time
+
+async def get_sber_data_full():
+    ticker = "SBER"
+    df_daily = await data_fetcher.fetch_candles(ticker, 100)
+    price = await data_fetcher.get_price(ticker)
+    return df_daily, df_daily, price
+
+async def send_sber_signal():
+    global current_position
+    if not CHANNEL_ID:
+        return
+    df_daily, df_hourly, price = await get_sber_data_full()
+    if df_daily is None or price is None:
+        return
+    intra_signal, intra_data = await get_sber_intraday_signal(df_hourly, price)
+    swing_signal, swing_data = await get_sber_swing_signal(df_daily, price)
+    exit_needed, exit_reason = await get_exit_signal(df_daily, price, current_position['type'])
+    close_intraday = await check_intraday_close()
+    now = datetime.now(pytz.timezone('Europe/Moscow'))
+    msg = f"📊 <b>СБЕР СИГНАЛ</b> {now.strftime('%d.%m %H:%M')}\n━━━━━━━━━━━━━━━━━━━\n💰 Цена: <b>{price:.2f} ₽</b>\n\n"
+    if close_intraday and current_position.get('signal_type') == 'intraday':
+        msg += f"⏰ ЗАКРЫТИЕ ПОЗИЦИИ (18:45)\n"
+        if current_position['type'] == 'long':
+            pnl = (price - current_position['entry_price']) / current_position['entry_price'] * 100
+            msg += f"💰 Результат: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n"
+        current_position['type'] = None
+        current_position['signal_type'] = None
+    elif intra_signal:
+        msg += f"🟢 ВНУТРИДНЕВНОЙ: {intra_signal}\n   🎯 {intra_data['target']:.2f} | 🛑 {intra_data['stop']:.2f}\n   RSI: {intra_data['rsi']} | Объём: {intra_data['volume_ratio']}x\n\n"
+    else:
+        msg += f"⚪ ВНУТРИДНЕВНОЙ: НЕТ\n\n"
+    if swing_signal:
+        msg += f"🟢 СВИНГ: {swing_signal}\n   🎯 {swing_data['target']:.2f} | 🛑 {swing_data['stop']:.2f}\n   MA20: {swing_data['ma20']} | MA50: {swing_data['ma50']}\n   RSI: {swing_data['rsi']} | Объём: {swing_data['volume_ratio']}x\n\n"
+    else:
+        msg += f"⚪ СВИНГ: НЕТ\n\n"
+    if current_position['type']:
+        pnl = (price - current_position['entry_price']) / current_position['entry_price'] * 100
+        if current_position['type'] == 'short':
+            pnl = -pnl
+        msg += f"📌 ПОЗИЦИЯ: {current_position['type'].upper()} | {current_position['signal_type']}\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n"
+    if exit_needed:
+        msg += f"\n🚨 ВЫХОД ИЗ {current_position['type'].upper()}: {exit_reason}\n"
+        current_position['type'] = None
+        current_position['signal_type'] = None
+    msg += f"\n🤖 Следующий сигнал через 15 мин"
+    try:
+        await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
+    except Exception as e:
+        print(f"Ошибка: {e}")
+    if not current_position['type']:
+        if intra_signal and not close_intraday:
+            current_position['type'] = intra_signal.lower()
+            current_position['entry_price'] = intra_data['price']
+            current_position['entry_time'] = now
+            current_position['signal_type'] = 'intraday'
+        elif swing_signal:
+            current_position['type'] = swing_signal.lower()
+            current_position['entry_price'] = swing_data['price']
+            current_position['entry_time'] = now
+            current_position['signal_type'] = 'swing'
+
+async def sber_signal_loop():
+    await asyncio.sleep(5)
+    await send_sber_signal()
+    while True:
+        await asyncio.sleep(15 * 60)
+        await send_sber_signal()
+
 # === WEB ДАШБОРД ===
 async def dashboard(req):
     tr = await get_all_trends()
@@ -856,6 +1028,7 @@ async def on_startup(dp):
     await web_server()
     asyncio.create_task(daily_loop())
     asyncio.create_task(moon_notify())
+    asyncio.create_task(sber_signal_loop())
     try:
         await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n/forecast, /risk, /best, /compare\n🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard")
     except:
@@ -867,7 +1040,7 @@ async def on_shutdown(dp):
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("ПРОФ АНАЛИТИК | ВЕРСИЯ СТАБИЛЬНАЯ")
+    print("ПРОФ АНАЛИТИК | СБЕР СИГНАЛЫ КАЖДЫЕ 15 МИНУТ")
     print("=" * 50)
     from aiogram.utils import executor
     executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
