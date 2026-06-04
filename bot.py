@@ -17,11 +17,6 @@ import matplotlib.pyplot as plt
 from io import BytesIO
 import sqlite3
 import ta
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
-import tempfile
-import base64
 
 warnings.filterwarnings('ignore')
 
@@ -34,15 +29,15 @@ if not BOT_TOKEN:
     raise ValueError("❌ Токен не найден")
 
 # === КОМИССИЯ БРОКЕРА ===
-COMMISSION = 0.003  # 0.3%
+COMMISSION = 0.003
 
-# === ОПТИМИЗИРОВАННЫЕ ПАРАМЕТРЫ ===
+# === ПАРАМЕТРЫ СТРАТЕГИИ ===
 STRATEGY = {
     'MA_FAST': 10,
     'MA_SLOW': 30,
     'ADX_THRESHOLD': 20,
-    'STOP_LOSS_ATR_MULT': 2.0,   # Стоп = 2 × ATR
-    'TAKE_PROFIT_ATR_MULT': 4.0, # Тейк = 4 × ATR
+    'STOP_LOSS_ATR_MULT': 2.0,
+    'TAKE_PROFIT_ATR_MULT': 4.0,
     'ATR_PERIOD': 14,
     'DAILY_LOSS_LIMIT': 0.03,
     'LUNAR_BLACKOUT_DAYS': 2
@@ -120,49 +115,6 @@ def get_stats():
         win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
         return {'total_trades': total_trades, 'total_pnl': total_pnl, 'avg_pnl': avg_pnl, 'win_rate': win_rate, 'winning_trades': winning_trades, 'losing_trades': total_trades - winning_trades}
 
-def get_weekly_stats(weeks_ago=0):
-    """Статистика за последние N недель"""
-    with sqlite3.connect('bot_data.db') as conn:
-        c = conn.cursor()
-        # Получаем все сделки за последние 4 недели
-        c.execute("SELECT date, type, pnl FROM trades ORDER BY date DESC")
-        rows = c.fetchall()
-    if not rows:
-        return None
-    
-    trades = []
-    for row in rows:
-        date = datetime.fromisoformat(row[0])
-        trades.append({'date': date, 'type': row[1], 'pnl': row[2]})
-    
-    # Группировка по неделям
-    weekly = {}
-    for t in trades:
-        week_num = t['date'].isocalendar()[1]
-        year = t['date'].year
-        week_key = f"{year}-W{week_num:02d}"
-        if week_key not in weekly:
-            weekly[week_key] = []
-        weekly[week_key].append(t)
-    
-    # Сортируем недели
-    sorted_weeks = sorted(weekly.keys(), reverse=True)
-    result = []
-    for week_key in sorted_weeks[:4]:
-        week_trades = weekly[week_key]
-        total_pnl = sum(t['pnl'] for t in week_trades)
-        winning = sum(1 for t in week_trades if t['pnl'] > 0)
-        win_rate = (winning / len(week_trades) * 100) if week_trades else 0
-        result.append({
-            'week': week_key,
-            'trades': len(week_trades),
-            'pnl': total_pnl,
-            'win_rate': win_rate,
-            'wins': winning,
-            'losses': len(week_trades) - winning
-        })
-    return result
-
 def get_last_summary_date():
     with sqlite3.connect('bot_data.db') as conn:
         c = conn.cursor()
@@ -175,17 +127,17 @@ def save_daily_summary(date, summary):
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO daily_summary (date, summary) VALUES (?, ?)", (date, summary))
 
-def save_weekly_report(week_start, report_pdf_base64):
-    with sqlite3.connect('bot_data.db') as conn:
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO weekly_reports (week_start, report_data) VALUES (?, ?)", (week_start, report_pdf_base64))
-
 def get_last_week_report():
     with sqlite3.connect('bot_data.db') as conn:
         c = conn.cursor()
         c.execute("SELECT week_start FROM weekly_reports ORDER BY week_start DESC LIMIT 1")
         row = c.fetchone()
     return row[0] if row else None
+
+def save_weekly_report(week_start, report_data):
+    with sqlite3.connect('bot_data.db') as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO weekly_reports (week_start, report_data) VALUES (?, ?)", (week_start, report_data))
 
 # === ЛУННЫЕ ДАННЫЕ ===
 LUNAR_PHASES = {
@@ -286,11 +238,9 @@ class DataFetcher:
                     cols = candles.get('columns', [])
                     if rows and len(rows) >= 3:
                         idx_date = next((i for i, c in enumerate(cols) if c.lower() in ('begin', 'date')), None)
-                        idx_open = next((i for i, c in enumerate(cols) if c.lower() == 'open'), None)
                         idx_high = next((i for i, c in enumerate(cols) if c.lower() == 'high'), None)
                         idx_low = next((i for i, c in enumerate(cols) if c.lower() == 'low'), None)
                         idx_close = next((i for i, c in enumerate(cols) if c.lower() in ('close', 'value')), None)
-                        idx_volume = next((i for i, c in enumerate(cols) if c.lower() == 'volume'), None)
                         if idx_date is not None and idx_close is not None:
                             records = []
                             for row in rows:
@@ -298,11 +248,9 @@ class DataFetcher:
                                     try:
                                         records.append({
                                             'date': pd.to_datetime(row[idx_date]),
-                                            'open': float(row[idx_open]) if idx_open is not None and len(row) > idx_open else None,
-                                            'high': float(row[idx_high]) if idx_high is not None and len(row) > idx_high else None,
-                                            'low': float(row[idx_low]) if idx_low is not None and len(row) > idx_low else None,
-                                            'close': float(row[idx_close]),
-                                            'volume': float(row[idx_volume]) if idx_volume is not None and len(row) > idx_volume else 0
+                                            'high': float(row[idx_high]) if idx_high is not None else None,
+                                            'low': float(row[idx_low]) if idx_low is not None else None,
+                                            'close': float(row[idx_close])
                                         })
                                     except:
                                         pass
@@ -315,7 +263,6 @@ class DataFetcher:
         return None
 
     async def fetch_candles_hourly(self, ticker, hours=200):
-        """4-часовые свечи"""
         key = f"hourly_{ticker}_{hours}"
         cached = get_from_cache(key)
         if cached is not None:
@@ -325,7 +272,7 @@ class DataFetcher:
             end = datetime.now()
             start = end - timedelta(hours=hours)
             url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json"
-            params = {'from': start.strftime('%Y-%m-%d'), 'till': end.strftime('%Y-%m-%d'), 'interval': 240}  # 240 минут = 4 часа
+            params = {'from': start.strftime('%Y-%m-%d'), 'till': end.strftime('%Y-%m-%d'), 'interval': 240}
             async with s.get(url, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -359,7 +306,6 @@ class DataFetcher:
         return None
 
     async def fetch_candles_min15(self, ticker, minutes=300):
-        """15-минутные свечи"""
         key = f"min15_{ticker}_{minutes}"
         cached = get_from_cache(key)
         if cached is not None:
@@ -410,7 +356,6 @@ data_fetcher = DataFetcher()
 
 # === РАСЧЁТ ИНДИКАТОРОВ ===
 def calculate_atr(df, period=14):
-    """Расчёт ATR для адаптивного стопа"""
     if df is None or len(df) < period + 5:
         return None
     high = df['high'] if 'high' in df.columns else df['close']
@@ -442,7 +387,6 @@ def calculate_adx(df, period=14):
     return adx if not np.isnan(adx) else 20
 
 def get_trend(df):
-    """Определение тренда по MA10/MA30"""
     if df is None or len(df) < 30:
         return None
     ma10 = df['close'].rolling(10).mean().iloc[-1]
@@ -464,7 +408,6 @@ def calc_trend(df):
 
 # === МУЛЬТИ-ТАЙМФРЕЙМ СИГНАЛ ===
 async def get_multi_tf_signal():
-    """Сигнал только при совпадении трендов на 15мин, 4ч, дневном"""
     df_daily = await data_fetcher.fetch_candles_daily("SBER", 100)
     df_hourly = await data_fetcher.fetch_candles_hourly("SBER", 200)
     df_min15 = await data_fetcher.fetch_candles_min15("SBER", 300)
@@ -477,10 +420,8 @@ async def get_multi_tf_signal():
     trend_hourly = get_trend(df_hourly)
     trend_min15 = get_trend(df_min15)
     
-    # Расчёт ADX на дневном таймфрейме
     adx = calculate_adx(df_daily)
     
-    # Золотое/мёртвое пересечение на дневном
     ma10 = df_daily['close'].rolling(10).mean()
     ma30 = df_daily['close'].rolling(30).mean()
     last_ma10 = ma10.iloc[-1]
@@ -491,15 +432,11 @@ async def get_multi_tf_signal():
     golden_cross = (last_ma10 > last_ma30) and (prev_ma10 <= prev_ma30)
     dead_cross = (last_ma10 < last_ma30) and (prev_ma10 >= prev_ma30)
     
-    # ATR для адаптивного стопа
     atr = calculate_atr(df_daily, STRATEGY['ATR_PERIOD'])
     
-    # Сигнал LONG: все три таймфрейма бычьи ИЛИ золотое пересечение
     long_condition = (trend_daily == "bullish" and trend_hourly == "bullish" and trend_min15 == "bullish") or golden_cross
-    # Сигнал SHORT: все три таймфрейма медвежьи ИЛИ мёртвое пересечение
     short_condition = (trend_daily == "bearish" and trend_hourly == "bearish" and trend_min15 == "bearish") or dead_cross
     
-    # Фильтр ADX (тренд должен быть)
     if adx < STRATEGY['ADX_THRESHOLD']:
         return None, {'trend_daily': trend_daily, 'trend_hourly': trend_hourly, 'trend_min15': trend_min15, 'adx': adx, 'price': price, 'atr': atr}
     
@@ -527,7 +464,6 @@ async def get_multi_tf_signal():
     return None, {'trend_daily': trend_daily, 'trend_hourly': trend_hourly, 'trend_min15': trend_min15, 'adx': adx, 'price': price, 'atr': atr}
 
 async def get_exit_signal(df, price, position_type, atr_at_entry):
-    """Выход при обратном пересечении MA или по стопу/тейку на основе ATR"""
     if df is None or len(df) < 20 or position_type is None:
         return False, None
     
@@ -538,15 +474,12 @@ async def get_exit_signal(df, price, position_type, atr_at_entry):
     prev_ma10 = ma10.iloc[-2] if len(ma10) > 1 else last_ma10
     prev_ma30 = ma30.iloc[-2] if len(ma30) > 1 else last_ma30
     
-    # Получаем текущий ATR
     current_atr = calculate_atr(df, STRATEGY['ATR_PERIOD'])
     if current_atr is None:
         current_atr = atr_at_entry if atr_at_entry else 5.0
     
     if position_type == 'long':
-        # Стоп по ATR (2 × ATR от цены входа)
         stop_price = current_position['entry_price'] - (STRATEGY['STOP_LOSS_ATR_MULT'] * current_atr)
-        # Тейк по ATR (4 × ATR от цены входа)
         take_price = current_position['entry_price'] + (STRATEGY['TAKE_PROFIT_ATR_MULT'] * current_atr)
         
         if price <= stop_price:
@@ -554,7 +487,6 @@ async def get_exit_signal(df, price, position_type, atr_at_entry):
         if price >= take_price:
             return True, f"ТЕЙК: цена {price:.2f} выше {take_price:.2f} (4×ATR={current_atr:.2f})"
         
-        # Выход по пересечению MA
         dead_cross = (last_ma10 < last_ma30) and (prev_ma10 >= prev_ma30)
         if dead_cross:
             return True, f"MA10 ниже MA30 (мёртвое пересечение)"
@@ -584,27 +516,20 @@ async def reset_daily_pnl():
 
 # === ЕЖЕНЕДЕЛЬНЫЙ ОТЧЁТ В PDF ===
 async def generate_weekly_pdf():
-    """Генерация PDF-отчёта за неделю"""
-    stats = get_stats()
-    weekly_stats = get_weekly_stats()
-    
-    # Получаем сделки за последние 7 дней
     with sqlite3.connect('bot_data.db') as conn:
         c = conn.cursor()
         week_ago = (datetime.now() - timedelta(days=7)).isoformat()
         c.execute("SELECT date, type, entry, exit, pnl FROM trades WHERE date > ? ORDER BY date DESC", (week_ago,))
         trades = c.fetchall()
     
-    # Создаём временный файл для графика
     plt.figure(figsize=(10, 5))
     
-    # Накапливаем P&L для графика
     if trades:
         cumulative = 0
         cum_pnl = []
         dates = []
         for t in trades[::-1]:
-            cumulative += t[4]  # pnl
+            cumulative += t[4]
             cum_pnl.append(cumulative)
             dates.append(datetime.fromisoformat(t[0]))
         
@@ -615,55 +540,39 @@ async def generate_weekly_pdf():
         plt.ylabel('P&L (%)')
         plt.grid(True, alpha=0.3)
     
-    # Сохраняем график в BytesIO
     img_buf = BytesIO()
     plt.savefig(img_buf, format='png', dpi=100)
     img_buf.seek(0)
     plt.close()
     
-    # Создаём PDF
     pdf_buf = BytesIO()
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
+    from reportlab.lib.pagesizes import A4
+    
     c = canvas.Canvas(pdf_buf, pagesize=A4)
     width, height = A4
     
-    # Заголовок
     c.setFont("Helvetica-Bold", 18)
     c.drawString(50, height - 50, f"Отчёт по торговле {datetime.now().strftime('%d.%m.%Y')}")
     
     c.setFont("Helvetica", 12)
-    c.drawString(50, height - 80, f"Период: { (datetime.now() - timedelta(days=7)).strftime('%d.%m.%Y') } - {datetime.now().strftime('%d.%m.%Y')}")
+    c.drawString(50, height - 80, f"Период: {(datetime.now() - timedelta(days=7)).strftime('%d.%m.%Y')} - {datetime.now().strftime('%d.%m.%Y')}")
     
-    # Общая статистика
+    stats = get_stats()
     c.setFont("Helvetica-Bold", 14)
     c.drawString(50, height - 120, "Общая статистика")
-    
     c.setFont("Helvetica", 11)
     y = height - 145
     c.drawString(50, y, f"Всего сделок: {stats['total_trades']}")
     c.drawString(50, y - 20, f"Win Rate: {stats['win_rate']:.1f}%")
     c.drawString(50, y - 40, f"Общий P&L: {stats['total_pnl']:+.2f}%")
-    c.drawString(50, y - 60, f"Средний P&L на сделку: {stats['avg_pnl']:+.2f}%")
     
-    # Недельная статистика
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(300, height - 120, "Статистика по неделям")
-    
-    c.setFont("Helvetica", 10)
-    y_week = height - 145
-    if weekly_stats:
-        for i, week in enumerate(weekly_stats[:3]):
-            c.drawString(300, y_week - i*25, f"{week['week']}: {week['trades']} сделок, {week['win_rate']:.0f}% винрейт, {week['pnl']:+.2f}%")
-    else:
-        c.drawString(300, y_week, "Нет данных за неделю")
-    
-    # График
     img = ImageReader(img_buf)
     c.drawImage(img, 50, height - 350, width=450, height=150)
     
-    # Список сделок за неделю
     c.setFont("Helvetica-Bold", 12)
     c.drawString(50, height - 380, "Сделки за неделю:")
-    
     c.setFont("Helvetica", 9)
     y_trade = height - 405
     for i, trade in enumerate(trades[:15]):
@@ -675,33 +584,25 @@ async def generate_weekly_pdf():
         trade_type = trade[1].upper()
         pnl = trade[4]
         pnl_str = f"{pnl:+.2f}%"
-        color = "green" if pnl > 0 else "red"
         c.drawString(50, y_trade, f"{date} | {trade_type} | {trade[2]:.2f} → {trade[3]:.2f} | {pnl_str}")
         y_trade -= 18
-    
-    # Итог
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(50, y_trade - 30, f"Итог недели: {cumulative:+.2f}%" if trades else "Итог недели: 0%")
     
     c.save()
     pdf_buf.seek(0)
     return pdf_buf
 
 async def send_weekly_report():
-    """Отправка еженедельного отчёта по пятницам в 18:00"""
     if not CHANNEL_ID:
         return
     
     msk = pytz.timezone('Europe/Moscow')
     now = datetime.now(msk)
     
-    # Проверяем, что сегодня пятница (weekday() = 4) и время около 18:00
     if now.weekday() != 4:
         return
     if now.hour != 18 or now.minute > 5:
         return
     
-    # Проверяем, не отправляли ли уже отчёт за эту неделю
     week_start = (now - timedelta(days=7)).strftime('%Y-%m-%d')
     last_report = get_last_week_report()
     if last_report == week_start:
@@ -710,11 +611,10 @@ async def send_weekly_report():
     try:
         pdf_buf = await generate_weekly_pdf()
         save_weekly_report(week_start, "sent")
-        
         await bot.send_document(
             CHANNEL_ID,
             types.InputFile(pdf_buf, filename=f"weekly_report_{now.strftime('%Y%m%d')}.pdf"),
-            caption=f"📊 Еженедельный отчёт\n{ (now - timedelta(days=7)).strftime('%d.%m') } - {now.strftime('%d.%m') }\n\nКоманды: /status /balance"
+            caption=f"📊 Еженедельный отчёт\n{(now - timedelta(days=7)).strftime('%d.%m')} - {now.strftime('%d.%m')}\n\nКоманды: /status /balance"
         )
     except Exception as e:
         print(f"Ошибка отправки отчёта: {e}")
@@ -728,7 +628,7 @@ async def send_sber_signal():
     
     await reset_daily_pnl()
     
-    lunar_blackout, full_moon_date = is_lunar_blackout()
+    lunar_blackout, _ = is_lunar_blackout()
     if lunar_blackout:
         return
     
@@ -746,7 +646,6 @@ async def send_sber_signal():
             current_position['type'] = None
         return
     
-    # Проверка выхода с адаптивным стопом
     exit_needed = False
     exit_reason = None
     if current_position['type']:
@@ -825,7 +724,40 @@ async def sber_signal_loop():
         await asyncio.sleep(15 * 60)
         await send_sber_signal()
 
+# === НАСТРОЙКА ЛОГГИНГА ===
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
+dp.middleware.setup(LoggingMiddleware())
+
+# === КЛАВИАТУРА ===
+keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🌙 Фазы Луны")],
+        [KeyboardButton(text="📈 Открыть позицию")],
+        [KeyboardButton(text="📊 Историческая статистика")],
+        [KeyboardButton(text="📈 График акции")],
+    ],
+    resize_keyboard=True
+)
+
 # === КОМАНДЫ ===
+@dp.message_handler(commands=['start'])
+async def start_cmd(m):
+    await m.answer(
+        "📊 **АНАЛИТИК**\n\n"
+        "🔹 <b>МУЛЬТИ-ТАЙМФРЕЙМ</b> (15мин + 4ч + день)\n"
+        "🔹 <b>АДАПТИВНЫЙ СТОП</b> (2×ATR / 4×ATR)\n"
+        "🔹 <b>ЛУННЫЙ ФИЛЬТР</b> (запрет за 2 дня до/после полнолуния)\n"
+        "🔹 <b>ЕЖЕНЕДЕЛЬНЫЙ ОТЧЁТ PDF</b> (пятница 18:00)\n\n"
+        "🔹 <b>КОМАНДЫ:</b>\n"
+        "   /status — текущее состояние (все ТФ)\n"
+        "   /open LONG 310 — открыть позицию\n"
+        "   /close — закрыть позицию\n"
+        "   /balance — статистика\n\n"
+        "🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard",
+        reply_markup=keyboard, parse_mode='HTML')
+
 @dp.message_handler(commands=['status'])
 async def status_cmd(m):
     price = await data_fetcher.get_price("SBER")
@@ -862,7 +794,6 @@ async def status_cmd(m):
         msg += f"   📊 P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n"
         msg += f"   💸 С комиссией: {'+' if pnl_with_comm >= 0 else ''}{pnl_with_comm:.2f}%\n"
         
-        # Адаптивные стоп/тейк на основе ATR
         if current_position.get('atr_at_entry'):
             atr_val = current_position['atr_at_entry']
             if current_position['type'] == 'long':
@@ -898,7 +829,7 @@ async def open_cmd(m):
         await m.answer(f"⚠️ Уже есть открытая позиция {current_position['type'].upper()}. Сначала закройте её /close")
         return
     
-    lunar_blackout, full_moon_date = is_lunar_blackout()
+    lunar_blackout, _ = is_lunar_blackout()
     if lunar_blackout:
         await m.answer(f"🌕 ЛУННЫЙ ЗАПРЕТ: торговля приостановлена на {STRATEGY['LUNAR_BLACKOUT_DAYS']} дн. до/после полнолуния")
         return
@@ -910,12 +841,6 @@ async def open_cmd(m):
         await m.answer("❌ Неверная цена")
         return
     
-    current_price = await data_fetcher.get_price("SBER")
-    if current_price is None:
-        await m.answer("⚠️ Не могу получить текущую цену")
-        return
-    
-    # Получаем ATR для адаптивного стопа
     df = await data_fetcher.fetch_candles_daily("SBER", 50)
     atr = calculate_atr(df, STRATEGY['ATR_PERIOD']) if df is not None else None
     
@@ -998,49 +923,7 @@ async def balance_cmd(m):
     
     await m.answer(msg, parse_mode='HTML')
 
-# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
-async def get_all_trends():
-    results = {}
-    for ticker in ALL_TICKERS:
-        df = await data_fetcher.fetch_candles_daily(ticker, 100)
-        price = await data_fetcher.get_price(ticker)
-        trend = calc_trend(df)
-        results[ticker] = {**TICKERS[ticker], "price": price, "trend": trend}
-    return results
-
-# === НАСТРОЙКА ЛОГГИНГА ===
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
-dp.middleware.setup(LoggingMiddleware())
-
-# === КЛАВИАТУРА ===
-keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🌙 Фазы Луны")],
-        [KeyboardButton(text="📈 Открыть позицию")],
-        [KeyboardButton(text="📊 Историческая статистика")],
-        [KeyboardButton(text="📈 График акции")],
-    ],
-    resize_keyboard=True
-)
-
-@dp.message_handler(commands=['start'])
-async def start_cmd(m):
-    await m.answer(
-        "📊 **АНАЛИТИК**\n\n"
-        "🔹 <b>МУЛЬТИ-ТАЙМФРЕЙМ</b> (15мин + 4ч + день)\n"
-        "🔹 <b>АДАПТИВНЫЙ СТОП</b> (2×ATR / 4×ATR)\n"
-        "🔹 <b>ЛУННЫЙ ФИЛЬТР</b> (запрет за 2 дня до/после полнолуния)\n"
-        "🔹 <b>ЕЖЕНЕДЕЛЬНЫЙ ОТЧЁТ PDF</b> (пятница 18:00)\n\n"
-        "🔹 <b>КОМАНДЫ:</b>\n"
-        "   /status — текущее состояние (все ТФ)\n"
-        "   /open LONG 310 — открыть позицию\n"
-        "   /close — закрыть позицию\n"
-        "   /balance — статистика\n\n"
-        "🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard",
-        reply_markup=keyboard, parse_mode='HTML')
-
+# === КНОПКИ ===
 @dp.message_handler(lambda msg: msg.text == "🌙 Фазы Луны")
 async def btn_lunar(m):
     ph, dt, nxt = get_lunar_info()
@@ -1105,7 +988,7 @@ async def daily_job():
     tr = await get_all_trends()
     long = sum(1 for d in tr.values() if d['trend'] == 'бычий')
     short = sum(1 for d in tr.values() if d['trend'] == 'медвежий')
-    lunar_blackout, full_moon_date = is_lunar_blackout()
+    lunar_blackout, _ = is_lunar_blackout()
     txt = f"🌙 **{datetime.now(msk).strftime('%d.%m.%Y')}**\n"
     if nxt:
         txt += f"🌕 Полнолуние {nxt.strftime('%d.%m.%Y')}\n"
@@ -1124,7 +1007,6 @@ async def daily_loop():
         now = datetime.now(pytz.timezone('Europe/Moscow'))
         if now.hour == 10 and now.minute < 5:
             await daily_job()
-        # Проверка для еженедельного отчёта (пятница 18:00)
         if now.weekday() == 4 and now.hour == 18 and now.minute < 5:
             await send_weekly_report()
         await asyncio.sleep(60)
@@ -1142,6 +1024,15 @@ async def moon_notify():
                 last['today'] = nxt.date()
                 await bot.send_message(MY_CHAT_ID, f"🌕 СЕГОДНЯ ПОЛНОЛУНИЕ — ТОЧКА ВХОДА")
         await asyncio.sleep(3600)
+
+async def get_all_trends():
+    results = {}
+    for ticker in ALL_TICKERS:
+        df = await data_fetcher.fetch_candles_daily(ticker, 100)
+        price = await data_fetcher.get_price(ticker)
+        trend = calc_trend(df)
+        results[ticker] = {**TICKERS[ticker], "price": price, "trend": trend}
+    return results
 
 # === WEB ДАШБОРД ===
 async def dashboard(req):
@@ -1176,7 +1067,7 @@ async def dashboard(req):
     <body>
     <div class="card"><h1>📊 АНАЛИТИК</h1><div>{now.strftime('%d.%m.%Y %H:%M')} | {ph}</div><div>🌕 Полнолуние: {nxt.strftime('%d.%m.%Y') if nxt else '—'}</div></div>
     <div class="grid"><div class="stat"><div class="num">{long}</div><div>LONG</div></div><div class="stat"><div class="num">{short}</div><div>SHORT</div></div><div class="stat"><div class="num">{side}</div><div>БОКОВИК</div></div></div>
-    <table><thead><tr><th>Актив</th><th>Тикер</th><th>Цена</th><th>Тренд</th><th>LONG</th><th>SHORT</th></tr></thead><tbody>{rows}</tbody></td>
+    <table><thead><tr><th>Актив</th><th>Тикер</th><th>Цена</th><th>Тренд</th><th>LONG</th><th>SHORT</th></tr></thead><tbody>{rows}</tbody></table>
     <div class="footer">Обновляется каждые 5 минут | Мульти-ТФ: 15мин + 4ч + день</div>
     </body></html>
     """
