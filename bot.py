@@ -79,7 +79,6 @@ LUNAR_PHASES = {
 }
 
 def get_lunar_info():
-    """Возвращает текущую фазу луны и дату следующего полнолуния"""
     msk = pytz.timezone('Europe/Moscow')
     now = datetime.now(msk)
     next_full = None
@@ -106,7 +105,6 @@ def get_lunar_info():
     return "обычный день", None, next_full
 
 def get_days_until_full_moon():
-    """Возвращает количество дней до следующего полнолуния"""
     msk = pytz.timezone('Europe/Moscow')
     now = datetime.now(msk)
     for date_str, time_str in LUNAR_PHASES["full_moons"]:
@@ -132,7 +130,7 @@ def set_to_cache(key, data):
 
 # === СОСТОЯНИЕ ДЛЯ СБЕРА ===
 current_position = {'type': None, 'entry_price': None, 'entry_time': None, 'is_manual': False}
-last_signal_sent = {'signal': None, 'price': None, 'time': None}
+last_signal_sent = {}
 daily_pnl = 0.0
 last_reset_date = None
 lunar_notified_days = set()
@@ -295,7 +293,6 @@ def get_trend(df):
     return "neutral"
 
 def calc_trend_for_ticker(df):
-    """Для лунной стратегии — определение тренда для одного тикера"""
     if df is None or len(df) < 30:
         return "недостаточно данных"
     ma18 = df['close'].rolling(18).mean().iloc[-1]
@@ -315,13 +312,13 @@ async def get_all_trends():
         results[ticker] = {**TICKERS[ticker], "price": price, "trend": trend}
     return results
 
-# === СИГНАЛЫ ПО СБЕРУ (3 раза в день) ===
+# === СИГНАЛЫ ПО СБЕРУ (КАЖДЫЙ ЧАС С 10 ДО 22) ===
 async def get_sber_signal():
     df = await data_fetcher.fetch_candles_daily("SBER", 100)
     price = await data_fetcher.get_price("SBER")
     
     if df is None or price is None:
-        return None, None
+        return None, None, "Нет данных от MOEX"
     
     trend = get_trend(df)
     adx = calculate_adx(df)
@@ -339,8 +336,25 @@ async def get_sber_signal():
     long_cond = golden_cross or (trend == "bullish" and adx > SBER_STRATEGY['ADX_THRESHOLD'])
     short_cond = dead_cross or (trend == "bearish" and adx > SBER_STRATEGY['ADX_THRESHOLD'])
     
+    # Формируем подробное объяснение
+    reasons = []
     if adx < SBER_STRATEGY['ADX_THRESHOLD']:
-        return None, {'trend': trend, 'adx': adx, 'price': price, 'note': f'ADX={adx:.1f} < {SBER_STRATEGY["ADX_THRESHOLD"]} (флет)'}
+        reasons.append(f"⚠️ ADX = {adx:.1f} (нужно > {SBER_STRATEGY['ADX_THRESHOLD']}) — рынок во флете")
+    if trend != "bullish" and not golden_cross:
+        reasons.append(f"📉 Тренд медвежий (MA10 ниже MA30) — для LONG нужен бычий тренд")
+    if trend != "bearish" and not dead_cross:
+        reasons.append(f"📈 Тренд бычий (MA10 выше MA30) — для SHORT нужен медвежий тренд")
+    
+    if adx < SBER_STRATEGY['ADX_THRESHOLD']:
+        return None, {
+            'price': price,
+            'trend': trend,
+            'adx': adx,
+            'ma10': last_ma10,
+            'ma30': last_ma30,
+            'golden_cross': golden_cross,
+            'dead_cross': dead_cross
+        }, "\n".join(reasons) if reasons else f"ADX = {adx:.1f} < {SBER_STRATEGY['ADX_THRESHOLD']} (флет, сигналов нет)"
     
     if long_cond:
         return "LONG", {
@@ -349,8 +363,10 @@ async def get_sber_signal():
             'adx': round(adx, 1),
             'target': price * (1 + SBER_STRATEGY['TAKE_PROFIT']),
             'stop': price * (1 - SBER_STRATEGY['STOP_LOSS']),
-            'signal_type': "ЗОЛОТОЕ ПЕРЕСЕЧЕНИЕ" if golden_cross else "ТРЕНД"
-        }
+            'signal_type': "ЗОЛОТОЕ ПЕРЕСЕЧЕНИЕ" if golden_cross else "ТРЕНД",
+            'ma10': last_ma10,
+            'ma30': last_ma30
+        }, None
     if short_cond:
         return "SHORT", {
             'price': price,
@@ -358,10 +374,29 @@ async def get_sber_signal():
             'adx': round(adx, 1),
             'target': price * (1 - SBER_STRATEGY['TAKE_PROFIT']),
             'stop': price * (1 + SBER_STRATEGY['STOP_LOSS']),
-            'signal_type': "МЁРТВОЕ ПЕРЕСЕЧЕНИЕ" if dead_cross else "ТРЕНД"
-        }
+            'signal_type': "МЁРТВОЕ ПЕРЕСЕЧЕНИЕ" if dead_cross else "ТРЕНД",
+            'ma10': last_ma10,
+            'ma30': last_ma30
+        }, None
     
-    return None, {'trend': trend, 'adx': adx, 'price': price, 'note': 'Нет пересечения'}
+    # Нет сигнала — объясняем почему
+    if not reasons:
+        if trend == "bullish" and adx > SBER_STRATEGY['ADX_THRESHOLD']:
+            reasons.append("Тренд бычий, ADX > 20, но нет подтверждения (жду пересечения MA или усиления тренда)")
+        elif trend == "bearish" and adx > SBER_STRATEGY['ADX_THRESHOLD']:
+            reasons.append("Тренд медвежий, ADX > 20, но нет подтверждения (жду пересечения MA или усиления тренда)")
+        else:
+            reasons.append("Условия для входа не выполнены")
+    
+    return None, {
+        'price': price,
+        'trend': trend,
+        'adx': adx,
+        'ma10': last_ma10,
+        'ma30': last_ma30,
+        'golden_cross': golden_cross,
+        'dead_cross': dead_cross
+    }, "\n".join(reasons)
 
 async def reset_daily_pnl():
     global daily_pnl, last_reset_date
@@ -379,11 +414,11 @@ async def send_sber_signal():
     
     await reset_daily_pnl()
     
-    signal, data = await get_sber_signal()
-    price = data['price'] if data else None
-    
-    if price is None:
+    signal, data, explanation = await get_sber_signal()
+    if data is None:
         return
+    
+    price = data['price']
     
     if daily_pnl < -SBER_STRATEGY['DAILY_LOSS_LIMIT']:
         if current_position['type']:
@@ -391,7 +426,7 @@ async def send_sber_signal():
             current_position['type'] = None
         return
     
-    # Проверка стоп/тейк
+    # Проверка стоп/тейк для открытой позиции
     exit_needed = False
     exit_reason = None
     if current_position['type']:
@@ -415,28 +450,60 @@ async def send_sber_signal():
                 exit_reason = f"Тейк-профит: {pnl_check:.1f}%"
     
     now = datetime.now(pytz.timezone('Europe/Moscow'))
-    signal_key = f"{signal}_{current_position['type']}"
+    current_hour = now.hour
     
-    msg = f"📊 <b>СБЕР</b> {now.strftime('%d.%m %H:%M')}\n━━━━━━━━━━━━━━━━━━━\n💰 Цена: <b>{price:.2f} ₽</b>\n"
-    msg += f"📈 Тренд: {'🟢 БЫЧИЙ' if data.get('trend') == 'bullish' else '🔴 МЕДВЕЖИЙ' if data.get('trend') == 'bearish' else '⚪ НЕЙТРАЛЬНО'}\n"
-    msg += f"📊 ADX: {data.get('adx', '?')}\n"
+    trend_ru = "БЫЧИЙ 🟢" if data['trend'] == 'bullish' else "МЕДВЕЖИЙ 🔴" if data['trend'] == 'bearish' else "НЕЙТРАЛЬНО ⚪"
     
+    # Особое сообщение для сигнала
     if signal:
-        msg += f"\n🟢 СИГНАЛ: {signal}\n   📊 {data['signal_type']}\n   🎯 Тейк: {data['target']:.2f} | 🛑 Стоп: {data['stop']:.2f}\n"
-    elif data.get('note'):
-        msg += f"\n⚪ {data['note']}\n"
+        msg = f"""
+🔔🔔🔔 <b>СБЕР — СИГНАЛ К {signal} !!!</b> 🔔🔔🔔
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💰 Цена: <b>{price:.2f} ₽</b>
+📈 Тренд: {trend_ru}
+📊 ADX: {data['adx']}
+📊 MA10: {data['ma10']:.2f} | MA30: {data['ma30']:.2f}
+
+🎯 <b>ПЛАН СДЕЛКИ:</b>
+   Вход: {price:.2f} ₽
+   🛑 Стоп: {data['stop']:.2f} (-{SBER_STRATEGY['STOP_LOSS']*100:.0f}%)
+   🎯 Тейк: {data['target']:.2f} (+{SBER_STRATEGY['TAKE_PROFIT']*100:.0f}%)
+
+📊 Тип сигнала: {data['signal_type']}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🤖 Сигнал сгенерирован в {now.strftime('%H:%M')}
+"""
     else:
-        msg += f"\n⚪ СИГНАЛ: НЕТ\n"
+        msg = f"""
+📊 <b>СБЕР - МОНИТОРИНГ</b> {now.strftime('%H:%M')}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💰 Цена: <b>{price:.2f} ₽</b>
+📈 Тренд: {trend_ru}
+📊 ADX: {data['adx']:.1f}
+📊 MA10: {data['ma10']:.2f} | MA30: {data['ma30']:.2f}
+
+❌ <b>СИГНАЛА НЕТ</b>
+
+📋 <b>ПРИЧИНА:</b>
+{explanation if explanation else 'Условия для входа не выполнены'}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💡 Следующая проверка через час
+"""
     
+    # Информация об открытой позиции
     if current_position['type']:
         pnl = (price - current_position['entry_price']) / current_position['entry_price'] * 100
         if current_position['type'] == 'short':
             pnl = -pnl
         manual_mark = " (ручная)" if current_position.get('is_manual') else ""
-        msg += f"\n📌 ПОЗИЦИЯ: {current_position['type'].upper()}{manual_mark}\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n"
+        msg += f"\n📌 ПОЗИЦИЯ: {current_position['type'].upper()}{manual_mark}\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%"
     
+    # Выход по стопу/тейку
     if exit_needed:
-        msg += f"\n🚨 ВЫХОД: {exit_reason}\n"
+        msg += f"\n\n🚨 <b>ВЫХОД ИЗ ПОЗИЦИИ</b>\n{exit_reason}"
         pnl_final = (price - current_position['entry_price']) / current_position['entry_price'] * 100
         if current_position['type'] == 'short':
             pnl_final = -pnl_final
@@ -446,25 +513,23 @@ async def send_sber_signal():
         save_trade(current_position['type'], current_position['entry_price'], price, pnl_after, commission_cost, current_position.get('is_manual', False))
         current_position['type'] = None
     
+    # Вход по сигналу
     elif not current_position['type'] and signal:
         current_position['type'] = signal.lower()
         current_position['entry_price'] = data['price']
         current_position['entry_time'] = now
         current_position['is_manual'] = False
-        msg += f"\n✅ ВХОД {signal}\n"
+        msg += f"\n\n✅ <b>ВХОД {signal}</b> по сигналу бота"
     
-    msg += f"\n🤖 Следующий сигнал в 10:00, 14:00 или 18:00"
-    
-    if signal_key != last_signal_sent.get('signal') or (now - last_signal_sent.get('time', datetime.min)).seconds > 3600:
-        try:
-            await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
-            last_signal_sent = {'signal': signal_key, 'price': price, 'time': now}
-        except Exception as e:
-            print(f"Ошибка: {e}")
+    try:
+        await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
+        last_signal_sent[f"{current_hour}"] = signal
+    except Exception as e:
+        print(f"Ошибка: {e}")
 
 async def sber_signal_loop():
-    """Три сигнала в день: 10:00, 14:00, 18:00"""
-    await asyncio.sleep(5)
+    """Сигналы каждый час с 10:00 до 22:00"""
+    await asyncio.sleep(10)
     last_sent_hour = None
     
     while True:
@@ -473,8 +538,8 @@ async def sber_signal_loop():
         current_hour = now.hour
         current_minute = now.minute
         
-        send_hours = [10, 14, 18]
-        if current_hour in send_hours and current_minute < 5 and last_sent_hour != current_hour:
+        # Каждый час с 10 до 22 включительно
+        if 10 <= current_hour <= 22 and current_minute < 3 and last_sent_hour != current_hour:
             await send_sber_signal()
             last_sent_hour = current_hour
         
@@ -545,7 +610,7 @@ keyboard = ReplyKeyboardMarkup(
 async def start_cmd(m):
     await m.answer(
         "📊 **АНАЛИТИК**\n\n"
-        "🔹 <b>СБЕР (сигналы 3 раза в день)</b>\n"
+        "🔹 <b>СБЕР (сигналы каждый час с 10:00 до 22:00)</b>\n"
         "   Стратегия: MA10/MA30 + ADX | Стоп 6% | Тейк 12%\n"
         "   Команды: /status, /open, /close, /balance\n\n"
         "🔹 <b>ЛУННАЯ СТРАТЕГИЯ (17 акций)</b>\n"
@@ -759,7 +824,7 @@ async def dashboard(req):
     <div class="card"><h1>📊 АНАЛИТИК</h1><div>{now.strftime('%d.%m.%Y %H:%M')}</div><div>{ph}</div><div>🌕 Полнолуние: {nxt.strftime('%d.%m.%Y') if nxt else '—'}</div></div>
     <div class="grid"><div class="stat"><div class="num">{long}</div><div>LONG</div></div><div class="stat"><div class="num">{short}</div><div>SHORT</div></div><div class="stat"><div class="num">{side}</div><div>БОКОВИК</div></div></div>
     <table><thead><tr><th>Актив</th><th>Тикер</th><th>Цена</th><th>Тренд</th><th>LONG</th><th>SHORT</th></tr></thead><tbody>{rows}</tbody></table>
-    <div class="footer">Сигналы по Сберу в 10:00, 14:00, 18:00 | Лунная стратегия</div>
+    <div class="footer">Сбер: сигналы каждый час с 10:00 до 22:00 | Лунная стратегия</div>
     </body></html>
     """
     return web.Response(text=html, content_type='text/html')
@@ -785,7 +850,7 @@ async def on_startup(dp):
     asyncio.create_task(lunar_notify())
     asyncio.create_task(sber_signal_loop())
     try:
-        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n\n🔹 СБЕР: сигналы в 10:00, 14:00, 18:00\n🔹 ЛУННАЯ СТРАТЕГИЯ: сводка в 10:00, уведомления за 3 дня\n\n/status — состояние Сбера\n/open LONG 310 — открыть\n/close — закрыть\n/balance — статистика")
+        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n\n🔹 СБЕР: сигналы КАЖДЫЙ ЧАС с 10:00 до 22:00\n🔹 ЛУННАЯ СТРАТЕГИЯ: сводка в 10:00, уведомления за 3 дня\n\n/status — состояние Сбера\n/open LONG 310 — открыть\n/close — закрыть\n/balance — статистика")
     except:
         pass
 
@@ -795,8 +860,8 @@ async def on_shutdown(dp):
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("АНАЛИТИК | ЛУННАЯ СТРАТЕГИЯ + СБЕР")
-    print("Сигналы Сбера: 10:00, 14:00, 18:00")
+    print("АНАЛИТИК | СИГНАЛЫ КАЖДЫЙ ЧАС 10-22")
+    print("Сбер: MA10/MA30 + ADX | Стоп 6% | Тейк 12%")
     print("Луна: уведомление за 3 дня до полнолуния")
     print("=" * 50)
     from aiogram.utils import executor
