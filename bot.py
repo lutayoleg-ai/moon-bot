@@ -61,7 +61,7 @@ TICKERS = {
 }
 ALL_TICKERS = list(TICKERS.keys())
 
-# === ЛУННЫЕ ДАННЫЕ ===
+# === ЛУННЫЕ ДАННЫЕ (только для информации) ===
 LUNAR_PHASES = {
     "full_moons": [
         ("2026-01-03", "13:04"), ("2026-02-02", "01:10"), ("2026-03-03", "14:39"),
@@ -129,12 +129,11 @@ def set_to_cache(key, data):
     data_cache[key] = (data, datetime.now())
 
 # === СОСТОЯНИЕ ПОЗИЦИЙ (для всех активов) ===
-positions = {}  # {ticker: {'type': 'long'/'short', 'entry_price': float, 'entry_time': datetime, 'is_manual': bool}}
+positions = {}
 last_signal_sent = {}
 daily_pnl = 0.0
 last_reset_date = None
 lunar_notified_days = set()
-last_hourly_signal_sent = {}  # для сбера
 
 # === БАЗА ДАННЫХ ===
 def init_db():
@@ -325,14 +324,8 @@ async def get_signal_for_ticker(ticker):
     golden_cross = (last_ma10 > last_ma30) and (prev_ma10 <= prev_ma30)
     dead_cross = (last_ma10 < last_ma30) and (prev_ma10 >= prev_ma30)
     
-    long_cond = golden_cross or (trend == "bullish" and adx > STRATEGY['ADX_THRESHOLD'])
-    short_cond = dead_cross or (trend == "bearish" and adx > STRATEGY['ADX_THRESHOLD'])
-    
-    reasons = []
-    if adx < STRATEGY['ADX_THRESHOLD']:
-        reasons.append(f"ADX = {adx:.1f} (нужно > {STRATEGY['ADX_THRESHOLD']})")
-    
-    if long_cond:
+    # ИСПРАВЛЕНО: строгое соответствие направления тренду
+    if trend == "bullish" and (adx > STRATEGY['ADX_THRESHOLD'] or golden_cross):
         return "LONG", {
             'ticker': ticker,
             'name': TICKERS[ticker]['name'],
@@ -345,7 +338,8 @@ async def get_signal_for_ticker(ticker):
             'ma10': last_ma10,
             'ma30': last_ma30
         }, None
-    if short_cond:
+    
+    if trend == "bearish" and (adx > STRATEGY['ADX_THRESHOLD'] or dead_cross):
         return "SHORT", {
             'ticker': ticker,
             'name': TICKERS[ticker]['name'],
@@ -367,7 +361,7 @@ async def get_signal_for_ticker(ticker):
         'adx': adx,
         'ma10': last_ma10,
         'ma30': last_ma30
-    }, ", ".join(reasons) if reasons else "Условия для входа не выполнены"
+    }, f"ADX = {adx:.1f} (нужно > {STRATEGY['ADX_THRESHOLD']})"
 
 # === СПЕЦИАЛЬНАЯ ФУНКЦИЯ ДЛЯ СБЕРА (с подробным объяснением) ===
 async def get_sber_signal_detailed():
@@ -391,13 +385,18 @@ async def get_sber_signal_detailed():
             reasons.append("Условия для входа не выполнены")
         return None, data, "\n".join(reasons)
 
-# === ПРОВЕРКА ВСЕХ АКТИВОВ (тихо, только при сигнале) ===
-async def check_all_signals():
-    """Проверяет все 17 активов, возвращает список сигналов"""
+# === ПРОВЕРКА ВСЕХ АКТИВОВ ===
+async def check_and_send_all_signals():
+    """Проверяет все активы, отправляет ОДНО сообщение со всеми сигналами"""
+    global last_signal_sent
+    
     signals = []
     for ticker in ALL_TICKERS:
-        # Пропускаем, если уже есть открытая позиция по этому активу
-        if ticker in positions and positions[ticker]['type'] is not None:
+        if ticker == "SBER":
+            continue
+        
+        # Пропускаем, если уже есть открытая позиция
+        if ticker in positions and positions[ticker].get('type') is not None:
             continue
         
         signal, data, _ = await get_signal_for_ticker(ticker)
@@ -405,27 +404,48 @@ async def check_all_signals():
             signals.append({
                 'ticker': ticker,
                 'signal': signal,
-                'data': data
+                'data': data,
+                'adx': data['adx']
             })
-    return signals
+    
+    if not signals:
+        return
+    
+    # Сортируем по ADX (от最强的 к слабому)
+    signals.sort(key=lambda x: x['adx'], reverse=True)
+    
+    # Формируем одно сообщение
+    now = datetime.now(pytz.timezone('Europe/Moscow'))
+    msg = f"🔔🔔🔔 <b>НАЙДЕНЫ СИГНАЛЫ</b> 🔔🔔🔔\n"
+    msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"⏰ {now.strftime('%H:%M')} | Найдено {len(signals)} сигналов\n\n"
+    
+    for s in signals:
+        data = s['data']
+        emoji = "🟢" if s['signal'] == "LONG" else "🔴"
+        direction = "LONG (покупка)" if s['signal'] == "LONG" else "SHORT (продажа)"
+        trend_ru = "БЫЧИЙ" if data['trend'] == 'bullish' else "МЕДВЕЖИЙ"
+        trend_emoji = "🟢" if data['trend'] == 'bullish' else "🔴"
+        
+        msg += f"{emoji} <b>{data['name']} ({s['ticker']})</b> | {direction}\n"
+        msg += f"   Цена: {data['price']:.2f} | ADX: {data['adx']}\n"
+        msg += f"   Тренд: {trend_emoji} {trend_ru} | MA10: {data['ma10']:.2f} | MA30: {data['ma30']:.2f}\n"
+        msg += f"   🛑 Стоп: {data['stop']:.2f} | 🎯 Тейк: {data['target']:.2f}\n"
+        msg += f"   💡 /open {s['ticker']} {s['signal']} {data['price']:.2f}\n\n"
+    
+    msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"🤖 Сигналы сгенерированы в {now.strftime('%H:%M')}"
+    
+    # Отправляем одно сообщение
+    try:
+        await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
+        # Запоминаем отправленные сигналы
+        for s in signals:
+            last_signal_sent[s['ticker']] = f"{s['signal']}_{int(s['data']['price'])}"
+    except Exception as e:
+        print(f"Ошибка отправки сигналов: {e}")
 
 # === УПРАВЛЕНИЕ ПОЗИЦИЯМИ ===
-async def check_exit_for_ticker(ticker, current_price, position):
-    """Проверяет, нужно ли закрыть позицию по стопу/тейку"""
-    if position['type'] == 'long':
-        pnl = (current_price - position['entry_price']) / position['entry_price'] * 100
-        if pnl <= -STRATEGY['STOP_LOSS'] * 100:
-            return True, f"Стоп-лосс: {pnl:.1f}%"
-        elif pnl >= STRATEGY['TAKE_PROFIT'] * 100:
-            return True, f"Тейк-профит: {pnl:.1f}%"
-    else:  # short
-        pnl = (position['entry_price'] - current_price) / position['entry_price'] * 100
-        if pnl <= -STRATEGY['STOP_LOSS'] * 100:
-            return True, f"Стоп-лосс: {pnl:.1f}%"
-        elif pnl >= STRATEGY['TAKE_PROFIT'] * 100:
-            return True, f"Тейк-профит: {pnl:.1f}%"
-    return False, None
-
 async def reset_daily_pnl():
     global daily_pnl, last_reset_date
     msk = pytz.timezone('Europe/Moscow')
@@ -434,7 +454,7 @@ async def reset_daily_pnl():
         daily_pnl = 0.0
         last_reset_date = today
 
-# === ОТПРАВКА СИГНАЛОВ ===
+# === ОТПРАВКА СИГНАЛА ПО СБЕРУ (КАЖДЫЙ ЧАС) ===
 async def send_sber_hourly():
     """Отправка сигнала по Сберу каждый час (как сейчас)"""
     global positions
@@ -538,65 +558,6 @@ async def send_sber_hourly():
     except Exception as e:
         print(f"Ошибка отправки: {e}")
 
-async def send_signal_for_ticker(ticker, signal_data):
-    """Отправка сигнала по любому активу (кроме Сбера)"""
-    if not CHANNEL_ID:
-        return
-    
-    name = signal_data['name']
-    price = signal_data['price']
-    signal = signal_data.get('signal_type') if 'signal_type' in signal_data else None
-    now = datetime.now(pytz.timezone('Europe/Moscow'))
-    
-    emoji = "🟢" if signal == "LONG" else "🔴"
-    direction = "LONG (покупка)" if signal == "LONG" else "SHORT (продажа)"
-    
-    msg = f"""
-{emoji}{emoji}{emoji} <b>СИГНАЛ ПО АКТИВУ: {name} ({ticker})</b> {emoji}{emoji}{emoji}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💰 Цена: <b>{price:.2f} ₽</b>
-📈 Тренд: {'БЫЧИЙ 🟢' if signal_data.get('trend') == 'bullish' else 'МЕДВЕЖИЙ 🔴'}
-📊 ADX: {signal_data['adx']}
-📊 MA10: {signal_data['ma10']:.2f} | MA30: {signal_data['ma30']:.2f}
-
-🎯 <b>ПЛАН СДЕЛКИ:</b>
-   Направление: {direction}
-   🛑 Стоп: {signal_data['stop']:.2f} ({'+' if signal == 'SHORT' else '-'}{STRATEGY['STOP_LOSS']*100:.0f}%)
-   🎯 Тейк: {signal_data['target']:.2f} ({'-' if signal == 'SHORT' else '+'}{STRATEGY['TAKE_PROFIT']*100:.0f}%)
-
-📊 Тип сигнала: {signal_data['signal_type']}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-💡 Для открытия сделки используйте команду:
-   /open {ticker} {signal_data.get('signal_type', signal)} {price:.2f}
-
-🤖 Сигнал сгенерирован в {now.strftime('%H:%M')}
-"""
-    try:
-        await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
-    except Exception as e:
-        print(f"Ошибка отправки сигнала по {ticker}: {e}")
-
-async def check_and_send_all_signals():
-    """Проверяет все активы, отправляет сигналы по новым (кроме Сбера)"""
-    global last_signal_sent
-    
-    signals = await check_all_signals()
-    
-    for sig in signals:
-        ticker = sig['ticker']
-        if ticker == "SBER":
-            continue  # Сбер обрабатывается отдельно в send_sber_hourly
-        
-        # Проверяем, не отправляли ли уже этот сигнал
-        signal_key = f"{ticker}_{sig['signal']}_{int(sig['data']['price'])}"
-        last_key = last_signal_sent.get(ticker)
-        
-        if last_key != signal_key:
-            await send_signal_for_ticker(ticker, sig['data'])
-            last_signal_sent[ticker] = signal_key
-
 # === ЦИКЛЫ ===
 async def sber_hourly_loop():
     """Сигналы по Сберу каждый час с 10 до 22"""
@@ -631,7 +592,7 @@ async def all_signals_check_loop():
         
         await asyncio.sleep(60)
 
-# === ЛУННАЯ СТРАТЕГИЯ ===
+# === ЛУННАЯ СТРАТЕГИЯ (только информационно) ===
 async def lunar_notify():
     global lunar_notified_days
     while True:
@@ -696,7 +657,6 @@ def get_tickers_list_text():
     """Возвращает текст со списком всех тикеров"""
     text = "📋 <b>ДОСТУПНЫЕ ТИКЕРЫ</b> (17 активов)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     
-    # Группируем для удобства
     ticker_list = list(TICKERS.items())
     for i, (ticker, info) in enumerate(ticker_list, 1):
         text += f"{i}. <b>{info['name']}</b> ({ticker})\n"
@@ -753,7 +713,6 @@ async def tickers_cmd(m):
 
 @dp.message_handler(commands=['status'])
 async def status_cmd(m):
-    # Показываем статус только по Сберу (как сейчас)
     price = await data_fetcher.get_price("SBER")
     df = await data_fetcher.fetch_candles_daily("SBER", 100)
     
@@ -804,7 +763,7 @@ async def open_cmd(m):
         await m.answer(f"❌ Тикер {ticker} не найден. Список: /tickers")
         return
     
-    if ticker in positions and positions[ticker]['type'] is not None:
+    if ticker in positions and positions[ticker].get('type') is not None:
         await m.answer(f"⚠️ Уже есть открытая позиция по {TICKERS[ticker]['name']}. Сначала закройте /close")
         return
     
@@ -833,7 +792,6 @@ async def open_cmd(m):
 async def close_cmd(m):
     global positions, daily_pnl
     
-    # Ищем активную позицию (по любому тикеру)
     active_ticker = None
     active_pos = None
     for ticker, pos in positions.items():
@@ -981,7 +939,7 @@ async def dashboard(req):
     <body>
     <div class="card"><h1>📊 АНАЛИТИК</h1><div>{now.strftime('%d.%m.%Y %H:%M')}</div><div>{ph}</div><div>🌕 Полнолуние: {nxt.strftime('%d.%m.%Y') if nxt else '—'}</div></div>
     <div class="grid"><div class="stat"><div class="num">{long}</div><div>LONG</div></div><div class="stat"><div class="num">{short}</div><div>SHORT</div></div><div class="stat"><div class="num">{side}</div><div>БОКОВИК</div></div></div>
-    <table><thead><tr><th>Актив</th><th>Тикер</th><th>Цена</th><th>Тренд</th><th>LONG</th><th>SHORT</th></tr></thead><tbody>{rows}</tbody></table>
+    <table><thead><tr><th>Актив</th><th>Тикер</th><th>Цена</th><th>Тренд</th><th>LONG</th><th>SHORT</th></table></thead><tbody>{rows}</tbody></table>
     <div class="footer">Сбер: сигналы каждый час | Остальные: только при сигнале</div>
     </body></html>
     """
