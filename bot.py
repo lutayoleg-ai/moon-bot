@@ -16,6 +16,8 @@ from aiohttp import web
 import matplotlib.pyplot as plt
 from io import BytesIO
 import sqlite3
+import signal
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 warnings.filterwarnings('ignore')
 
@@ -37,7 +39,16 @@ STRATEGY = {
     'DAILY_LOSS_LIMIT': 0.03
 }
 
-COMMISSION = 0.003
+# Комиссия брокера: 0.3% на вход, 0.3% на выход = 0.6% от суммы сделки
+COMMISSION = 0.003  # 0.3%
+COMMISSION_TOTAL_PCT = COMMISSION * 2 * 100  # 0.6 процентных пункта
+
+# === НАСТРОЙКА ЛОГИРОВАНИЯ ===
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # === 17 АКТИВОВ ===
 TICKERS = {
@@ -61,7 +72,7 @@ TICKERS = {
 }
 ALL_TICKERS = list(TICKERS.keys())
 
-# === ЛУННЫЕ ДАННЫЕ (полнолуния и новолуния) ===
+# === ЛУННЫЕ ДАННЫЕ ===
 LUNAR_PHASES = {
     "full_moons": [
         ("2026-01-03", "13:04"), ("2026-02-02", "01:10"), ("2026-03-03", "14:39"),
@@ -115,10 +126,7 @@ def get_lunar_info():
     last_new = max([d for d in new_moons if d <= now], default=None)
     if last_new:
         days = (now - last_new).days
-        if days < 14:
-            return "растущая", last_new, next_full, next_new
-        else:
-            return "убывающая", last_new, next_full, next_new
+        return ("растущая" if days < 14 else "убывающая"), last_new, next_full, next_new
     
     return "обычный день", None, next_full, next_new
 
@@ -140,23 +148,9 @@ def get_days_until_new_moon():
             return (dt - now).days
     return None
 
-# === КЭШ ===
-data_cache = {}
-cache_ttl = 60
-
-def get_from_cache(key):
-    if key in data_cache:
-        data, ts = data_cache[key]
-        if (datetime.now() - ts).seconds < cache_ttl:
-            return data
-        del data_cache[key]
-    return None
-
-def set_to_cache(key, data):
-    data_cache[key] = (data, datetime.now())
-
-# === СОСТОЯНИЕ ПОЗИЦИЙ ===
+# === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
 positions = {}
+positions_lock = asyncio.Lock()
 last_signal_sent = {}
 daily_pnl = 0.0
 last_reset_date = None
@@ -199,90 +193,110 @@ def save_daily_summary(date, summary):
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO daily_summary (date, summary) VALUES (?, ?)", (date, summary))
 
-# === MOEX ===
+# === MOEX С RETRY И ЛОГИРОВАНИЕМ ===
 class DataFetcher:
-    def __init__(self):
-        self.session = None
-
-    async def get_session(self):
-        if self.session is None or self.session.closed:
-            ctx = ssl.create_default_context(cafile=certifi.where())
-            conn = aiohttp.TCPConnector(ssl=ctx)
-            self.session = aiohttp.ClientSession(connector=conn, timeout=aiohttp.ClientTimeout(total=15), headers={'User-Agent': 'Mozilla/5.0'})
-        return self.session
-
+    moex_last_success = None
+    moex_error_count = 0
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
+        reraise=True
+    )
+    async def _fetch_json(self, url, params=None):
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=ssl.create_default_context(cafile=certifi.where())),
+            timeout=aiohttp.ClientTimeout(total=15),
+            headers={'User-Agent': 'Mozilla/5.0'}
+        ) as session:
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    logger.warning(f"MOEX вернул {resp.status} для {url}")
+                    raise aiohttp.ClientResponseError(
+                        status=resp.status,
+                        message=f"HTTP {resp.status}",
+                        headers=resp.headers
+                    )
+                return await resp.json()
+    
     async def get_price(self, ticker):
-        key = f"price_{ticker}"
-        cached = get_from_cache(key)
-        if cached is not None:
-            return cached
         try:
-            s = await self.get_session()
             url = f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{ticker}.json"
-            async with s.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    md = data.get('marketdata', {})
-                    if md:
-                        cols = md.get('columns', [])
-                        rows = md.get('data', [])
-                        if rows:
-                            for i, col in enumerate(cols):
-                                if col.lower() in ('last', 'currentprice'):
-                                    if i < len(rows[0]) and rows[0][i]:
-                                        try:
-                                            p = float(rows[0][i])
-                                            if 1 < p < 20000:
-                                                set_to_cache(key, p)
-                                                return p
-                                        except:
-                                            pass
-        except:
-            pass
-        return None
-
+            data = await self._fetch_json(url)
+            
+            md = data.get('marketdata', {})
+            if md:
+                cols = md.get('columns', [])
+                rows = md.get('data', [])
+                if rows:
+                    for i, col in enumerate(cols):
+                        if col.lower() in ('last', 'currentprice'):
+                            if i < len(rows[0]) and rows[0][i]:
+                                p = float(rows[0][i])
+                                if 1 < p < 20000:
+                                    DataFetcher.moex_error_count = 0
+                                    DataFetcher.moex_last_success = datetime.now()
+                                    return p
+            logger.warning(f"Нет данных о цене для {ticker}")
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка get_price({ticker}): {type(e).__name__}: {e}")
+            DataFetcher.moex_error_count += 1
+            return None
+    
     async def fetch_candles_daily(self, ticker, days=100):
-        key = f"daily_{ticker}_{days}"
-        cached = get_from_cache(key)
-        if cached is not None:
-            return cached
         try:
-            s = await self.get_session()
             end = datetime.now()
             start = end - timedelta(days=days)
             url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json"
             params = {'from': start.strftime('%Y-%m-%d'), 'till': end.strftime('%Y-%m-%d'), 'interval': 24}
-            async with s.get(url, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    candles = data.get('candles', {})
-                    rows = candles.get('data', [])
-                    cols = candles.get('columns', [])
-                    if rows and len(rows) >= 3:
-                        idx_date = next((i for i, c in enumerate(cols) if c.lower() in ('begin', 'date')), None)
-                        idx_close = next((i for i, c in enumerate(cols) if c.lower() in ('close', 'value')), None)
-                        if idx_date is not None and idx_close is not None:
-                            records = []
-                            for row in rows:
-                                if len(row) > max(idx_date, idx_close):
-                                    try:
-                                        records.append({
-                                            'date': pd.to_datetime(row[idx_date]),
-                                            'close': float(row[idx_close])
-                                        })
-                                    except:
-                                        pass
-                            if len(records) >= 5:
-                                df = pd.DataFrame(records).sort_values('date').reset_index(drop=True)
-                                set_to_cache(key, df)
-                                return df
+            
+            data = await self._fetch_json(url, params)
+            candles = data.get('candles', {})
+            rows = candles.get('data', [])
+            cols = candles.get('columns', [])
+            
+            if rows and len(rows) >= 3:
+                idx_date = next((i for i, c in enumerate(cols) if c.lower() in ('begin', 'date')), None)
+                idx_close = next((i for i, c in enumerate(cols) if c.lower() in ('close', 'value')), None)
+                if idx_date is not None and idx_close is not None:
+                    records = []
+                    for row in rows:
+                        if len(row) > max(idx_date, idx_close):
+                            try:
+                                records.append({
+                                    'date': pd.to_datetime(row[idx_date]),
+                                    'close': float(row[idx_close])
+                                })
+                            except:
+                                pass
+                    if len(records) >= 5:
+                        df = pd.DataFrame(records).sort_values('date').reset_index(drop=True)
+                        return df
+            
+            logger.warning(f"Недостаточно данных для {ticker}, получено {len(rows) if rows else 0} строк")
+            return None
         except Exception as e:
-            print(f"Ошибка: {e}")
-        return None
-
-    async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
+            logger.error(f"Ошибка fetch_candles_daily({ticker}): {type(e).__name__}: {e}")
+            return None
+    
+    async def healthcheck_moex(self, bot):
+        """Фоновая проверка доступности MOEX"""
+        while True:
+            try:
+                price = await self.get_price("SBER")
+                if price is not None:
+                    if DataFetcher.moex_error_count >= 10 and CHANNEL_ID:
+                        await bot.send_message(CHANNEL_ID, "✅ MOEX снова доступен. Сигналы возобновлены.")
+                elif DataFetcher.moex_error_count >= 10:
+                    logger.critical("MOEX недоступен более 30 минут!")
+                    if CHANNEL_ID:
+                        await bot.send_message(CHANNEL_ID, "🚨 КРИТИЧЕСКАЯ ОШИБКА: MOEX не отвечает более 30 минут. Сигналы могут не приходить.")
+            except Exception as e:
+                logger.error(f"Healthcheck MOEX ошибка: {e}")
+            
+            await asyncio.sleep(180)  # каждые 3 минуты
 
 data_fetcher = DataFetcher()
 
@@ -388,7 +402,6 @@ async def get_signal_for_ticker(ticker):
         'ma30': last_ma30
     }, f"ADX = {adx:.1f} (нужно > {STRATEGY['ADX_THRESHOLD']})"
 
-# === ДЛЯ СБЕРА ===
 async def get_sber_signal_detailed():
     signal, data, explanation = await get_signal_for_ticker("SBER")
     if data is None:
@@ -407,24 +420,25 @@ async def get_sber_signal_detailed():
             reasons.append("Условия для входа не выполнены")
         return None, data, "\n".join(reasons)
 
-# === ОТПРАВКА СИГНАЛОВ ПО ВСЕМ АКТИВАМ ===
+# === ОТПРАВКА СИГНАЛОВ ===
 async def check_and_send_all_signals():
     global last_signal_sent
     
-    signals = []
-    for ticker in ALL_TICKERS:
-        if ticker == "SBER":
-            continue
-        if ticker in positions and positions[ticker].get('type') is not None:
-            continue
-        signal, data, _ = await get_signal_for_ticker(ticker)
-        if signal and data:
-            signals.append({
-                'ticker': ticker,
-                'signal': signal,
-                'data': data,
-                'adx': data['adx']
-            })
+    async with positions_lock:
+        signals = []
+        for ticker in ALL_TICKERS:
+            if ticker == "SBER":
+                continue
+            if ticker in positions and positions[ticker].get('type') is not None:
+                continue
+            signal, data, _ = await get_signal_for_ticker(ticker)
+            if signal and data:
+                signals.append({
+                    'ticker': ticker,
+                    'signal': signal,
+                    'data': data,
+                    'adx': data['adx']
+                })
     
     if not signals:
         return
@@ -435,7 +449,6 @@ async def check_and_send_all_signals():
     msg = f"🔔🔔🔔 <b>НАЙДЕНЫ СИГНАЛЫ</b> 🔔🔔🔔\n"
     msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"⏰ {now.strftime('%H:%M')} | Найдено {len(signals)} сигналов\n\n"
-    
     msg += f"📊 <b>САМЫЕ СИЛЬНЫЕ (ТОП-3):</b>\n"
     msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     
@@ -467,9 +480,8 @@ async def check_and_send_all_signals():
         for s in signals:
             last_signal_sent[s['ticker']] = f"{s['signal']}_{int(s['data']['price'])}"
     except Exception as e:
-        print(f"Ошибка отправки: {e}")
+        logger.error(f"Ошибка отправки: {e}")
 
-# === ОТПРАВКА СИГНАЛА ПО СБЕРУ ===
 async def send_sber_hourly():
     global positions, daily_pnl
     
@@ -489,8 +501,12 @@ async def send_sber_hourly():
     
     exit_needed = False
     exit_reason = None
-    sber_position = positions.get("SBER", {}).get('type')
-    sber_entry = positions.get("SBER", {}).get('entry_price') if sber_position else None
+    sber_position = None
+    sber_entry = None
+    
+    async with positions_lock:
+        sber_position = positions.get("SBER", {}).get('type')
+        sber_entry = positions.get("SBER", {}).get('entry_price') if sber_position else None
     
     if sber_position and sber_entry:
         if sber_position == 'long':
@@ -549,26 +565,28 @@ async def send_sber_hourly():
     if exit_needed:
         msg += f"\n\n🚨 <b>ВЫХОД ИЗ ПОЗИЦИИ ПО СБЕРУ</b>\n{exit_reason}"
         pnl_final = (price - sber_entry) / sber_entry * 100 if sber_position == 'long' else (sber_entry - price) / sber_entry * 100
-        commission_cost = COMMISSION * 2 * 100
-        pnl_after = pnl_final - commission_cost
-        daily_pnl += pnl_after / 100
-        save_trade("SBER", sber_position, sber_entry, price, pnl_after, commission_cost, positions["SBER"].get('is_manual', False))
-        positions["SBER"] = {'type': None, 'entry_price': None, 'entry_time': None, 'is_manual': False}
+        pnl_after = pnl_final - COMMISSION_TOTAL_PCT
+        
+        async with positions_lock:
+            daily_pnl += pnl_after / 100
+            save_trade("SBER", sber_position, sber_entry, price, pnl_after, COMMISSION_TOTAL_PCT, positions.get("SBER", {}).get('is_manual', False))
+            positions["SBER"] = {'type': None, 'entry_price': None, 'entry_time': None, 'is_manual': False}
+    
     elif signal and not sber_position:
-        positions["SBER"] = {
-            'type': signal.lower(),
-            'entry_price': price,
-            'entry_time': now,
-            'is_manual': False
-        }
+        async with positions_lock:
+            positions["SBER"] = {
+                'type': signal.lower(),
+                'entry_price': price,
+                'entry_time': now,
+                'is_manual': False
+            }
         msg += f"\n\n✅ <b>ВХОД {signal}</b> по сигналу бота"
     
     try:
         await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
     except Exception as e:
-        print(f"Ошибка отправки: {e}")
+        logger.error(f"Ошибка отправки: {e}")
 
-# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 async def reset_daily_pnl():
     global daily_pnl, last_reset_date
     msk = pytz.timezone('Europe/Moscow')
@@ -590,13 +608,6 @@ def get_tickers_list_text():
     text = "📋 <b>ДОСТУПНЫЕ ТИКЕРЫ</b> (17 активов)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     for i, (ticker, info) in enumerate(TICKERS.items(), 1):
         text += f"{i}. <b>{info['name']}</b> ({ticker})\n"
-    text += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += "💡 <b>Как использовать:</b>\n"
-    text += "   /open SBER LONG 310.50 — открыть LONG\n"
-    text += "   /open GAZP SHORT 180.20 — открыть SHORT\n"
-    text += "   /close — закрыть позицию\n"
-    text += "   /status — состояние Сбера\n"
-    text += "   /balance — общая статистика"
     return text
 
 # === ЛУННАЯ СТРАТЕГИЯ ===
@@ -606,7 +617,6 @@ async def lunar_notify():
         days_until_full = get_days_until_full_moon()
         days_until_new = get_days_until_new_moon()
         
-        # Полнолуние
         if days_until_full is not None and days_until_full <= 3 and days_until_full not in lunar_notified_days:
             lunar_notified_days.add(days_until_full)
             if days_until_full == 3:
@@ -616,7 +626,6 @@ async def lunar_notify():
             elif days_until_full == 1:
                 await bot.send_message(MY_CHAT_ID, f"🌕 ЗАВТРА ПОЛНОЛУНИЕ — ТОЧКА ВХОДА")
         
-        # Новолуние
         if days_until_new is not None and days_until_new <= 3 and days_until_new not in lunar_notified_days:
             lunar_notified_days.add(days_until_new)
             if days_until_new == 3:
@@ -662,7 +671,6 @@ async def daily_loop():
             await daily_lunar_summary()
         await asyncio.sleep(60)
 
-# === ЦИКЛЫ СИГНАЛОВ ===
 async def sber_hourly_loop():
     await asyncio.sleep(10)
     last_sent_hour = None
@@ -689,7 +697,6 @@ async def all_signals_check_loop():
         await asyncio.sleep(60)
 
 # === НАСТРОЙКА БОТА ===
-logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
@@ -697,8 +704,8 @@ dp.middleware.setup(LoggingMiddleware())
 # === КЛАВИАТУРА ===
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🌙 Фазы Луны"), KeyboardButton(text="📈 Открыть позицию")],
-        [KeyboardButton(text="📊 Историческая статистика"), KeyboardButton(text="📈 График акции")],
+        [KeyboardButton(text="🌙 Фазы Луны")],
+        [KeyboardButton(text="📈 График акции")],
         [KeyboardButton(text="📋 Тикеры"), KeyboardButton(text="🚨 Срочный срез")],
     ],
     resize_keyboard=True
@@ -742,12 +749,14 @@ async def status_cmd(m):
     trend_ru = "БЫЧИЙ 🟢" if trend == "bullish" else "МЕДВЕЖИЙ 🔴" if trend == "bearish" else "БОКОВИК ⚪"
     msg = f"📊 <b>СБЕР - СТАТУС</b>\n━━━━━━━━━━━━━━━━━━━\n💰 Цена: <b>{price:.2f} ₽</b>\n"
     msg += f"📈 Тренд: {trend_ru}\n📊 MA10: {ma10:.2f} | MA30: {ma30:.2f}\n📈 ADX: {adx:.1f}\n"
-    sber_pos = positions.get("SBER", {}).get('type')
-    sber_entry = positions.get("SBER", {}).get('entry_price') if sber_pos else None
+    
+    async with positions_lock:
+        sber_pos = positions.get("SBER", {}).get('type')
+        sber_entry = positions.get("SBER", {}).get('entry_price') if sber_pos else None
+    
     if sber_pos and sber_entry:
         pnl = (price - sber_entry) / sber_entry * 100 if sber_pos == 'long' else (sber_entry - price) / sber_entry * 100
-        commission_cost = COMMISSION * 2 * 100
-        msg += f"\n📌 ПОЗИЦИЯ: {sber_pos.upper()}\n   Вход: {sber_entry:.2f} ₽\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n   С комиссией: {'+' if pnl - commission_cost >= 0 else ''}{pnl - commission_cost:.2f}%\n"
+        msg += f"\n📌 ПОЗИЦИЯ: {sber_pos.upper()}\n   Вход: {sber_entry:.2f} ₽\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n   С комиссией: {'+' if pnl - COMMISSION_TOTAL_PCT >= 0 else ''}{pnl - COMMISSION_TOTAL_PCT:.2f}%\n"
     else:
         msg += f"\n📌 ПОЗИЦИЯ: НЕТ\n"
     msg += f"\n📅 Дневной P&L: {'+' if daily_pnl*100 >= 0 else ''}{daily_pnl*100:.2f}%"
@@ -756,30 +765,37 @@ async def status_cmd(m):
 @dp.message_handler(commands=['open'])
 async def open_cmd(m):
     global positions
+    
     parts = m.text.split()
     if len(parts) != 4 or parts[2].upper() not in ['LONG', 'SHORT']:
         await m.answer("📝 /open SBER LONG 310.50\nили\n📝 /open GAZP SHORT 180.20")
         return
+    
     ticker = parts[1].upper()
     if ticker not in TICKERS:
         await m.answer(f"❌ Тикер {ticker} не найден. Список: /tickers")
         return
-    if ticker in positions and positions[ticker].get('type') is not None:
-        await m.answer(f"⚠️ Уже есть открытая позиция по {TICKERS[ticker]['name']}. Сначала закройте /close")
-        return
-    direction = parts[2].upper()
-    try:
-        entry_price = float(parts[3])
-    except:
-        await m.answer("❌ Неверная цена")
-        return
-    now = datetime.now(pytz.timezone('Europe/Moscow'))
-    if ticker not in positions:
-        positions[ticker] = {}
-    positions[ticker]['type'] = direction.lower()
-    positions[ticker]['entry_price'] = entry_price
-    positions[ticker]['entry_time'] = now
-    positions[ticker]['is_manual'] = True
+    
+    async with positions_lock:
+        if ticker in positions and positions[ticker].get('type') is not None:
+            await m.answer(f"⚠️ Уже есть открытая позиция по {TICKERS[ticker]['name']}. Сначала закройте /close")
+            return
+        
+        direction = parts[2].upper()
+        try:
+            entry_price = float(parts[3])
+        except:
+            await m.answer("❌ Неверная цена")
+            return
+        
+        now = datetime.now(pytz.timezone('Europe/Moscow'))
+        if ticker not in positions:
+            positions[ticker] = {}
+        positions[ticker]['type'] = direction.lower()
+        positions[ticker]['entry_price'] = entry_price
+        positions[ticker]['entry_time'] = now
+        positions[ticker]['is_manual'] = True
+    
     stop = entry_price * (1 - STRATEGY['STOP_LOSS']) if direction == 'LONG' else entry_price * (1 + STRATEGY['STOP_LOSS'])
     take = entry_price * (1 + STRATEGY['TAKE_PROFIT']) if direction == 'LONG' else entry_price * (1 - STRATEGY['TAKE_PROFIT'])
     msg = f"✅ Ручное открытие {direction} по {TICKERS[ticker]['name']} ({ticker})\n💰 Вход: {entry_price:.2f}\n🛑 Стоп: {stop:.2f}\n🎯 Тейк: {take:.2f}"
@@ -788,30 +804,38 @@ async def open_cmd(m):
 @dp.message_handler(commands=['close'])
 async def close_cmd(m):
     global positions, daily_pnl
-    active_ticker = None
-    active_pos = None
-    for ticker, pos in positions.items():
-        if pos.get('type') is not None:
-            active_ticker = ticker
-            active_pos = pos
-            break
-    if not active_ticker or active_pos is None:
-        await m.answer("⚠️ Нет открытой позиции")
-        return
+    
+    async with positions_lock:
+        active_ticker = None
+        active_pos = None
+        for ticker, pos in positions.items():
+            if pos.get('type') is not None:
+                active_ticker = ticker
+                active_pos = pos
+                break
+        
+        if not active_ticker or active_pos is None:
+            await m.answer("⚠️ Нет открытой позиции")
+            return
+    
     price = await data_fetcher.get_price(active_ticker)
     if not price:
         await m.answer("⚠️ Нет цены")
         return
+    
     if active_pos['type'] == 'long':
         pnl = (price - active_pos['entry_price']) / active_pos['entry_price'] * 100
     else:
         pnl = (active_pos['entry_price'] - price) / active_pos['entry_price'] * 100
-    commission_cost = COMMISSION * 2 * 100
-    pnl_after = pnl - commission_cost
-    daily_pnl += pnl_after / 100
-    save_trade(active_ticker, active_pos['type'], active_pos['entry_price'], price, pnl_after, commission_cost, active_pos.get('is_manual', False))
+    
+    pnl_after = pnl - COMMISSION_TOTAL_PCT
+    
+    async with positions_lock:
+        daily_pnl += pnl_after / 100
+        save_trade(active_ticker, active_pos['type'], active_pos['entry_price'], price, pnl_after, COMMISSION_TOTAL_PCT, active_pos.get('is_manual', False))
+        positions[active_ticker] = {'type': None, 'entry_price': None, 'entry_time': None, 'is_manual': False}
+    
     msg = f"✅ Закрыто {active_pos['type'].upper()} по {TICKERS[active_ticker]['name']} ({active_ticker})\n💰 Вход: {active_pos['entry_price']:.2f}\n💰 Выход: {price:.2f}\n📊 P&L: {pnl:+.2f}%\n💸 С комиссией: {pnl_after:+.2f}%"
-    positions[active_ticker] = {'type': None, 'entry_price': None, 'entry_time': None, 'is_manual': False}
     await m.answer(msg)
 
 @dp.message_handler(commands=['balance'])
@@ -848,23 +872,6 @@ async def btn_lunar(m):
     
     await m.answer(txt)
 
-@dp.message_handler(lambda msg: msg.text == "📈 Открыть позицию")
-async def btn_open_position(m):
-    ph, _, _, _ = get_lunar_info()
-    if ph == "полнолуние":
-        await m.answer("🌕 **ТОЧКА ВХОДА!**\n📝 Используйте /open SBER LONG ЦЕНА\nили /open GAZP SHORT ЦЕНА")
-    else:
-        days = get_days_until_full_moon()
-        await m.answer(f"⏸ Лунного сигнала нет\n⏳ Полнолуние через {days} дн.\n📝 Для ручного входа: /open SBER LONG 310")
-
-@dp.message_handler(lambda msg: msg.text == "📊 Историческая статистика")
-async def btn_stats(m):
-    s = sorted(TICKERS.items(), key=lambda x: -x[1]['return_bull'])
-    txt = "📊 **ТОП-10 по доходности LONG**\n"
-    for i, (t, d) in enumerate(s[:10], 1):
-        txt += f"{i}. {d['name']} ({t}): +{d['return_bull']:.2f}%\n"
-    await m.answer(txt, parse_mode='Markdown')
-
 @dp.message_handler(lambda msg: msg.text == "📈 График акции")
 async def btn_chart(m):
     await m.answer("Введите тикер из списка:\n" + ", ".join(ALL_TICKERS))
@@ -878,19 +885,20 @@ async def btn_emergency_snapshot(m):
     await m.answer("🚨 Срочный срез... Анализирую все 17 активов 🔍")
     
     signals = []
-    for ticker in ALL_TICKERS:
-        if ticker == "SBER":
-            continue
-        if ticker in positions and positions[ticker].get('type') is not None:
-            continue
-        signal, data, _ = await get_signal_for_ticker(ticker)
-        if signal and data:
-            signals.append({
-                'ticker': ticker,
-                'signal': signal,
-                'data': data,
-                'adx': data['adx']
-            })
+    async with positions_lock:
+        for ticker in ALL_TICKERS:
+            if ticker == "SBER":
+                continue
+            if ticker in positions and positions[ticker].get('type') is not None:
+                continue
+            signal, data, _ = await get_signal_for_ticker(ticker)
+            if signal and data:
+                signals.append({
+                    'ticker': ticker,
+                    'signal': signal,
+                    'data': data,
+                    'adx': data['adx']
+                })
     
     sber_signal, sber_data, sber_expl = await get_sber_signal_detailed()
     now = datetime.now(pytz.timezone('Europe/Moscow'))
@@ -978,7 +986,7 @@ async def dashboard(req):
         else:
             trend_class = "trend-neutral"
             trend_text = "⚪ БОКОВИК"
-        rows += f"<tr><td style='font-weight:500;'>{data['name']}</td><td><b>{ticker}</b></td><td><b>{price}</b> ₽</td><td class='{trend_class}'>{trend_text}</td><td class='bull'>+{data['return_bull']:.2f}%</td><td class='bear'>+{data['return_bear']:.2f}%</td>{a</td>"
+        rows += f"<tr><td style='font-weight:500;'>{data['name']}</td><td><b>{ticker}</b></td><td><b>{price}</b> ₽</td><td class='{trend_class}'>{trend_text}</td><td class='bull'>+{data['return_bull']:.2f}%</td><td class='bear'>+{data['return_bear']:.2f}%</td></tr>"
         tickers_names.append(data['name'])
         long_returns.append(data['return_bull'])
         short_returns.append(data['return_bear'])
@@ -1070,32 +1078,99 @@ async def dashboard(req):
     """
     return web.Response(text=html, content_type='text/html')
 
-# === ЗАПУСК ===
-async def on_startup(dp):
-    init_db()
-    await web_server()
-    asyncio.create_task(daily_loop())
-    asyncio.create_task(lunar_notify())
-    asyncio.create_task(sber_hourly_loop())
-    asyncio.create_task(all_signals_check_loop())
-    try:
-        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n\n🔹 СБЕР: сигналы КАЖДЫЙ ЧАС с 10:00 до 22:00\n🔹 ОСТАЛЬНЫЕ 16: ТОП-3 видны сразу, остальные под спойлером\n🔹 ЛУНА: сводка в 10:00, уведомления за 3 дня до ПОЛНОЛУНИЯ и НОВОЛУНИЯ\n🔹 КНОПКА: 🚨 Срочный срез — моментальный анализ всех 17 активов\n\n📋 /tickers — список всех активов\n/open SBER LONG 310 — открыть сделку\n/close — закрыть\n/status — состояние Сбера\n/balance — статистика")
-    except:
-        pass
-
-async def on_shutdown(dp):
-    await data_fetcher.close()
-    await bot.close()
+# === WEB СЕРВЕР ===
+async def moex_health(req):
+    status = "ok" if DataFetcher.moex_error_count < 5 else "degraded"
+    return web.json_response({
+        "status": status,
+        "last_success": DataFetcher.moex_last_success.isoformat() if DataFetcher.moex_last_success else None,
+        "error_count": DataFetcher.moex_error_count
+    })
 
 async def web_server():
     app = web.Application()
     app.router.add_get('/health', lambda req: web.Response(text="OK"))
+    app.router.add_get('/health/moex', moex_health)
     app.router.add_get('/dashboard', dashboard)
     app.router.add_get('/', dashboard)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 10000).start()
-    print("🌐 Веб-сервер запущен")
+    logger.info("🌐 Веб-сервер запущен на порту 10000")
+
+# === ЗАПУСК ===
+async def main():
+    # Инициализация
+    init_db()
+    
+    # Запуск веб-сервера
+    await web_server()
+    
+    # Запуск healthcheck MOEX
+    asyncio.create_task(data_fetcher.healthcheck_moex(bot))
+    
+    # Запуск фоновых задач
+    tasks = [
+        asyncio.create_task(daily_loop()),
+        asyncio.create_task(lunar_notify()),
+        asyncio.create_task(sber_hourly_loop()),
+        asyncio.create_task(all_signals_check_loop()),
+    ]
+    
+    # Обработка сигналов завершения
+    stop_event = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    
+    def signal_handler():
+        logger.info("📢 Получен сигнал завершения, останавливаю бота...")
+        stop_event.set()
+    
+    loop.add_signal_handler(signal.SIGTERM, signal_handler)
+    loop.add_signal_handler(signal.SIGINT, signal_handler)
+    
+    # Запуск polling
+    logger.info("🚀 Бот запущен, начинаю polling...")
+    
+    async def run_polling():
+        try:
+            await dp.start_polling()
+        except Exception as e:
+            logger.error(f"❌ Ошибка в polling: {e}")
+        finally:
+            stop_event.set()
+    
+    polling_task = asyncio.create_task(run_polling())
+    
+    # Ждём остановки
+    await stop_event.wait()
+    
+    logger.info("🛑 Останавливаю бота...")
+    
+    # Остановка polling
+    await dp.stop_polling()
+    polling_task.cancel()
+    
+    # Остановка фоновых задач
+    for task in tasks:
+        task.cancel()
+    
+    await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Закрытие соединений
+    await data_fetcher.close()
+    await bot.close()
+    
+    logger.info("✅ Бот остановлен")
+
+async def run_bot_with_retry():
+    while True:
+        try:
+            await main()
+        except Exception as e:
+            logger.error(f"❌ Бот упал с ошибкой: {e}. Перезапуск через 10 секунд...")
+            await asyncio.sleep(10)
+        else:
+            break
 
 if __name__ == "__main__":
     print("=" * 50)
@@ -1105,5 +1180,5 @@ if __name__ == "__main__":
     print("Стоп 6% | Тейк 12% | ADX > 20")
     print("🚨 Срочный срез — кнопка в меню")
     print("=" * 50)
-    from aiogram.utils import executor
-    executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
+    
+    asyncio.run(run_bot_with_retry())
