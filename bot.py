@@ -41,7 +41,7 @@ STRATEGY = {
 }
 
 COMMISSION = 0.003
-MOEX_TIMEOUT = 10  # секунд на запрос
+MOEX_TIMEOUT = 15
 
 # === НАСТРОЙКА ЛОГИРОВАНИЯ ===
 logging.basicConfig(
@@ -201,7 +201,7 @@ class DataFetcher:
     async def _fetch_json(self, url, params=None):
         async with aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(ssl=ssl.create_default_context(cafile=certifi.where())),
-            timeout=aiohttp.ClientTimeout(total=15),
+            timeout=aiohttp.ClientTimeout(total=MOEX_TIMEOUT),
             headers={'User-Agent': 'Mozilla/5.0'}
         ) as session:
             async with session.get(url, params=params) as resp:
@@ -213,7 +213,7 @@ class DataFetcher:
     async def get_price(self, ticker):
         try:
             url = f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{ticker}.json"
-            data = await asyncio.wait_for(self._fetch_json(url), timeout=MOEX_TIMEOUT)
+            data = await self._fetch_json(url)
             
             md = data.get('marketdata', {})
             if md:
@@ -253,7 +253,7 @@ class DataFetcher:
             url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json"
             params = {'from': start.strftime('%Y-%m-%d'), 'till': end.strftime('%Y-%m-%d'), 'interval': 24}
             
-            data = await asyncio.wait_for(self._fetch_json(url, params), timeout=MOEX_TIMEOUT)
+            data = await self._fetch_json(url, params)
             candles = data.get('candles', {})
             rows = candles.get('data', [])
             cols = candles.get('columns', [])
@@ -470,10 +470,10 @@ async def check_and_send_all_signals():
     signals.sort(key=lambda x: x['adx'], reverse=True)
     now = datetime.now(pytz.timezone('Europe/Moscow'))
     
-    msg = f"🔔🔔🔔 <b>НАЙДЕНЫ СИГНАЛЫ</b> 🔔🔔🔔\n"
+    msg = f"🔔🔔🔔 НАЙДЕНЫ СИГНАЛЫ 🔔🔔🔔\n"
     msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"⏰ {now.strftime('%H:%M')} | Найдено {len(signals)} сигналов\n\n"
-    msg += f"📊 <b>САМЫЕ СИЛЬНЫЕ (ТОП-3):</b>\n"
+    msg += f"САМЫЕ СИЛЬНЫЕ (ТОП-3):\n"
     msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     
     top_count = min(3, len(signals))
@@ -482,19 +482,18 @@ async def check_and_send_all_signals():
         data = s['data']
         emoji = "🟢" if s['signal'] == 'LONG' else "🔴"
         direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
-        msg += f"{emoji} <b>{data['name']} ({s['ticker']})</b> | {direction} | ADX {data['adx']}\n"
+        msg += f"{emoji} {data['name']} ({s['ticker']}) | {direction} | ADX {data['adx']}\n"
         msg += f"   💡 /open {s['ticker']} {s['signal']} {data['price']:.2f}\n\n"
     
     if len(signals) > top_count:
-        msg += f"<details>\n<summary>📋 Остальные {len(signals) - top_count} сигналов (нажмите, чтобы раскрыть)</summary>\n\n"
+        msg += f"ОСТАЛЬНЫЕ {len(signals) - top_count} СИГНАЛОВ:\n"
         for i in range(top_count, len(signals)):
             s = signals[i]
             data = s['data']
             emoji = "🟢" if s['signal'] == 'LONG' else "🔴"
             direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
-            msg += f"{emoji} <b>{data['name']} ({s['ticker']})</b> | {direction} | ADX {data['adx']}\n"
+            msg += f"{emoji} {data['name']} ({s['ticker']}) | {direction} | ADX {data['adx']}\n"
             msg += f"   💡 /open {s['ticker']} {s['signal']} {data['price']:.2f}\n\n"
-        msg += f"</details>\n"
     
     msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"🤖 Сигналы сгенерированы в {now.strftime('%H:%M')}"
@@ -548,15 +547,15 @@ async def send_sber_hourly():
     
     if signal:
         msg = f"""
-🔔🔔🔔 <b>СБЕР — СИГНАЛ К {signal} !!!</b> 🔔🔔🔔
+🔔🔔🔔 СБЕР — СИГНАЛ К {signal} !!! 🔔🔔🔔
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💰 Цена: <b>{price:.2f} ₽</b>
+💰 Цена: {price:.2f} ₽
 📈 Тренд: {trend_ru}
 📊 ADX: {data['adx']}
 📊 MA10: {data['ma10']:.2f} | MA30: {data['ma30']:.2f}
 
-🎯 <b>ПЛАН СДЕЛКИ:</b>
+🎯 ПЛАН СДЕЛКИ:
    Вход: {price:.2f} ₽
    🛑 Стоп: {data['stop']:.2f} (-{STRATEGY['STOP_LOSS']*100:.0f}%)
    🎯 Тейк: {data['target']:.2f} (+{STRATEGY['TAKE_PROFIT']*100:.0f}%)
@@ -568,16 +567,16 @@ async def send_sber_hourly():
 """
     else:
         msg = f"""
-📊 <b>СБЕР - МОНИТОРИНГ</b> {now.strftime('%H:%M')}
+📊 СБЕР - МОНИТОРИНГ {now.strftime('%H:%M')}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💰 Цена: <b>{price:.2f} ₽</b>
+💰 Цена: {price:.2f} ₽
 📈 Тренд: {trend_ru}
 📊 ADX: {data['adx']:.1f}
 📊 MA10: {data['ma10']:.2f} | MA30: {data['ma30']:.2f}
 
-❌ <b>СИГНАЛА НЕТ</b>
+❌ СИГНАЛА НЕТ
 
-📋 <b>ПРИЧИНА:</b>
+📋 ПРИЧИНА:
 {explanation if explanation else 'Условия для входа не выполнены'}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -589,7 +588,7 @@ async def send_sber_hourly():
         msg += f"\n\n📌 ПОЗИЦИЯ ПО СБЕРУ: {sber_position.upper()}\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%"
     
     if exit_needed:
-        msg += f"\n\n🚨 <b>ВЫХОД ИЗ ПОЗИЦИИ ПО СБЕРУ</b>\n{exit_reason}"
+        msg += f"\n\n🚨 ВЫХОД ИЗ ПОЗИЦИИ ПО СБЕРУ\n{exit_reason}"
         
         pnl_percent, commission_percent = calculate_pnl_percent(sber_entry, price, sber_position)
         
@@ -606,7 +605,7 @@ async def send_sber_hourly():
                 'entry_time': now,
                 'is_manual': False
             }
-        msg += f"\n\n✅ <b>ВХОД {signal}</b> по сигналу бота"
+        msg += f"\n\n✅ ВХОД {signal} по сигналу бота"
     
     try:
         await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
@@ -631,9 +630,9 @@ async def get_all_trends():
     return results
 
 def get_tickers_list_text():
-    text = "📋 <b>ДОСТУПНЫЕ ТИКЕРЫ</b> (17 активов)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    text = "📋 ДОСТУПНЫЕ ТИКЕРЫ (17 активов)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     for i, (ticker, info) in enumerate(TICKERS.items(), 1):
-        text += f"{i}. <b>{info['name']}</b> ({ticker})\n"
+        text += f"{i}. {info['name']} ({ticker})\n"
     return text
 
 # === ЛУННАЯ СТРАТЕГИЯ ===
@@ -678,7 +677,7 @@ async def daily_lunar_summary():
         trends[ticker] = trend
     long_cnt = sum(1 for t in trends.values() if t == 'бычий')
     short_cnt = sum(1 for t in trends.values() if t == 'медвежий')
-    txt = f"🌙 **{datetime.now(msk).strftime('%d.%m.%Y')}**\n"
+    txt = f"🌙 {datetime.now(msk).strftime('%d.%m.%Y')}\n"
     if nxt_full:
         txt += f"🌕 Полнолуние {nxt_full.strftime('%d.%m.%Y')}\n"
     if nxt_new:
@@ -740,15 +739,15 @@ keyboard = ReplyKeyboardMarkup(
 @dp.message_handler(commands=['start'])
 async def start_cmd(m):
     await m.answer(
-        "📊 <b>АНАЛИТИК</b>\n\n"
-        "🔹 <b>СБЕР (сигналы каждый час с 10:00 до 22:00)</b>\n"
+        "📊 АНАЛИТИК\n\n"
+        "🔹 СБЕР (сигналы каждый час с 10:00 до 22:00)\n"
         "   Стратегия: MA10/MA30 + ADX | Стоп 6% | Тейк 12%\n"
         f"   Капитал: {STRATEGY['CAPITAL']:,} ₽ | Размер позиции: {STRATEGY['POSITION_SIZE']*100:.0f}%\n\n"
-        "🔹 <b>ОСТАЛЬНЫЕ 16 АКТИВОВ</b>\n"
-        "   Проверяются каждый час, ТОП-3 видны сразу, остальные под спойлером\n\n"
-        "🔹 <b>ЛУННАЯ СТРАТЕГИЯ</b>\n"
+        "🔹 ОСТАЛЬНЫЕ 16 АКТИВОВ\n"
+        "   Проверяются каждый час, при сигнале присылается список\n\n"
+        "🔹 ЛУННАЯ СТРАТЕГИЯ\n"
         "   Ежедневная сводка в 10:00 | Уведомления за 3 дня до полнолуния и новолуния\n\n"
-        "🔹 <b>КОМАНДЫ:</b>\n"
+        "🔹 КОМАНДЫ:\n"
         "   /status — состояние по Сберу\n"
         "   /open SBER LONG 310 — открыть сделку\n"
         "   /close — закрыть позицию\n"
@@ -773,7 +772,7 @@ async def status_cmd(m):
     ma10 = df['close'].rolling(10).mean().iloc[-1]
     ma30 = df['close'].rolling(30).mean().iloc[-1]
     trend_ru = "БЫЧИЙ 🟢" if trend == "bullish" else "МЕДВЕЖИЙ 🔴" if trend == "bearish" else "БОКОВИК ⚪"
-    msg = f"📊 <b>СБЕР - СТАТУС</b>\n━━━━━━━━━━━━━━━━━━━\n💰 Цена: <b>{price:.2f} ₽</b>\n"
+    msg = f"📊 СБЕР - СТАТУС\n━━━━━━━━━━━━━━━━━━━\n💰 Цена: {price:.2f} ₽\n"
     msg += f"📈 Тренд: {trend_ru}\n📊 MA10: {ma10:.2f} | MA30: {ma30:.2f}\n📈 ADX: {adx:.1f}\n"
     
     async with positions_lock:
@@ -863,12 +862,12 @@ async def close_cmd(m):
 async def balance_cmd(m):
     stats = get_stats()
     price = await data_fetcher.get_price("SBER")
-    msg = f"📊 <b>СТАТИСТИКА ПО СДЕЛКАМ</b>\n━━━━━━━━━━━━━━━━━━━\n"
+    msg = f"📊 СТАТИСТИКА ПО СДЕЛКАМ\n━━━━━━━━━━━━━━━━━━━\n"
     msg += f"💰 Цена Сбера: {price:.2f} ₽\n\n" if price else ""
-    msg += f"📈 <b>ОБЩАЯ</b>\n   Всего сделок: {stats['total_trades']}\n"
+    msg += f"📈 ОБЩАЯ\n   Всего сделок: {stats['total_trades']}\n"
     msg += f"   Прибыльных: {stats['winning_trades']}\n   Убыточных: {stats['losing_trades']}\n"
     msg += f"   Win Rate: {stats['win_rate']:.1f}%\n   Общий P&L: {stats['total_pnl']:+.2f}%\n"
-    msg += f"   Средний P&L: {stats['avg_pnl']:+.2f}%\n\n📅 <b>СЕГОДНЯ</b>\n   P&L: {daily_pnl:+.2f}%"
+    msg += f"   Средний P&L: {stats['avg_pnl']:+.2f}%\n\n📅 СЕГОДНЯ\n   P&L: {daily_pnl:+.2f}%"
     await m.answer(msg, parse_mode='HTML')
 
 # === КНОПКИ ===
@@ -924,32 +923,32 @@ async def btn_emergency_snapshot(m):
     sber_signal, sber_data, sber_expl = await get_sber_signal_detailed()
     now = datetime.now(pytz.timezone('Europe/Moscow'))
     
-    msg = f"🚨 <b>СРОЧНЫЙ СРЕЗ</b> 🚨\n"
+    msg = f"🚨 СРОЧНЫЙ СРЕЗ 🚨\n"
     msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"⏰ {now.strftime('%H:%M:%S')}\n\n"
     
     if sber_signal:
-        msg += f"🔔 <b>СБЕР: СИГНАЛ {sber_signal}</b>\n"
+        msg += f"🔔 СБЕР: СИГНАЛ {sber_signal}\n"
         msg += f"   Цена: {sber_data['price']:.2f} | ADX: {sber_data['adx']}\n"
         msg += f"   🛑 {sber_data['stop']:.2f} | 🎯 {sber_data['target']:.2f}\n"
         msg += f"   💡 /open SBER {sber_signal} {sber_data['price']:.2f}\n\n"
     else:
-        msg += f"⚪ <b>СБЕР: НЕТ СИГНАЛА</b>\n"
+        msg += f"⚪ СБЕР: НЕТ СИГНАЛА\n"
         msg += f"   Цена: {sber_data['price']:.2f} | ADX: {sber_data['adx']:.1f}\n"
         msg += f"   {sber_expl.split(chr(10))[0] if sber_expl else 'Условия не выполнены'}\n\n"
     
     if signals:
         signals.sort(key=lambda x: x['adx'], reverse=True)
-        msg += f"📊 <b>СИГНАЛЫ ПО ОСТАЛЬНЫМ ({len(signals)})</b>\n"
+        msg += f"📊 СИГНАЛЫ ПО ОСТАЛЬНЫМ ({len(signals)})\n"
         msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         for s in signals:
             data = s['data']
             emoji = "🟢" if s['signal'] == 'LONG' else "🔴"
             direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
-            msg += f"{emoji} <b>{data['name']} ({s['ticker']})</b> | {direction} | ADX {data['adx']}\n"
+            msg += f"{emoji} {data['name']} ({s['ticker']}) | {direction} | ADX {data['adx']}\n"
             msg += f"   💡 /open {s['ticker']} {s['signal']} {data['price']:.2f}\n"
     else:
-        msg += f"⚪ <b>СИГНАЛОВ ПО ОСТАЛЬНЫМ НЕТ</b>\n"
+        msg += f"⚪ СИГНАЛОВ ПО ОСТАЛЬНЫМ НЕТ\n"
     
     msg += f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"🤖 Срез выполнен вручную"
@@ -1021,35 +1020,34 @@ async def dashboard(req):
 <!DOCTYPE html>
 <html>
 <head>
-    <title>АНАЛИТИК | ПРОФАНАЛИТИК</title>
+    <title>АНАЛИТИК</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ background: #0a0c15; font-family: 'Inter', system-ui, sans-serif; padding: 24px; color: #e2e8f0; }}
+        body {{ background: #0a0c15; font-family: system-ui, sans-serif; padding: 24px; color: #e2e8f0; }}
         .container {{ max-width: 1400px; margin: 0 auto; }}
         .header {{ background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); border-radius: 28px; padding: 28px 32px; margin-bottom: 32px; border: 1px solid #334155; }}
-        .header h1 {{ font-size: 2rem; font-weight: 700; background: linear-gradient(135deg, #f0f9ff, #bae6fd); -webkit-background-clip: text; background-clip: text; color: transparent; }}
+        .header h1 {{ font-size: 2rem; font-weight: 700; color: #bae6fd; }}
         .lunar-info {{ display: flex; gap: 20px; flex-wrap: wrap; margin-top: 16px; color: #94a3b8; }}
         .lunar-badge {{ background: #1e293b; padding: 6px 14px; border-radius: 40px; font-size: 0.85rem; border-left: 3px solid #facc15; }}
         .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 20px; margin-bottom: 32px; }}
-        .stat-card {{ background: #111827; border-radius: 24px; padding: 20px; text-align: center; border: 1px solid #2d3a4e; transition: 0.2s; }}
-        .stat-card:hover {{ transform: translateY(-3px); border-color: #4f5b73; }}
+        .stat-card {{ background: #111827; border-radius: 24px; padding: 20px; text-align: center; border: 1px solid #2d3a4e; }}
         .stat-value {{ font-size: 2.5rem; font-weight: 800; }}
         .stat-label {{ font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; color: #94a3b8; margin-top: 10px; }}
         .bull {{ color: #4ade80; }} .bear {{ color: #f87171; }} .neutral {{ color: #facc15; }}
         .charts-row {{ display: flex; flex-wrap: wrap; gap: 24px; margin-bottom: 32px; }}
         .chart-box {{ flex: 1; min-width: 280px; background: #0f172a; border-radius: 24px; padding: 20px; border: 1px solid #2d3a4e; }}
-        .chart-box h3 {{ font-size: 1.1rem; margin-bottom: 16px; color: #cbd5e1; }}
+        .chart-box h3 {{ font-size: 1.1rem; margin-bottom: 16px; }}
         canvas {{ max-height: 260px; width: 100%; }}
         .table-wrapper {{ overflow-x: auto; border-radius: 24px; background: #0f172a; border: 1px solid #2d3a4e; }}
         table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
-        th {{ background: #1e293b; padding: 14px 10px; text-align: left; color: #cbd5e6; border-bottom: 1px solid #334155; }}
+        th {{ background: #1e293b; padding: 14px 10px; text-align: left; border-bottom: 1px solid #334155; }}
         td {{ padding: 12px 10px; border-bottom: 1px solid #1e293b; }}
         tr:hover td {{ background-color: rgba(30, 41, 59, 0.5); }}
         .trend-bull {{ color: #4ade80; font-weight: 600; }} .trend-bear {{ color: #f87171; font-weight: 600; }} .trend-neutral {{ color: #facc15; font-weight: 600; }}
-        .ticker-cell {{ font-family: monospace; font-weight: 600; letter-spacing: 0.5px; }}
+        .ticker-cell {{ font-family: monospace; font-weight: 600; }}
         .price-cell {{ font-weight: 700; color: #facc15; }}
         .footer-note {{ margin-top: 28px; text-align: center; font-size: 0.75rem; color: #5b6e8c; border-top: 1px solid #1e293b; padding-top: 20px; }}
         @media (max-width: 700px) {{ body {{ padding: 16px; }} .stat-value {{ font-size: 1.8rem; }} th, td {{ font-size: 0.7rem; padding: 6px 4px; }} }}
@@ -1070,9 +1068,9 @@ async def dashboard(req):
         <div class="stat-card"><div class="stat-value bull">{long_count}</div><div class="stat-label">🟢 LONG</div></div>
         <div class="stat-card"><div class="stat-value bear">{short_count}</div><div class="stat-label">🔴 SHORT</div></div>
         <div class="stat-card"><div class="stat-value neutral">{side_count}</div><div class="stat-label">⚪ БОКОВИК</div></div>
-        <div class="stat-card"><div class="stat-value" style="color: {sentiment_color};">{short_percent}%</div><div class="stat-label">📉 ПРЕОБЛАДАНИЕ SHORT</div></div>
-        <div class="stat-card"><div class="stat-value" style="color: #60a5fa;">{long_percent}%</div><div class="stat-label">📈 % БЫЧЬИХ</div></div>
-        <div class="stat-card"><div class="stat-value" style="color: #c084fc;">{total_count}</div><div class="stat-label">🏷️ ВСЕГО АКТИВОВ</div></div>
+        <div class="stat-card"><div class="stat-value" style="color: {sentiment_color};">{short_percent}%</div><div class="stat-label">📉 SHORT %</div></div>
+        <div class="stat-card"><div class="stat-value" style="color: #60a5fa;">{long_percent}%</div><div class="stat-label">📈 LONG %</div></div>
+        <div class="stat-card"><div class="stat-value" style="color: #c084fc;">{total_count}</div><div class="stat-label">🏷️ ВСЕГО</div></div>
     </div>
     <div class="charts-row">
         <div class="chart-box"><h3>📊 РАСПРЕДЕЛЕНИЕ ТРЕНДОВ</h3><canvas id="trendPieChart"></canvas></div>
@@ -1080,11 +1078,11 @@ async def dashboard(req):
     </div>
     <div class="table-wrapper">
         <table>
-            <thead><tr><th>Актив</th><th>Тикер</th><th>💰 Цена</th><th>📈 Тренд</th><th>🚀 LONG %</th><th>📉 SHORT %</th></tr></thead>
+            <thead><tr><th>Актив</th><th>Тикер</th><th>💰 Цена</th><th>📈 Тренд</th><th>🚀 LONG</th><th>📉 SHORT</th></tr></thead>
             <tbody>{rows}</tbody>
         </table>
     </div>
-    <div class="footer-note">🤖 Сбер: сигналы каждый час | Остальные: ТОП-3 видны сразу, остальные под спойлером | 🌕🌑 Уведомления за 3 дня</div>
+    <div class="footer-note">🤖 Сбер: сигналы каждый час | Остальные: только при сигнале</div>
 </div>
 <script>
     new Chart(document.getElementById('trendPieChart'), {{
@@ -1203,7 +1201,7 @@ async def run_bot_with_retry():
 if __name__ == "__main__":
     print("=" * 50)
     print("АНАЛИТИК | СИГНАЛЫ ПО ВСЕМ 17 АКТИВАМ")
-    print("Сбер: каждый час | Остальные: ТОП-3 видно, остальные под спойлером")
+    print("Сбер: каждый час | Остальные: только при сигнале")
     print("Луна: уведомления за 3 дня до ПОЛНОЛУНИЯ и НОВОЛУНИЯ")
     print("Стоп 6% | Тейк 12% | ADX > 20")
     print(f"Капитал: {STRATEGY['CAPITAL']:,} ₽ | Размер позиции: {STRATEGY['POSITION_SIZE']*100:.0f}%")
