@@ -154,40 +154,33 @@ def get_days_until_new_moon():
 
 # === ЛУННАЯ СТРАТЕГИЯ ПО СИСТЕМЕ ДМИТРИЕВА ===
 async def get_lunar_signal():
-    """Возвращает сигнал по системе Дмитриева (полнолуние/новолуние)"""
     msk = pytz.timezone('Europe/Moscow')
     now = datetime.now(msk)
     
-    # Находим ближайшее полнолуние
     next_full = None
-    next_full_date = None
+    next_new = None
     for date_str, time_str in LUNAR_PHASES["full_moons"]:
         dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
         if dt > now:
             next_full = dt
             break
     
-    # Находим ближайшее новолуние
-    next_new = None
     for date_str, time_str in LUNAR_PHASES["new_moons"]:
         dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
         if dt > now:
             next_new = dt
             break
     
-    # Проверяем, сегодня ли полнолуние
     for date_str, time_str in LUNAR_PHASES["full_moons"]:
         dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
         if dt.date() == now.date():
             return "full_today", dt, next_full, next_new
     
-    # Проверяем, в зоне 3 дней до полнолуния
     if next_full:
         days_until_full = (next_full - now).days
         if 1 <= days_until_full <= 3:
             return "prepare", next_full, next_full, next_new
     
-    # Проверяем, в зоне 5 дней после полнолуния
     for date_str, time_str in LUNAR_PHASES["full_moons"]:
         dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
         if dt < now:
@@ -195,7 +188,6 @@ async def get_lunar_signal():
             if 1 <= days_after <= 5:
                 return "hold", dt, next_full, next_new
     
-    # Проверяем, сегодня ли новолуние
     for date_str, time_str in LUNAR_PHASES["new_moons"]:
         dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
         if dt.date() == now.date():
@@ -395,7 +387,7 @@ def calc_trend_for_ticker(df):
     spread = abs(ma18 - ma50) / ma50 * 100
     return "боковик" if spread < 0.7 else ("бычий" if ma18 > ma50 else "медвежий")
 
-# === ИНФОРМАЦИЯ ПО АКТИВУ (без графика) ===
+# === ИНФОРМАЦИЯ ПО АКТИВУ ===
 async def get_asset_info(ticker):
     df = await data_fetcher.fetch_candles_daily(ticker, 100)
     price = await data_fetcher.get_price(ticker)
@@ -748,23 +740,64 @@ async def daily_lunar_summary():
     today = datetime.now(msk).strftime('%Y-%m-%d')
     if get_last_summary_date() == today:
         return
+    
     ph, _, nxt_full, nxt_new = get_lunar_info()
     trends = {}
     for ticker in ALL_TICKERS:
         df = await data_fetcher.fetch_candles_daily(ticker, 100)
         trend = calc_trend_for_ticker(df)
         trends[ticker] = trend
+    
     long_cnt = sum(1 for t in trends.values() if t == 'бычий')
     short_cnt = sum(1 for t in trends.values() if t == 'медвежий')
-    txt = f"🌙 {datetime.now(msk).strftime('%d.%m.%Y')}\n"
+    side_cnt = sum(1 for t in trends.values() if t == 'боковик')
+    total_cnt = long_cnt + short_cnt + side_cnt
+    
+    long_percent = round((long_cnt / total_cnt) * 100, 1) if total_cnt else 0
+    short_percent = round((short_cnt / total_cnt) * 100, 1) if total_cnt else 0
+    
+    if short_cnt > long_cnt:
+        predominance = "МЕДВЕЖИЙ (SHORT)"
+        recommendation = "рассмотреть SHORT-позиции, избегать LONG"
+    elif long_cnt > short_cnt:
+        predominance = "БЫЧИЙ (LONG)"
+        recommendation = "рассмотреть LONG-позиции, избегать SHORT"
+    else:
+        predominance = "НЕЙТРАЛЬНЫЙ"
+        recommendation = "рынок без явного тренда, осторожность"
+    
+    days_full = get_days_until_full_moon()
+    days_new = get_days_until_new_moon()
+    
+    txt = f"📊 ЕЖЕДНЕВНАЯ СВОДКА {msk.strftime('%d.%m.%Y %H:%M')}\n\n"
+    txt += f"🌙 Фаза Луны: {ph.upper()}\n"
     if nxt_full:
-        txt += f"🌕 Полнолуние {nxt_full.strftime('%d.%m.%Y')}\n"
+        txt += f"🌕 Полнолуние: {nxt_full.strftime('%d.%m.%Y')}"
+        if days_full is not None:
+            txt += f" (через {days_full} дн.)\n"
+        else:
+            txt += "\n"
     if nxt_new:
-        txt += f"🌑 Новолуние {nxt_new.strftime('%d.%m.%Y')}\n"
-    txt += f"🟢 LONG: {long_cnt}  🔴 SHORT: {short_cnt}\n"
+        txt += f"🌑 Новолуние: {nxt_new.strftime('%d.%m.%Y')}"
+        if days_new is not None:
+            txt += f" (через {days_new} дн.)\n"
+        else:
+            txt += "\n"
+    
+    txt += f"\n📊 ОБЩИЙ ТРЕНД НА МОСБИРЖЕ (17 активов)\n"
+    txt += f"🟢 LONG: {long_cnt} активов ({long_percent}%)\n"
+    txt += f"🔴 SHORT: {short_cnt} активов ({short_percent}%)\n"
+    txt += f"⚪ БОКОВИК: {side_cnt} активов\n\n"
+    txt += f"📈 ПРЕОБЛАДАНИЕ: {predominance}\n"
+    txt += f"💡 Рекомендация: {recommendation}\n\n"
+    txt += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    txt += f"🔹 СИГНАЛЫ ПО СБЕРУ: каждый час с 10:00 до 22:00\n"
+    txt += f"🔹 СРОЧНЫЙ СРЕЗ: кнопка в меню\n"
+    txt += f"🔹 /luna — детальная лунная стратегия"
+    
     save_daily_summary(today, txt)
     try:
-        await bot.send_message(CHANNEL_ID, txt, parse_mode='Markdown')
+        await bot.send_message(CHANNEL_ID, txt, parse_mode='HTML')
     except:
         pass
 
@@ -827,21 +860,21 @@ async def start_cmd(m):
         "🔹 ЛУННАЯ СТРАТЕГИЯ\n"
         "   Ежедневная сводка в 10:00 | Уведомления за 3 дня до полнолуния и новолуния\n\n"
         "🔹 КНОПКИ:\n"
-        "   🌙 Фазы Луны — информация о луне\n"
+        "   🌙 Фазы Луны — информация о луне и общий тренд на Мосбирже\n"
         "   📊 Информация — данные по всем 17 активам\n"
         "   📋 Тикеры — список тикеров\n"
         "   🚨 Срочный срез — моментальный анализ всех 17 активов\n\n"
         "🔹 КОМАНДА:\n"
-        "   /луна — детальная лунная стратегия с сигналами по системе Дмитриева",
+        "   /luna — детальная лунная стратегия с сигналами по системе Дмитриева",
         reply_markup=keyboard, parse_mode='HTML')
 
-@dp.message_handler(commands=['луна'])
-async def lunar_cmd(m):
+@dp.message_handler(commands=['luna'])
+async def luna_cmd(m):
     signal_type, full_date, next_full, next_new = await get_lunar_signal()
     now = datetime.now(pytz.timezone('Europe/Moscow'))
     ph, _, _, _ = get_lunar_info()
+    msk = pytz.timezone('Europe/Moscow')
     
-    # Определяем день лунного цикла (приблизительно)
     new_moons = [msk.localize(datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M")) for d, t in LUNAR_PHASES["new_moons"]]
     last_new = max([d for d in new_moons if d <= now], default=None)
     lunar_day = (now - last_new).days if last_new else 0
@@ -891,6 +924,26 @@ async def btn_lunar(m):
     days_full = get_days_until_full_moon()
     days_new = get_days_until_new_moon()
     
+    # Получаем общий тренд по всем активам
+    trends = await get_all_trends()
+    long_cnt = sum(1 for d in trends.values() if d['trend'] == 'бычий')
+    short_cnt = sum(1 for d in trends.values() if d['trend'] == 'медвежий')
+    side_cnt = sum(1 for d in trends.values() if d['trend'] == 'боковик')
+    total_cnt = long_cnt + short_cnt + side_cnt
+    
+    long_percent = round((long_cnt / total_cnt) * 100, 1) if total_cnt else 0
+    short_percent = round((short_cnt / total_cnt) * 100, 1) if total_cnt else 0
+    
+    if short_cnt > long_cnt:
+        predominance = "МЕДВЕЖИЙ (SHORT)"
+        recommendation = "рассмотреть SHORT-позиции, избегать LONG"
+    elif long_cnt > short_cnt:
+        predominance = "БЫЧИЙ (LONG)"
+        recommendation = "рассмотреть LONG-позиции, избегать SHORT"
+    else:
+        predominance = "НЕЙТРАЛЬНЫЙ"
+        recommendation = "рынок без явного тренда, осторожность"
+    
     txt = f"🌙 {ph.upper()}\n📅 {now.strftime('%d.%m.%Y')}"
     
     if next_full:
@@ -903,7 +956,14 @@ async def btn_lunar(m):
         if days_new is not None:
             txt += f"\n   ⏳ До новолуния: {days_new} дн."
     
-    await m.answer(txt)
+    txt += f"\n\n📊 ОБЩИЙ ТРЕНД НА МОСБИРЖЕ (17 активов)\n"
+    txt += f"🟢 LONG: {long_cnt} активов ({long_percent}%)\n"
+    txt += f"🔴 SHORT: {short_cnt} активов ({short_percent}%)\n"
+    txt += f"⚪ БОКОВИК: {side_cnt} активов\n\n"
+    txt += f"📈 ПРЕОБЛАДАНИЕ: {predominance}\n"
+    txt += f"💡 Рекомендация: {recommendation}"
+    
+    await m.answer(txt, parse_mode='HTML')
 
 @dp.message_handler(lambda msg: msg.text == "📊 Информация")
 async def btn_info(m):
@@ -914,11 +974,10 @@ async def btn_info(m):
         info_msg, error = await get_asset_info(ticker)
         if info_msg:
             all_info.append(info_msg)
-        await asyncio.sleep(0.1)  # небольшая задержка, чтобы не перегружать MOEX
+        await asyncio.sleep(0.1)
     
     if all_info:
         full_msg = "\n\n".join(all_info)
-        # Если сообщение слишком длинное, разбиваем на части
         if len(full_msg) > 4000:
             parts = []
             current_part = ""
@@ -1098,7 +1157,7 @@ if __name__ == "__main__":
     print("Сбер: сигналы каждый час | Остальные: только при сигнале")
     print("Кнопка «Информация» — данные по всем 17 активам")
     print("Срочный срез — с рекомендациями")
-    print("Команда /луна — лунная стратегия по системе Дмитриева")
+    print("Команда /luna — лунная стратегия по системе Дмитриева")
     print("Дашборд отключён для экономии памяти")
     print("=" * 50)
     
