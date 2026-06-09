@@ -14,7 +14,7 @@ import warnings
 import os
 import gc
 import matplotlib
-matplotlib.use('Agg')  # Экономия памяти: отключаем GUI
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from io import BytesIO
 import sqlite3
@@ -22,8 +22,7 @@ import signal
 
 warnings.filterwarnings('ignore')
 
-# === ОГРАНИЧЕНИЕ ПАМЯТИ ===
-os.environ['MPLCONFIGDIR'] = '/tmp/matplotlib'  # Временная папка для кэша
+os.environ['MPLCONFIGDIR'] = '/tmp/matplotlib'
 
 # === ТОКЕН ===
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -199,7 +198,6 @@ def save_daily_summary(date, summary):
         c.execute("INSERT OR REPLACE INTO daily_summary (date, summary) VALUES (?, ?)", (date, summary))
 
 def clean_old_trades(days=30):
-    """Очистка старых сделок для экономии памяти"""
     with sqlite3.connect('bot_data.db') as conn:
         conn.execute("DELETE FROM trades WHERE date < datetime('now', ?)", (f'-{days} days',))
 
@@ -364,6 +362,232 @@ def calculate_pnl_percent(entry_price, exit_price, direction):
     
     return pnl_percent, commission_percent
 
+# === ИНФОРМАЦИЯ ПО АКТИВУ (без графика) ===
+async def get_asset_info(ticker):
+    """Возвращает текстовую информацию по активу (MA18, MA50, ADX, рекомендация)"""
+    df = await data_fetcher.fetch_candles_daily(ticker, 100)
+    price = await data_fetcher.get_price(ticker)
+    
+    if df is None or price is None or price <= 0:
+        return None, "Нет данных от MOEX"
+    
+    # Расчёт индикаторов для информации
+    ma18 = df['close'].rolling(18).mean().iloc[-1] if len(df) >= 18 else None
+    ma50 = df['close'].rolling(50).mean().iloc[-1] if len(df) >= 50 else None
+    adx = calculate_adx(df)
+    trend = get_trend(df)
+    
+    # Определяем рекомендацию
+    recommendation = None
+    if trend == "bullish" and adx > STRATEGY['ADX_THRESHOLD']:
+        recommendation = f"Рекомендую открыть LONG по {TICKERS[ticker]['name']} ({ticker}) по цене {price:.2f} ₽"
+    elif trend == "bearish" and adx > STRATEGY['ADX_THRESHOLD']:
+        recommendation = f"Рекомендую открыть SHORT по {TICKERS[ticker]['name']} ({ticker}) по цене {price:.2f} ₽"
+    
+    adx_status = "тренд" if adx > STRATEGY['ADX_THRESHOLD'] else "флет"
+    trend_ru = "БЫЧИЙ 🟢" if trend == "bullish" else "МЕДВЕЖИЙ 🔴" if trend == "bearish" else "НЕЙТРАЛЬНО"
+    
+    # Формируем сообщение
+    msg = f"📊 {TICKERS[ticker]['name']} ({ticker})\n"
+    msg += f"💰 Текущая: {price:.2f} ₽\n"
+    if ma18 and ma50:
+        msg += f"📈 MA18: {ma18:.2f} | MA50: {ma50:.2f}\n"
+    msg += f"📊 ADX: {adx:.1f} ({adx_status})\n"
+    
+    if recommendation:
+        msg += f"✅ {recommendation}"
+    else:
+        msg += "❌ Сигналов нет, ожидайте"
+    
+    return msg, None
+
+# === ОТПРАВКА СИГНАЛОВ (с рекомендацией вместо /open) ===
+async def check_and_send_all_signals():
+    global last_signal_sent
+    
+    async with positions_lock:
+        signals = []
+        for ticker in ALL_TICKERS:
+            if ticker == "SBER":
+                continue
+            if ticker in positions and positions[ticker].get('type') is not None:
+                continue
+            signal, data, _ = await get_signal_for_ticker(ticker)
+            if signal and data and data.get('price') is not None and data['price'] > 0:
+                signals.append({
+                    'ticker': ticker,
+                    'signal': signal,
+                    'data': data,
+                    'adx': data['adx']
+                })
+    
+    if not signals:
+        return
+    
+    signals.sort(key=lambda x: x['adx'], reverse=True)
+    now = datetime.now(pytz.timezone('Europe/Moscow'))
+    
+    msg = f"🔔🔔🔔 НАЙДЕНЫ СИГНАЛЫ 🔔🔔🔔\n\n"
+    msg += f"⏰ {now.strftime('%H:%M')} | Найдено {len(signals)} сигналов\n\n"
+    msg += f"САМЫЕ СИЛЬНЫЕ (ТОП-3):\n\n"
+    
+    top_count = min(3, len(signals))
+    for i in range(top_count):
+        s = signals[i]
+        data = s['data']
+        emoji = "🟢" if s['signal'] == 'LONG' else "🔴"
+        direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
+        msg += f"{emoji} {data['name']} ({s['ticker']}) | {direction} | ADX {data['adx']}\n"
+        if s['signal'] == 'LONG':
+            msg += f"   ✅ Рекомендую открыть LONG по {data['name']} ({s['ticker']}) по цене {data['price']:.2f} ₽\n\n"
+        else:
+            msg += f"   ✅ Рекомендую открыть SHORT по {data['name']} ({s['ticker']}) по цене {data['price']:.2f} ₽\n\n"
+    
+    if len(signals) > top_count:
+        msg += f"ОСТАЛЬНЫЕ {len(signals) - top_count} СИГНАЛОВ:\n\n"
+        for i in range(top_count, len(signals)):
+            s = signals[i]
+            data = s['data']
+            emoji = "🟢" if s['signal'] == 'LONG' else "🔴"
+            direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
+            msg += f"{emoji} {data['name']} ({s['ticker']}) | {direction} | ADX {data['adx']}\n"
+            if s['signal'] == 'LONG':
+                msg += f"   ✅ Рекомендую открыть LONG по {data['name']} ({s['ticker']}) по цене {data['price']:.2f} ₽\n\n"
+            else:
+                msg += f"   ✅ Рекомендую открыть SHORT по {data['name']} ({s['ticker']}) по цене {data['price']:.2f} ₽\n\n"
+    
+    msg += f"\n🤖 Сигналы сгенерированы в {now.strftime('%H:%M')}"
+    
+    try:
+        await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
+        for s in signals:
+            last_signal_sent[s['ticker']] = f"{s['signal']}_{int(s['data']['price'])}"
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}")
+    
+    gc.collect()
+
+async def send_sber_hourly():
+    global positions, daily_pnl
+    
+    if not CHANNEL_ID:
+        return
+    
+    await reset_daily_pnl()
+    
+    signal, data, explanation = await get_sber_signal_detailed()
+    
+    if data is None or data.get('price') is None or data['price'] <= 0:
+        logger.error("Нет корректной цены для Сбера, пропускаем сигнал")
+        return
+    
+    price = data['price']
+    now = datetime.now(pytz.timezone('Europe/Moscow'))
+    
+    trend_ru = "БЫЧИЙ 🟢" if data.get('trend') == 'bullish' else "МЕДВЕЖИЙ 🔴" if data.get('trend') == 'bearish' else "НЕЙТРАЛЬНО ⚪"
+    
+    exit_needed = False
+    exit_reason = None
+    sber_position = None
+    sber_entry = None
+    
+    async with positions_lock:
+        sber_position = positions.get("SBER", {}).get('type')
+        sber_entry = positions.get("SBER", {}).get('entry_price') if sber_position else None
+    
+    if sber_position and sber_entry:
+        if sber_position == 'long':
+            pnl_check = (price - sber_entry) / sber_entry * 100
+        else:
+            pnl_check = (sber_entry - price) / sber_entry * 100
+        if pnl_check <= -STRATEGY['STOP_LOSS'] * 100:
+            exit_needed = True
+            exit_reason = f"Стоп-лосс: {pnl_check:.1f}%"
+        elif pnl_check >= STRATEGY['TAKE_PROFIT'] * 100:
+            exit_needed = True
+            exit_reason = f"Тейк-профит: {pnl_check:.1f}%"
+    
+    if signal:
+        msg = f"🔔🔔🔔 СБЕР — СИГНАЛ К {signal} !!! 🔔🔔🔔\n\n"
+        msg += f"💰 Цена: {price:.2f} ₽\n"
+        msg += f"📈 Тренд: {trend_ru}\n"
+        msg += f"📊 ADX: {data['adx']}\n"
+        msg += f"📊 MA10: {data['ma10']:.2f} | MA30: {data['ma30']:.2f}\n\n"
+        msg += f"🎯 ПЛАН СДЕЛКИ:\n"
+        msg += f"   Вход: {price:.2f} ₽\n"
+        msg += f"   🛑 Стоп: {data['stop']:.2f} (-{STRATEGY['STOP_LOSS']*100:.0f}%)\n"
+        msg += f"   🎯 Тейк: {data['target']:.2f} (+{STRATEGY['TAKE_PROFIT']*100:.0f}%)\n\n"
+        msg += f"📊 Тип сигнала: {data['signal_type']}\n\n"
+        msg += f"🤖 Сигнал сгенерирован в {now.strftime('%H:%M')}\n"
+        
+        if signal == 'LONG':
+            msg += f"✅ Рекомендую открыть LONG по Сберу (SBER) по цене {price:.2f} ₽"
+        else:
+            msg += f"✅ Рекомендую открыть SHORT по Сберу (SBER) по цене {price:.2f} ₽"
+    else:
+        msg = f"📊 СБЕР - МОНИТОРИНГ {now.strftime('%H:%M')}\n\n"
+        msg += f"💰 Цена: {price:.2f} ₽\n"
+        msg += f"📈 Тренд: {trend_ru}\n"
+        msg += f"📊 ADX: {data['adx']:.1f}\n"
+        msg += f"📊 MA10: {data['ma10']:.2f} | MA30: {data['ma30']:.2f}\n\n"
+        msg += f"❌ СИГНАЛА НЕТ\n\n"
+        msg += f"📋 ПРИЧИНА:\n{explanation if explanation else 'Условия для входа не выполнены'}\n\n"
+        msg += f"💡 Следующая проверка через час"
+    
+    if sber_position:
+        pnl = (price - sber_entry) / sber_entry * 100 if sber_position == 'long' else (sber_entry - price) / sber_entry * 100
+        msg += f"\n\n📌 ПОЗИЦИЯ ПО СБЕРУ: {sber_position.upper()}\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%"
+    
+    if exit_needed:
+        msg += f"\n\n🚨 ВЫХОД ИЗ ПОЗИЦИИ ПО СБЕРУ\n{exit_reason}"
+        
+        pnl_percent, commission_percent = calculate_pnl_percent(sber_entry, price, sber_position)
+        
+        async with positions_lock:
+            daily_pnl += pnl_percent
+            save_trade("SBER", sber_position, sber_entry, price, pnl_percent, commission_percent, positions.get("SBER", {}).get('is_manual', False))
+            positions["SBER"] = {'type': None, 'entry_price': None, 'entry_time': None, 'is_manual': False}
+    
+    elif signal and not sber_position:
+        async with positions_lock:
+            positions["SBER"] = {
+                'type': signal.lower(),
+                'entry_price': price,
+                'entry_time': now,
+                'is_manual': False
+            }
+        msg += f"\n\n✅ ВХОД {signal} по сигналу бота"
+    
+    try:
+        await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}")
+    
+    gc.collect()
+
+async def reset_daily_pnl():
+    global daily_pnl, last_reset_date
+    msk = pytz.timezone('Europe/Moscow')
+    today = datetime.now(msk).date()
+    if last_reset_date != today:
+        daily_pnl = 0.0
+        last_reset_date = today
+
+async def get_all_trends():
+    results = {}
+    for ticker in ALL_TICKERS:
+        df = await data_fetcher.fetch_candles_daily(ticker, 100)
+        price = await data_fetcher.get_price(ticker)
+        trend = calc_trend_for_ticker(df)
+        results[ticker] = {**TICKERS[ticker], "price": price, "trend": trend}
+    return results
+
+def get_tickers_list_text():
+    text = "📋 ДОСТУПНЫЕ ТИКЕРЫ (17 активов)\n\n"
+    for i, (ticker, info) in enumerate(TICKERS.items(), 1):
+        text += f"{i}. {info['name']} ({ticker})\n"
+    return text
+
 # === АНАЛИЗ СИГНАЛА ===
 async def get_signal_for_ticker(ticker):
     df = await data_fetcher.fetch_candles_daily(ticker, 100)
@@ -445,201 +669,6 @@ async def get_sber_signal_detailed():
             reasons.append("Условия для входа не выполнены")
         return None, data, "\n".join(reasons)
 
-# === ОТПРАВКА СИГНАЛОВ ===
-async def check_and_send_all_signals():
-    global last_signal_sent
-    
-    async with positions_lock:
-        signals = []
-        for ticker in ALL_TICKERS:
-            if ticker == "SBER":
-                continue
-            if ticker in positions and positions[ticker].get('type') is not None:
-                continue
-            signal, data, _ = await get_signal_for_ticker(ticker)
-            if signal and data and data.get('price') is not None and data['price'] > 0:
-                signals.append({
-                    'ticker': ticker,
-                    'signal': signal,
-                    'data': data,
-                    'adx': data['adx']
-                })
-    
-    if not signals:
-        return
-    
-    signals.sort(key=lambda x: x['adx'], reverse=True)
-    now = datetime.now(pytz.timezone('Europe/Moscow'))
-    
-    msg = f"🔔🔔🔔 НАЙДЕНЫ СИГНАЛЫ 🔔🔔🔔\n"
-    msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"⏰ {now.strftime('%H:%M')} | Найдено {len(signals)} сигналов\n\n"
-    msg += f"САМЫЕ СИЛЬНЫЕ (ТОП-3):\n"
-    msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    
-    top_count = min(3, len(signals))
-    for i in range(top_count):
-        s = signals[i]
-        data = s['data']
-        emoji = "🟢" if s['signal'] == 'LONG' else "🔴"
-        direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
-        msg += f"{emoji} {data['name']} ({s['ticker']}) | {direction} | ADX {data['adx']}\n"
-        msg += f"   💡 /open {s['ticker']} {s['signal']} {data['price']:.2f}\n\n"
-    
-    if len(signals) > top_count:
-        msg += f"ОСТАЛЬНЫЕ {len(signals) - top_count} СИГНАЛОВ:\n"
-        for i in range(top_count, len(signals)):
-            s = signals[i]
-            data = s['data']
-            emoji = "🟢" if s['signal'] == 'LONG' else "🔴"
-            direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
-            msg += f"{emoji} {data['name']} ({s['ticker']}) | {direction} | ADX {data['adx']}\n"
-            msg += f"   💡 /open {s['ticker']} {s['signal']} {data['price']:.2f}\n\n"
-    
-    msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"🤖 Сигналы сгенерированы в {now.strftime('%H:%M')}"
-    
-    try:
-        await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
-        for s in signals:
-            last_signal_sent[s['ticker']] = f"{s['signal']}_{int(s['data']['price'])}"
-    except Exception as e:
-        logger.error(f"Ошибка отправки: {e}")
-    
-    gc.collect()  # Принудительный сбор мусора после отправки
-
-async def send_sber_hourly():
-    global positions, daily_pnl
-    
-    if not CHANNEL_ID:
-        return
-    
-    await reset_daily_pnl()
-    
-    signal, data, explanation = await get_sber_signal_detailed()
-    
-    if data is None or data.get('price') is None or data['price'] <= 0:
-        logger.error("Нет корректной цены для Сбера, пропускаем сигнал")
-        return
-    
-    price = data['price']
-    now = datetime.now(pytz.timezone('Europe/Moscow'))
-    
-    trend_ru = "БЫЧИЙ 🟢" if data.get('trend') == 'bullish' else "МЕДВЕЖИЙ 🔴" if data.get('trend') == 'bearish' else "НЕЙТРАЛЬНО ⚪"
-    
-    exit_needed = False
-    exit_reason = None
-    sber_position = None
-    sber_entry = None
-    
-    async with positions_lock:
-        sber_position = positions.get("SBER", {}).get('type')
-        sber_entry = positions.get("SBER", {}).get('entry_price') if sber_position else None
-    
-    if sber_position and sber_entry:
-        if sber_position == 'long':
-            pnl_check = (price - sber_entry) / sber_entry * 100
-        else:
-            pnl_check = (sber_entry - price) / sber_entry * 100
-        if pnl_check <= -STRATEGY['STOP_LOSS'] * 100:
-            exit_needed = True
-            exit_reason = f"Стоп-лосс: {pnl_check:.1f}%"
-        elif pnl_check >= STRATEGY['TAKE_PROFIT'] * 100:
-            exit_needed = True
-            exit_reason = f"Тейк-профит: {pnl_check:.1f}%"
-    
-    if signal:
-        msg = f"""
-🔔🔔🔔 СБЕР — СИГНАЛ К {signal} !!! 🔔🔔🔔
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💰 Цена: {price:.2f} ₽
-📈 Тренд: {trend_ru}
-📊 ADX: {data['adx']}
-📊 MA10: {data['ma10']:.2f} | MA30: {data['ma30']:.2f}
-
-🎯 ПЛАН СДЕЛКИ:
-   Вход: {price:.2f} ₽
-   🛑 Стоп: {data['stop']:.2f} (-{STRATEGY['STOP_LOSS']*100:.0f}%)
-   🎯 Тейк: {data['target']:.2f} (+{STRATEGY['TAKE_PROFIT']*100:.0f}%)
-
-📊 Тип сигнала: {data['signal_type']}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🤖 Сигнал сгенерирован в {now.strftime('%H:%M')}
-"""
-    else:
-        msg = f"""
-📊 СБЕР - МОНИТОРИНГ {now.strftime('%H:%M')}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💰 Цена: {price:.2f} ₽
-📈 Тренд: {trend_ru}
-📊 ADX: {data['adx']:.1f}
-📊 MA10: {data['ma10']:.2f} | MA30: {data['ma30']:.2f}
-
-❌ СИГНАЛА НЕТ
-
-📋 ПРИЧИНА:
-{explanation if explanation else 'Условия для входа не выполнены'}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💡 Следующая проверка через час
-"""
-    
-    if sber_position:
-        pnl = (price - sber_entry) / sber_entry * 100 if sber_position == 'long' else (sber_entry - price) / sber_entry * 100
-        msg += f"\n\n📌 ПОЗИЦИЯ ПО СБЕРУ: {sber_position.upper()}\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%"
-    
-    if exit_needed:
-        msg += f"\n\n🚨 ВЫХОД ИЗ ПОЗИЦИИ ПО СБЕРУ\n{exit_reason}"
-        
-        pnl_percent, commission_percent = calculate_pnl_percent(sber_entry, price, sber_position)
-        
-        async with positions_lock:
-            daily_pnl += pnl_percent
-            save_trade("SBER", sber_position, sber_entry, price, pnl_percent, commission_percent, positions.get("SBER", {}).get('is_manual', False))
-            positions["SBER"] = {'type': None, 'entry_price': None, 'entry_time': None, 'is_manual': False}
-    
-    elif signal and not sber_position:
-        async with positions_lock:
-            positions["SBER"] = {
-                'type': signal.lower(),
-                'entry_price': price,
-                'entry_time': now,
-                'is_manual': False
-            }
-        msg += f"\n\n✅ ВХОД {signal} по сигналу бота"
-    
-    try:
-        await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
-    except Exception as e:
-        logger.error(f"Ошибка отправки: {e}")
-    
-    gc.collect()
-
-async def reset_daily_pnl():
-    global daily_pnl, last_reset_date
-    msk = pytz.timezone('Europe/Moscow')
-    today = datetime.now(msk).date()
-    if last_reset_date != today:
-        daily_pnl = 0.0
-        last_reset_date = today
-
-async def get_all_trends():
-    results = {}
-    for ticker in ALL_TICKERS:
-        df = await data_fetcher.fetch_candles_daily(ticker, 100)
-        price = await data_fetcher.get_price(ticker)
-        trend = calc_trend_for_ticker(df)
-        results[ticker] = {**TICKERS[ticker], "price": price, "trend": trend}
-    return results
-
-def get_tickers_list_text():
-    text = "📋 ДОСТУПНЫЕ ТИКЕРЫ (17 активов)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    for i, (ticker, info) in enumerate(TICKERS.items(), 1):
-        text += f"{i}. {info['name']} ({ticker})\n"
-    return text
-
 # === ЛУННАЯ СТРАТЕГИЯ ===
 async def lunar_notify():
     global lunar_notified_days
@@ -699,7 +728,7 @@ async def daily_loop():
         now = datetime.now(pytz.timezone('Europe/Moscow'))
         if now.hour == 10 and now.minute < 5:
             await daily_lunar_summary()
-            clean_old_trades(30)  # Очистка БД раз в день
+            clean_old_trades(30)
         await asyncio.sleep(60)
 
 async def sber_hourly_loop():
@@ -732,10 +761,10 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
 
+# === КЛАВИАТУРА ===
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🌙 Фазы Луны")],
-        [KeyboardButton(text="📈 График акции")],
+        [KeyboardButton(text="🌙 Фазы Луны"), KeyboardButton(text="📊 Информация")],
         [KeyboardButton(text="📋 Тикеры"), KeyboardButton(text="🚨 Срочный срез")],
     ],
     resize_keyboard=True
@@ -759,7 +788,11 @@ async def start_cmd(m):
         "   /close — закрыть позицию\n"
         "   /balance — статистика\n"
         "   /tickers — список всех тикеров\n\n"
-        "🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard (может быть недоступен при экономии памяти)",
+        "🔹 КНОПКИ:\n"
+        "   🌙 Фазы Луны — информация о луне\n"
+        "   📊 Информация — данные по активу (введите тикер)\n"
+        "   📋 Тикеры — список тикеров\n"
+        "   🚨 Срочный срез — моментальный анализ всех 17 активов",
         reply_markup=keyboard, parse_mode='HTML')
 
 @dp.message_handler(commands=['tickers'])
@@ -778,7 +811,7 @@ async def status_cmd(m):
     ma10 = df['close'].rolling(10).mean().iloc[-1]
     ma30 = df['close'].rolling(30).mean().iloc[-1]
     trend_ru = "БЫЧИЙ 🟢" if trend == "bullish" else "МЕДВЕЖИЙ 🔴" if trend == "bearish" else "БОКОВИК ⚪"
-    msg = f"📊 СБЕР - СТАТУС\n━━━━━━━━━━━━━━━━━━━\n💰 Цена: {price:.2f} ₽\n"
+    msg = f"📊 СБЕР - СТАТУС\n\n💰 Цена: {price:.2f} ₽\n"
     msg += f"📈 Тренд: {trend_ru}\n📊 MA10: {ma10:.2f} | MA30: {ma30:.2f}\n📈 ADX: {adx:.1f}\n"
     
     async with positions_lock:
@@ -869,7 +902,7 @@ async def close_cmd(m):
 async def balance_cmd(m):
     stats = get_stats()
     price = await data_fetcher.get_price("SBER")
-    msg = f"📊 СТАТИСТИКА ПО СДЕЛКАМ\n━━━━━━━━━━━━━━━━━━━\n"
+    msg = f"📊 СТАТИСТИКА ПО СДЕЛКАМ\n\n"
     msg += f"💰 Цена Сбера: {price:.2f} ₽\n\n" if price else ""
     msg += f"📈 ОБЩАЯ\n   Всего сделок: {stats['total_trades']}\n"
     msg += f"   Прибыльных: {stats['winning_trades']}\n   Убыточных: {stats['losing_trades']}\n"
@@ -899,8 +932,8 @@ async def btn_lunar(m):
     
     await m.answer(txt)
 
-@dp.message_handler(lambda msg: msg.text == "📈 График акции")
-async def btn_chart(m):
+@dp.message_handler(lambda msg: msg.text == "📊 Информация")
+async def btn_info(m):
     await m.answer("Введите тикер из списка:\n" + ", ".join(ALL_TICKERS))
 
 @dp.message_handler(lambda msg: msg.text == "📋 Тикеры")
@@ -930,15 +963,17 @@ async def btn_emergency_snapshot(m):
     sber_signal, sber_data, sber_expl = await get_sber_signal_detailed()
     now = datetime.now(pytz.timezone('Europe/Moscow'))
     
-    msg = f"🚨 СРОЧНЫЙ СРЕЗ 🚨\n"
-    msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg = f"🚨 СРОЧНЫЙ СРЕЗ 🚨\n\n"
     msg += f"⏰ {now.strftime('%H:%M:%S')}\n\n"
     
     if sber_signal:
         msg += f"🔔 СБЕР: СИГНАЛ {sber_signal}\n"
         msg += f"   Цена: {sber_data['price']:.2f} | ADX: {sber_data['adx']}\n"
         msg += f"   🛑 {sber_data['stop']:.2f} | 🎯 {sber_data['target']:.2f}\n"
-        msg += f"   💡 /open SBER {sber_signal} {sber_data['price']:.2f}\n\n"
+        if sber_signal == 'LONG':
+            msg += f"   ✅ Рекомендую открыть LONG по Сберу (SBER) по цене {sber_data['price']:.2f} ₽\n\n"
+        else:
+            msg += f"   ✅ Рекомендую открыть SHORT по Сберу (SBER) по цене {sber_data['price']:.2f} ₽\n\n"
     else:
         msg += f"⚪ СБЕР: НЕТ СИГНАЛА\n"
         msg += f"   Цена: {sber_data['price']:.2f} | ADX: {sber_data['adx']:.1f}\n"
@@ -946,57 +981,41 @@ async def btn_emergency_snapshot(m):
     
     if signals:
         signals.sort(key=lambda x: x['adx'], reverse=True)
-        msg += f"📊 СИГНАЛЫ ПО ОСТАЛЬНЫМ ({len(signals)})\n"
-        msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += f"📊 СИГНАЛЫ ПО ОСТАЛЬНЫМ ({len(signals)})\n\n"
         for s in signals:
             data = s['data']
             emoji = "🟢" if s['signal'] == 'LONG' else "🔴"
             direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
             msg += f"{emoji} {data['name']} ({s['ticker']}) | {direction} | ADX {data['adx']}\n"
-            msg += f"   💡 /open {s['ticker']} {s['signal']} {data['price']:.2f}\n"
+            if s['signal'] == 'LONG':
+                msg += f"   ✅ Рекомендую открыть LONG по {data['name']} ({s['ticker']}) по цене {data['price']:.2f} ₽\n\n"
+            else:
+                msg += f"   ✅ Рекомендую открыть SHORT по {data['name']} ({s['ticker']}) по цене {data['price']:.2f} ₽\n\n"
     else:
         msg += f"⚪ СИГНАЛОВ ПО ОСТАЛЬНЫМ НЕТ\n"
     
-    msg += f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"🤖 Срез выполнен вручную"
+    msg += f"\n🤖 Срез выполнен вручную"
     
     await m.answer(msg, parse_mode='HTML')
     gc.collect()
 
 @dp.message_handler(lambda msg: msg.text.upper() in ALL_TICKERS)
-async def chart(m):
+async def info_by_ticker(m):
     ticker = m.text.upper()
-    msg = await m.answer(f"📈 График {TICKERS[ticker]['name']}...")
-    df = await data_fetcher.fetch_candles_daily(ticker, 100)
-    if df is None:
-        await msg.edit_text("Нет данных")
-        return
+    msg = await m.answer(f"📊 Загружаю данные по {TICKERS[ticker]['name']}...")
     
-    plt.figure(figsize=(12,5))
-    plt.plot(df['date'], df['close'], 'b-', label='Цена')
-    if len(df) >= 18:
-        plt.plot(df['date'], df['close'].rolling(18).mean(), 'g--', label='MA18')
-    if len(df) >= 50:
-        plt.plot(df['date'], df['close'].rolling(50).mean(), 'r--', label='MA50')
-    plt.title(TICKERS[ticker]['name'])
-    plt.grid()
-    buf = BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    plt.close()
+    info_msg, error = await get_asset_info(ticker)
     
-    await msg.delete()
-    await m.answer_photo(buf)
+    if error:
+        await msg.edit_text(error)
+    else:
+        await msg.delete()
+        await m.answer(info_msg, parse_mode='HTML')
     
-    plt.close('all')
     gc.collect()
 
-# === ВЕБ-ДАШБОРД (ОТКЛЮЧЁН ДЛЯ ЭКОНОМИИ ПАМЯТИ) ===
-# Функции dashboard, moex_health, web_server оставлены в коде,
-# но не запускаются в main(). При необходимости можно раскомментировать.
-
+# === ВЕБ-ДАШБОРД (ОТКЛЮЧЁН) ===
 async def dashboard(req):
-    # Заглушка: возвращает простую страницу вместо тяжёлого дашборда
     return web.Response(text="Дашборд отключён для экономии памяти. Работает Telegram-бот.", content_type='text/html')
 
 async def moex_health(req):
@@ -1009,24 +1028,6 @@ async def moex_health(req):
 
 async def web_server():
     # Веб-сервер отключён для экономии памяти
-    # При необходимости раскомментировать:
-    """
-    try:
-        app = web.Application()
-        app.router.add_get('/health', lambda req: web.Response(text="OK"))
-        app.router.add_get('/health/moex', moex_health)
-        app.router.add_get('/dashboard', dashboard)
-        app.router.add_get('/', dashboard)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        
-        port = int(os.environ.get('PORT', 10000))
-        site = web.TCPSite(runner, '0.0.0.0', port)
-        await site.start()
-        logger.info(f"🌐 Веб-сервер запущен на порту {port}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка запуска веб-сервера: {e}")
-    """
     logger.info("🌐 Веб-сервер отключён для экономии памяти")
     return
 
@@ -1034,7 +1035,6 @@ async def web_server():
 async def main():
     init_db()
     asyncio.create_task(data_fetcher.healthcheck_moex())
-    # asyncio.create_task(web_server())  # ОТКЛЮЧЁН для экономии памяти
     
     tasks = [
         asyncio.create_task(daily_loop()),
@@ -1101,9 +1101,10 @@ async def run_bot_with_retry():
 if __name__ == "__main__":
     print("=" * 50)
     print("АНАЛИТИК | ОПТИМИЗИРОВАННАЯ ВЕРСИЯ")
+    print("Сбер: сигналы каждый час | Остальные: только при сигнале")
+    print("Кнопка «Информация» — данные по активу без графика")
+    print("Срочный срез — с рекомендациями вместо команд")
     print("Дашборд отключён для экономии памяти")
-    print("Сбер: каждый час | Остальные: только при сигнале")
-    print("Луна: уведомления за 3 дня")
     print(f"Капитал: {STRATEGY['CAPITAL']:,} ₽ | Размер позиции: {STRATEGY['POSITION_SIZE']*100:.0f}%")
     print("=" * 50)
     
