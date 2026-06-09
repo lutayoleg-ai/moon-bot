@@ -12,13 +12,18 @@ import ssl
 import certifi
 import warnings
 import os
-from aiohttp import web
+import gc
+import matplotlib
+matplotlib.use('Agg')  # Экономия памяти: отключаем GUI
 import matplotlib.pyplot as plt
 from io import BytesIO
 import sqlite3
 import signal
 
 warnings.filterwarnings('ignore')
+
+# === ОГРАНИЧЕНИЕ ПАМЯТИ ===
+os.environ['MPLCONFIGDIR'] = '/tmp/matplotlib'  # Временная папка для кэша
 
 # === ТОКЕН ===
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -193,6 +198,11 @@ def save_daily_summary(date, summary):
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO daily_summary (date, summary) VALUES (?, ?)", (date, summary))
 
+def clean_old_trades(days=30):
+    """Очистка старых сделок для экономии памяти"""
+    with sqlite3.connect('bot_data.db') as conn:
+        conn.execute("DELETE FROM trades WHERE date < datetime('now', ?)", (f'-{days} days',))
+
 # === MOEX ===
 class DataFetcher:
     moex_last_success = None
@@ -229,13 +239,8 @@ class DataFetcher:
                                         DataFetcher.moex_error_count = 0
                                         DataFetcher.moex_last_success = datetime.now()
                                         return p
-                                    else:
-                                        logger.warning(f"Цена {p} вне диапазона для {ticker}")
-                                        return None
-                                except (ValueError, TypeError) as e:
-                                    logger.error(f"Ошибка преобразования цены {ticker}: {e}")
-                                    return None
-            logger.warning(f"Нет данных о цене для {ticker}")
+                                except (ValueError, TypeError):
+                                    pass
             return None
         except asyncio.TimeoutError:
             logger.error(f"Таймаут get_price({ticker})")
@@ -275,8 +280,6 @@ class DataFetcher:
                     if len(records) >= 5:
                         df = pd.DataFrame(records).sort_values('date').reset_index(drop=True)
                         return df
-            
-            logger.warning(f"Недостаточно данных для {ticker}, получено {len(rows) if rows else 0} строк")
             return None
         except asyncio.TimeoutError:
             logger.error(f"Таймаут fetch_candles_daily({ticker})")
@@ -289,10 +292,9 @@ class DataFetcher:
         while True:
             try:
                 price = await self.get_price("SBER")
-                if price is not None:
-                    if DataFetcher.moex_error_count >= 10:
-                        logger.info("✅ MOEX снова доступен")
-                        DataFetcher.moex_error_count = 0
+                if price is not None and DataFetcher.moex_error_count >= 10:
+                    logger.info("✅ MOEX снова доступен")
+                    DataFetcher.moex_error_count = 0
                 elif DataFetcher.moex_error_count >= 10:
                     logger.critical("MOEX недоступен более 30 минут!")
             except Exception as e:
@@ -368,7 +370,6 @@ async def get_signal_for_ticker(ticker):
     price = await data_fetcher.get_price(ticker)
     
     if df is None or price is None or price <= 0:
-        logger.warning(f"Нет данных для {ticker}")
         return None, None, "Нет данных от MOEX"
     
     trend = get_trend(df)
@@ -504,6 +505,8 @@ async def check_and_send_all_signals():
             last_signal_sent[s['ticker']] = f"{s['signal']}_{int(s['data']['price'])}"
     except Exception as e:
         logger.error(f"Ошибка отправки: {e}")
+    
+    gc.collect()  # Принудительный сбор мусора после отправки
 
 async def send_sber_hourly():
     global positions, daily_pnl
@@ -611,6 +614,8 @@ async def send_sber_hourly():
         await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
     except Exception as e:
         logger.error(f"Ошибка отправки: {e}")
+    
+    gc.collect()
 
 async def reset_daily_pnl():
     global daily_pnl, last_reset_date
@@ -694,6 +699,7 @@ async def daily_loop():
         now = datetime.now(pytz.timezone('Europe/Moscow'))
         if now.hour == 10 and now.minute < 5:
             await daily_lunar_summary()
+            clean_old_trades(30)  # Очистка БД раз в день
         await asyncio.sleep(60)
 
 async def sber_hourly_loop():
@@ -753,7 +759,7 @@ async def start_cmd(m):
         "   /close — закрыть позицию\n"
         "   /balance — статистика\n"
         "   /tickers — список всех тикеров\n\n"
-        "🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard",
+        "🌐 Дашборд: https://moon-bot-55tl.onrender.com/dashboard (может быть недоступен при экономии памяти)",
         reply_markup=keyboard, parse_mode='HTML')
 
 @dp.message_handler(commands=['tickers'])
@@ -786,6 +792,7 @@ async def status_cmd(m):
         msg += f"\n📌 ПОЗИЦИЯ: НЕТ\n"
     msg += f"\n📅 Дневной P&L: {'+' if daily_pnl >= 0 else ''}{daily_pnl:.2f}%"
     await m.answer(msg, parse_mode='HTML')
+    gc.collect()
 
 @dp.message_handler(commands=['open'])
 async def open_cmd(m):
@@ -954,6 +961,7 @@ async def btn_emergency_snapshot(m):
     msg += f"🤖 Срез выполнен вручную"
     
     await m.answer(msg, parse_mode='HTML')
+    gc.collect()
 
 @dp.message_handler(lambda msg: msg.text.upper() in ALL_TICKERS)
 async def chart(m):
@@ -963,6 +971,7 @@ async def chart(m):
     if df is None:
         await msg.edit_text("Нет данных")
         return
+    
     plt.figure(figsize=(12,5))
     plt.plot(df['date'], df['close'], 'b-', label='Цена')
     if len(df) >= 18:
@@ -975,136 +984,21 @@ async def chart(m):
     plt.savefig(buf, format='png')
     buf.seek(0)
     plt.close()
+    
     await msg.delete()
     await m.answer_photo(buf)
+    
+    plt.close('all')
+    gc.collect()
 
-# === ВЕБ-ДАШБОРД ===
+# === ВЕБ-ДАШБОРД (ОТКЛЮЧЁН ДЛЯ ЭКОНОМИИ ПАМЯТИ) ===
+# Функции dashboard, moex_health, web_server оставлены в коде,
+# но не запускаются в main(). При необходимости можно раскомментировать.
+
 async def dashboard(req):
-    try:
-        tr = await get_all_trends()
-    except Exception as e:
-        logger.error(f"Ошибка get_all_trends: {e}")
-        tr = {}
-    
-    ph, _, next_full, next_new = get_lunar_info()
-    now = datetime.now(pytz.timezone('Europe/Moscow'))
-    long_count = sum(1 for d in tr.values() if d.get('trend') == 'бычий')
-    short_count = sum(1 for d in tr.values() if d.get('trend') == 'медвежий')
-    side_count = sum(1 for d in tr.values() if d.get('trend') == 'боковик')
-    total_count = long_count + short_count + side_count
-    short_percent = round((short_count / total_count) * 100, 1) if total_count else 0
-    long_percent = round((long_count / total_count) * 100, 1) if total_count else 0
-    sentiment_color = "#f87171" if short_count > long_count else "#4ade80" if long_count > short_count else "#facc15"
-    
-    rows = ""
-    tickers_names = []
-    long_returns = []
-    short_returns = []
-    for ticker, data in tr.items():
-        price = f"{data.get('price', 0):.2f}" if data.get('price') else "—"
-        if data.get('trend') == 'бычий':
-            trend_class = "trend-bull"
-            trend_text = "🟢 БЫЧИЙ"
-        elif data.get('trend') == 'медвежий':
-            trend_class = "trend-bear"
-            trend_text = "🔴 МЕДВЕЖИЙ"
-        else:
-            trend_class = "trend-neutral"
-            trend_text = "⚪ БОКОВИК"
-        rows += f"<tr><td style='font-weight:500;'>{data.get('name', ticker)}</td><td class='ticker-cell'><b>{ticker}</b></td><td class='price-cell'><b>{price}</b> ₽</td><td class='{trend_class}'>{trend_text}</td><td class='bull'>+{data.get('return_bull', 0):.2f}%</td><td class='bear'>+{data.get('return_bear', 0):.2f}%</td></tr>"
-        tickers_names.append(data.get('name', ticker))
-        long_returns.append(data.get('return_bull', 0))
-        short_returns.append(data.get('return_bear', 0))
-    
-    html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>АНАЛИТИК</title>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ background: #0a0c15; font-family: system-ui, sans-serif; padding: 24px; color: #e2e8f0; }}
-        .container {{ max-width: 1400px; margin: 0 auto; }}
-        .header {{ background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); border-radius: 28px; padding: 28px 32px; margin-bottom: 32px; border: 1px solid #334155; }}
-        .header h1 {{ font-size: 2rem; font-weight: 700; color: #bae6fd; }}
-        .lunar-info {{ display: flex; gap: 20px; flex-wrap: wrap; margin-top: 16px; color: #94a3b8; }}
-        .lunar-badge {{ background: #1e293b; padding: 6px 14px; border-radius: 40px; font-size: 0.85rem; border-left: 3px solid #facc15; }}
-        .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 20px; margin-bottom: 32px; }}
-        .stat-card {{ background: #111827; border-radius: 24px; padding: 20px; text-align: center; border: 1px solid #2d3a4e; }}
-        .stat-value {{ font-size: 2.5rem; font-weight: 800; }}
-        .stat-label {{ font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; color: #94a3b8; margin-top: 10px; }}
-        .bull {{ color: #4ade80; }} .bear {{ color: #f87171; }} .neutral {{ color: #facc15; }}
-        .charts-row {{ display: flex; flex-wrap: wrap; gap: 24px; margin-bottom: 32px; }}
-        .chart-box {{ flex: 1; min-width: 280px; background: #0f172a; border-radius: 24px; padding: 20px; border: 1px solid #2d3a4e; }}
-        .chart-box h3 {{ font-size: 1.1rem; margin-bottom: 16px; }}
-        canvas {{ max-height: 260px; width: 100%; }}
-        .table-wrapper {{ overflow-x: auto; border-radius: 24px; background: #0f172a; border: 1px solid #2d3a4e; }}
-        table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
-        th {{ background: #1e293b; padding: 14px 10px; text-align: left; border-bottom: 1px solid #334155; }}
-        td {{ padding: 12px 10px; border-bottom: 1px solid #1e293b; }}
-        tr:hover td {{ background-color: rgba(30, 41, 59, 0.5); }}
-        .trend-bull {{ color: #4ade80; font-weight: 600; }} .trend-bear {{ color: #f87171; font-weight: 600; }} .trend-neutral {{ color: #facc15; font-weight: 600; }}
-        .ticker-cell {{ font-family: monospace; font-weight: 600; }}
-        .price-cell {{ font-weight: 700; color: #facc15; }}
-        .footer-note {{ margin-top: 28px; text-align: center; font-size: 0.75rem; color: #5b6e8c; border-top: 1px solid #1e293b; padding-top: 20px; }}
-        @media (max-width: 700px) {{ body {{ padding: 16px; }} .stat-value {{ font-size: 1.8rem; }} th, td {{ font-size: 0.7rem; padding: 6px 4px; }} }}
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="header">
-        <h1>📊 АНАЛИТИК</h1>
-        <div class="lunar-info">
-            <span>🗓️ {now.strftime('%d.%m.%Y %H:%M')}</span>
-            <span class="lunar-badge">🌙 {ph.upper()}</span>
-            <span class="lunar-badge">🌕 Полнолуние: {next_full.strftime('%d.%m.%Y') if next_full else '—'}</span>
-            <span class="lunar-badge">🌑 Новолуние: {next_new.strftime('%d.%m.%Y') if next_new else '—'}</span>
-        </div>
-    </div>
-    <div class="stats-grid">
-        <div class="stat-card"><div class="stat-value bull">{long_count}</div><div class="stat-label">🟢 LONG</div></div>
-        <div class="stat-card"><div class="stat-value bear">{short_count}</div><div class="stat-label">🔴 SHORT</div></div>
-        <div class="stat-card"><div class="stat-value neutral">{side_count}</div><div class="stat-label">⚪ БОКОВИК</div></div>
-        <div class="stat-card"><div class="stat-value" style="color: {sentiment_color};">{short_percent}%</div><div class="stat-label">📉 SHORT %</div></div>
-        <div class="stat-card"><div class="stat-value" style="color: #60a5fa;">{long_percent}%</div><div class="stat-label">📈 LONG %</div></div>
-        <div class="stat-card"><div class="stat-value" style="color: #c084fc;">{total_count}</div><div class="stat-label">🏷️ ВСЕГО</div></div>
-    </div>
-    <div class="charts-row">
-        <div class="chart-box"><h3>📊 РАСПРЕДЕЛЕНИЕ ТРЕНДОВ</h3><canvas id="trendPieChart"></canvas></div>
-        <div class="chart-box"><h3>📊 ПОТЕНЦИАЛЬНАЯ ДОХОДНОСТЬ (ТОП-10)</h3><canvas id="returnBarChart"></canvas></div>
-    </div>
-    <div class="table-wrapper">
-        <table>
-            <thead><tr><th>Актив</th><th>Тикер</th><th>💰 Цена</th><th>📈 Тренд</th><th>🚀 LONG</th><th>📉 SHORT</th></tr></thead>
-            <tbody>{rows}</tbody>
-        </table>
-    </div>
-    <div class="footer-note">🤖 Сбер: сигналы каждый час | Остальные: только при сигнале</div>
-</div>
-<script>
-    new Chart(document.getElementById('trendPieChart'), {{
-        type: 'doughnut',
-        data: {{ labels: ['LONG', 'SHORT', 'БОКОВИК'], datasets: [{{ data: [{long_count}, {short_count}, {side_count}], backgroundColor: ['#4ade80', '#f87171', '#facc15'], borderWidth: 0 }}] }},
-        options: {{ responsive: true, maintainAspectRatio: true, plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#cbd5e6' }} }} }} }}
-    }});
-    new Chart(document.getElementById('returnBarChart'), {{
-        type: 'bar',
-        data: {{ labels: {tickers_names[:10]}, datasets: [
-            {{ label: 'LONG потенциал (%)', data: {long_returns[:10]}, backgroundColor: '#4ade8066', borderColor: '#4ade80', borderWidth: 1 }},
-            {{ label: 'SHORT потенциал (%)', data: {short_returns[:10]}, backgroundColor: '#f8717166', borderColor: '#f87171', borderWidth: 1 }}
-        ] }},
-        options: {{ responsive: true, maintainAspectRatio: true, plugins: {{ legend: {{ position: 'top', labels: {{ color: '#cbd5e6' }} }} }}, scales: {{ y: {{ grid: {{ color: '#2d3a4e' }}, ticks: {{ color: '#cbd5e6' }} }}, x: {{ ticks: {{ color: '#cbd5e6', rotation: 35, autoSkip: true }} }} }} }}
-    }});
-</script>
-</body>
-</html>
-    """
-    return web.Response(text=html, content_type='text/html')
+    # Заглушка: возвращает простую страницу вместо тяжёлого дашборда
+    return web.Response(text="Дашборд отключён для экономии памяти. Работает Telegram-бот.", content_type='text/html')
 
-# === WEB СЕРВЕР ===
 async def moex_health(req):
     status = "ok" if DataFetcher.moex_error_count < 5 else "degraded"
     return web.json_response({
@@ -1114,6 +1008,9 @@ async def moex_health(req):
     })
 
 async def web_server():
+    # Веб-сервер отключён для экономии памяти
+    # При необходимости раскомментировать:
+    """
     try:
         app = web.Application()
         app.router.add_get('/health', lambda req: web.Response(text="OK"))
@@ -1129,12 +1026,15 @@ async def web_server():
         logger.info(f"🌐 Веб-сервер запущен на порту {port}")
     except Exception as e:
         logger.error(f"❌ Ошибка запуска веб-сервера: {e}")
+    """
+    logger.info("🌐 Веб-сервер отключён для экономии памяти")
+    return
 
 # === ЗАПУСК ===
 async def main():
     init_db()
     asyncio.create_task(data_fetcher.healthcheck_moex())
-    asyncio.create_task(web_server())
+    # asyncio.create_task(web_server())  # ОТКЛЮЧЁН для экономии памяти
     
     tasks = [
         asyncio.create_task(daily_loop()),
@@ -1200,12 +1100,11 @@ async def run_bot_with_retry():
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("АНАЛИТИК | СИГНАЛЫ ПО ВСЕМ 17 АКТИВАМ")
+    print("АНАЛИТИК | ОПТИМИЗИРОВАННАЯ ВЕРСИЯ")
+    print("Дашборд отключён для экономии памяти")
     print("Сбер: каждый час | Остальные: только при сигнале")
-    print("Луна: уведомления за 3 дня до ПОЛНОЛУНИЯ и НОВОЛУНИЯ")
-    print("Стоп 6% | Тейк 12% | ADX > 20")
+    print("Луна: уведомления за 3 дня")
     print(f"Капитал: {STRATEGY['CAPITAL']:,} ₽ | Размер позиции: {STRATEGY['POSITION_SIZE']*100:.0f}%")
-    print("🚨 Срочный срез — кнопка в меню")
     print("=" * 50)
     
     asyncio.run(run_bot_with_retry())
