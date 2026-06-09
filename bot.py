@@ -152,6 +152,57 @@ def get_days_until_new_moon():
             return (dt - now).days
     return None
 
+# === ЛУННАЯ СТРАТЕГИЯ ПО СИСТЕМЕ ДМИТРИЕВА ===
+async def get_lunar_signal():
+    """Возвращает сигнал по системе Дмитриева (полнолуние/новолуние)"""
+    msk = pytz.timezone('Europe/Moscow')
+    now = datetime.now(msk)
+    
+    # Находим ближайшее полнолуние
+    next_full = None
+    next_full_date = None
+    for date_str, time_str in LUNAR_PHASES["full_moons"]:
+        dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
+        if dt > now:
+            next_full = dt
+            break
+    
+    # Находим ближайшее новолуние
+    next_new = None
+    for date_str, time_str in LUNAR_PHASES["new_moons"]:
+        dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
+        if dt > now:
+            next_new = dt
+            break
+    
+    # Проверяем, сегодня ли полнолуние
+    for date_str, time_str in LUNAR_PHASES["full_moons"]:
+        dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
+        if dt.date() == now.date():
+            return "full_today", dt, next_full, next_new
+    
+    # Проверяем, в зоне 3 дней до полнолуния
+    if next_full:
+        days_until_full = (next_full - now).days
+        if 1 <= days_until_full <= 3:
+            return "prepare", next_full, next_full, next_new
+    
+    # Проверяем, в зоне 5 дней после полнолуния
+    for date_str, time_str in LUNAR_PHASES["full_moons"]:
+        dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
+        if dt < now:
+            days_after = (now - dt).days
+            if 1 <= days_after <= 5:
+                return "hold", dt, next_full, next_new
+    
+    # Проверяем, сегодня ли новолуние
+    for date_str, time_str in LUNAR_PHASES["new_moons"]:
+        dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
+        if dt.date() == now.date():
+            return "new_today", dt, next_full, next_new
+    
+    return "none", None, next_full, next_new
+
 # === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
 positions = {}
 positions_lock = asyncio.Lock()
@@ -344,64 +395,40 @@ def calc_trend_for_ticker(df):
     spread = abs(ma18 - ma50) / ma50 * 100
     return "боковик" if spread < 0.7 else ("бычий" if ma18 > ma50 else "медвежий")
 
-# === РАСЧЁТ P&L ===
-def calculate_pnl_percent(entry_price, exit_price, direction):
-    position_value = STRATEGY['CAPITAL'] * STRATEGY['POSITION_SIZE']
-    shares = position_value / entry_price
-    
-    if direction == 'long':
-        pnl_rub = (exit_price - entry_price) * shares
-    else:
-        pnl_rub = (entry_price - exit_price) * shares
-    
-    commission_rub = (entry_price * shares * COMMISSION) + (exit_price * shares * COMMISSION)
-    pnl_rub_net = pnl_rub - commission_rub
-    
-    pnl_percent = (pnl_rub_net / STRATEGY['CAPITAL']) * 100
-    commission_percent = (commission_rub / STRATEGY['CAPITAL']) * 100
-    
-    return pnl_percent, commission_percent
-
 # === ИНФОРМАЦИЯ ПО АКТИВУ (без графика) ===
 async def get_asset_info(ticker):
-    """Возвращает текстовую информацию по активу (MA18, MA50, ADX, рекомендация)"""
     df = await data_fetcher.fetch_candles_daily(ticker, 100)
     price = await data_fetcher.get_price(ticker)
     
     if df is None or price is None or price <= 0:
         return None, "Нет данных от MOEX"
     
-    # Расчёт индикаторов для информации
     ma18 = df['close'].rolling(18).mean().iloc[-1] if len(df) >= 18 else None
     ma50 = df['close'].rolling(50).mean().iloc[-1] if len(df) >= 50 else None
     adx = calculate_adx(df)
     trend = get_trend(df)
     
-    # Определяем рекомендацию
     recommendation = None
     if trend == "bullish" and adx > STRATEGY['ADX_THRESHOLD']:
-        recommendation = f"Рекомендую открыть LONG по {TICKERS[ticker]['name']} ({ticker}) по цене {price:.2f} ₽"
+        recommendation = "✅ Рекомендую открыть LONG"
     elif trend == "bearish" and adx > STRATEGY['ADX_THRESHOLD']:
-        recommendation = f"Рекомендую открыть SHORT по {TICKERS[ticker]['name']} ({ticker}) по цене {price:.2f} ₽"
+        recommendation = "✅ Рекомендую открыть SHORT"
     
     adx_status = "тренд" if adx > STRATEGY['ADX_THRESHOLD'] else "флет"
-    trend_ru = "БЫЧИЙ 🟢" if trend == "bullish" else "МЕДВЕЖИЙ 🔴" if trend == "bearish" else "НЕЙТРАЛЬНО"
     
-    # Формируем сообщение
-    msg = f"📊 {TICKERS[ticker]['name']} ({ticker})\n"
-    msg += f"💰 Текущая: {price:.2f} ₽\n"
+    msg = f"📊 {TICKERS[ticker]['name']} ({ticker}) 💰 {price:.2f} ₽\n"
     if ma18 and ma50:
         msg += f"📈 MA18: {ma18:.2f} | MA50: {ma50:.2f}\n"
     msg += f"📊 ADX: {adx:.1f} ({adx_status})\n"
     
     if recommendation:
-        msg += f"✅ {recommendation}"
+        msg += recommendation
     else:
-        msg += "❌ Сигналов нет, ожидайте"
+        msg += "❌ Сигналов нет"
     
     return msg, None
 
-# === ОТПРАВКА СИГНАЛОВ (с рекомендацией вместо /open) ===
+# === ОТПРАВКА СИГНАЛОВ ===
 async def check_and_send_all_signals():
     global last_signal_sent
     
@@ -439,9 +466,9 @@ async def check_and_send_all_signals():
         direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
         msg += f"{emoji} {data['name']} ({s['ticker']}) | {direction} | ADX {data['adx']}\n"
         if s['signal'] == 'LONG':
-            msg += f"   ✅ Рекомендую открыть LONG по {data['name']} ({s['ticker']}) по цене {data['price']:.2f} ₽\n\n"
+            msg += f"   ✅ Рекомендую открыть LONG\n\n"
         else:
-            msg += f"   ✅ Рекомендую открыть SHORT по {data['name']} ({s['ticker']}) по цене {data['price']:.2f} ₽\n\n"
+            msg += f"   ✅ Рекомендую открыть SHORT\n\n"
     
     if len(signals) > top_count:
         msg += f"ОСТАЛЬНЫЕ {len(signals) - top_count} СИГНАЛОВ:\n\n"
@@ -452,9 +479,9 @@ async def check_and_send_all_signals():
             direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
             msg += f"{emoji} {data['name']} ({s['ticker']}) | {direction} | ADX {data['adx']}\n"
             if s['signal'] == 'LONG':
-                msg += f"   ✅ Рекомендую открыть LONG по {data['name']} ({s['ticker']}) по цене {data['price']:.2f} ₽\n\n"
+                msg += f"   ✅ Рекомендую открыть LONG\n\n"
             else:
-                msg += f"   ✅ Рекомендую открыть SHORT по {data['name']} ({s['ticker']}) по цене {data['price']:.2f} ₽\n\n"
+                msg += f"   ✅ Рекомендую открыть SHORT\n\n"
     
     msg += f"\n🤖 Сигналы сгенерированы в {now.strftime('%H:%M')}"
     
@@ -521,9 +548,9 @@ async def send_sber_hourly():
         msg += f"🤖 Сигнал сгенерирован в {now.strftime('%H:%M')}\n"
         
         if signal == 'LONG':
-            msg += f"✅ Рекомендую открыть LONG по Сберу (SBER) по цене {price:.2f} ₽"
+            msg += f"✅ Рекомендую открыть LONG"
         else:
-            msg += f"✅ Рекомендую открыть SHORT по Сберу (SBER) по цене {price:.2f} ₽"
+            msg += f"✅ Рекомендую открыть SHORT"
     else:
         msg = f"📊 СБЕР - МОНИТОРИНГ {now.strftime('%H:%M')}\n\n"
         msg += f"💰 Цена: {price:.2f} ₽\n"
@@ -669,6 +696,24 @@ async def get_sber_signal_detailed():
             reasons.append("Условия для входа не выполнены")
         return None, data, "\n".join(reasons)
 
+# === РАСЧЁТ P&L ===
+def calculate_pnl_percent(entry_price, exit_price, direction):
+    position_value = STRATEGY['CAPITAL'] * STRATEGY['POSITION_SIZE']
+    shares = position_value / entry_price
+    
+    if direction == 'long':
+        pnl_rub = (exit_price - entry_price) * shares
+    else:
+        pnl_rub = (entry_price - exit_price) * shares
+    
+    commission_rub = (entry_price * shares * COMMISSION) + (exit_price * shares * COMMISSION)
+    pnl_rub_net = pnl_rub - commission_rub
+    
+    pnl_percent = (pnl_rub_net / STRATEGY['CAPITAL']) * 100
+    commission_percent = (commission_rub / STRATEGY['CAPITAL']) * 100
+    
+    return pnl_percent, commission_percent
+
 # === ЛУННАЯ СТРАТЕГИЯ ===
 async def lunar_notify():
     global lunar_notified_days
@@ -716,7 +761,7 @@ async def daily_lunar_summary():
         txt += f"🌕 Полнолуние {nxt_full.strftime('%d.%m.%Y')}\n"
     if nxt_new:
         txt += f"🌑 Новолуние {nxt_new.strftime('%d.%m.%Y')}\n"
-    txt += f"🟢 LONG: {long_cnt}  🔴 SHORT: {short_cnt}\n💡 /status /balance"
+    txt += f"🟢 LONG: {long_cnt}  🔴 SHORT: {short_cnt}\n"
     save_daily_summary(today, txt)
     try:
         await bot.send_message(CHANNEL_ID, txt, parse_mode='Markdown')
@@ -776,138 +821,66 @@ async def start_cmd(m):
     await m.answer(
         "📊 АНАЛИТИК\n\n"
         "🔹 СБЕР (сигналы каждый час с 10:00 до 22:00)\n"
-        "   Стратегия: MA10/MA30 + ADX | Стоп 6% | Тейк 12%\n"
-        f"   Капитал: {STRATEGY['CAPITAL']:,} ₽ | Размер позиции: {STRATEGY['POSITION_SIZE']*100:.0f}%\n\n"
+        "   Стратегия: MA10/MA30 + ADX | Стоп 6% | Тейк 12%\n\n"
         "🔹 ОСТАЛЬНЫЕ 16 АКТИВОВ\n"
-        "   Проверяются каждый час, при сигнале присылается список\n\n"
+        "   Проверяются каждый час, при сигнале присылается список или актив\n\n"
         "🔹 ЛУННАЯ СТРАТЕГИЯ\n"
         "   Ежедневная сводка в 10:00 | Уведомления за 3 дня до полнолуния и новолуния\n\n"
-        "🔹 КОМАНДЫ:\n"
-        "   /status — состояние по Сберу\n"
-        "   /open SBER LONG 310 — открыть сделку\n"
-        "   /close — закрыть позицию\n"
-        "   /balance — статистика\n"
-        "   /tickers — список всех тикеров\n\n"
         "🔹 КНОПКИ:\n"
         "   🌙 Фазы Луны — информация о луне\n"
-        "   📊 Информация — данные по активу (введите тикер)\n"
+        "   📊 Информация — данные по всем 17 активам\n"
         "   📋 Тикеры — список тикеров\n"
-        "   🚨 Срочный срез — моментальный анализ всех 17 активов",
+        "   🚨 Срочный срез — моментальный анализ всех 17 активов\n\n"
+        "🔹 КОМАНДА:\n"
+        "   /луна — детальная лунная стратегия с сигналами по системе Дмитриева",
         reply_markup=keyboard, parse_mode='HTML')
 
-@dp.message_handler(commands=['tickers'])
-async def tickers_cmd(m):
-    await m.answer(get_tickers_list_text(), parse_mode='HTML')
-
-@dp.message_handler(commands=['status'])
-async def status_cmd(m):
-    price = await data_fetcher.get_price("SBER")
-    df = await data_fetcher.fetch_candles_daily("SBER", 100)
-    if price is None or df is None or price <= 0:
-        await m.answer("⚠️ Нет данных")
-        return
-    trend = get_trend(df)
-    adx = calculate_adx(df)
-    ma10 = df['close'].rolling(10).mean().iloc[-1]
-    ma30 = df['close'].rolling(30).mean().iloc[-1]
-    trend_ru = "БЫЧИЙ 🟢" if trend == "bullish" else "МЕДВЕЖИЙ 🔴" if trend == "bearish" else "БОКОВИК ⚪"
-    msg = f"📊 СБЕР - СТАТУС\n\n💰 Цена: {price:.2f} ₽\n"
-    msg += f"📈 Тренд: {trend_ru}\n📊 MA10: {ma10:.2f} | MA30: {ma30:.2f}\n📈 ADX: {adx:.1f}\n"
+@dp.message_handler(commands=['луна'])
+async def lunar_cmd(m):
+    signal_type, full_date, next_full, next_new = await get_lunar_signal()
+    now = datetime.now(pytz.timezone('Europe/Moscow'))
+    ph, _, _, _ = get_lunar_info()
     
-    async with positions_lock:
-        sber_pos = positions.get("SBER", {}).get('type')
-        sber_entry = positions.get("SBER", {}).get('entry_price') if sber_pos else None
+    # Определяем день лунного цикла (приблизительно)
+    new_moons = [msk.localize(datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M")) for d, t in LUNAR_PHASES["new_moons"]]
+    last_new = max([d for d in new_moons if d <= now], default=None)
+    lunar_day = (now - last_new).days if last_new else 0
     
-    if sber_pos and sber_entry:
-        pnl = (price - sber_entry) / sber_entry * 100 if sber_pos == 'long' else (sber_entry - price) / sber_entry * 100
-        msg += f"\n📌 ПОЗИЦИЯ: {sber_pos.upper()}\n   Вход: {sber_entry:.2f} ₽\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n"
+    msg = f"🌙 {ph.upper()} ({lunar_day} день)\n"
+    msg += f"📅 {now.strftime('%d.%m.%Y')}\n\n"
+    msg += f"📊 РЕКОМЕНДАЦИЯ ПО СИСТЕМЕ ДМИТРИЕВА:\n"
+    
+    if signal_type == "full_today":
+        msg += f"🔥 ТОЧКА ВХОДА\n\n"
+        msg += f"💡 Рекомендуется открывать LONG позиции сегодня"
+    elif signal_type == "prepare":
+        days = (next_full - now).days
+        msg += f"✅ СИГНАЛ: готовьтесь к входу\n\n"
+        msg += f"🌕 ПОЛНОЛУНИЕ: {next_full.strftime('%d.%m.%Y')} (через {days} дн.)\n\n"
+        msg += f"💡 Сигнал активен за 3 дня до полнолуния"
+    elif signal_type == "hold":
+        days_after = (now - full_date).days
+        msg += f"✅ СИГНАЛ: удерживайте позиции\n\n"
+        msg += f"🌕 ПОЛНОЛУНИЕ БЫЛО: {full_date.strftime('%d.%m.%Y')} ({days_after} дн. назад)\n\n"
+        msg += f"💡 Сигнал активен 5 дней после полнолуния"
+    elif signal_type == "new_today":
+        msg += f"🌑 НОВОЛУНИЕ\n\n"
+        msg += f"💡 Рекомендуется закрывать позиции, фиксировать прибыль"
     else:
-        msg += f"\n📌 ПОЗИЦИЯ: НЕТ\n"
-    msg += f"\n📅 Дневной P&L: {'+' if daily_pnl >= 0 else ''}{daily_pnl:.2f}%"
-    await m.answer(msg, parse_mode='HTML')
-    gc.collect()
-
-@dp.message_handler(commands=['open'])
-async def open_cmd(m):
-    global positions
+        msg += f"⏸ СИГНАЛА НЕТ\n\n"
+        if next_full:
+            days_until_full = (next_full - now).days
+            msg += f"❌ ПРИЧИНА: до полнолуния {days_until_full} дней (сигнал за 3 дня)"
+        else:
+            msg += f"❌ ПРИЧИНА: вне зоны сигналов\n"
     
-    parts = m.text.split()
-    if len(parts) != 4 or parts[2].upper() not in ['LONG', 'SHORT']:
-        await m.answer("📝 /open SBER LONG 310.50\nили\n📝 /open GAZP SHORT 180.20")
-        return
+    if next_full:
+        days_full = (next_full - now).days
+        msg += f"\n🌕 Следующее полнолуние: {next_full.strftime('%d.%m.%Y')} (через {days_full} дн.)"
+    if next_new:
+        days_new = (next_new - now).days
+        msg += f"\n🌑 Следующее новолуние: {next_new.strftime('%d.%m.%Y')} (через {days_new} дн.)"
     
-    ticker = parts[1].upper()
-    if ticker not in TICKERS:
-        await m.answer(f"❌ Тикер {ticker} не найден. Список: /tickers")
-        return
-    
-    async with positions_lock:
-        if ticker in positions and positions[ticker].get('type') is not None:
-            await m.answer(f"⚠️ Уже есть открытая позиция по {TICKERS[ticker]['name']}. Сначала закройте /close")
-            return
-        
-        direction = parts[2].upper()
-        try:
-            entry_price = float(parts[3])
-        except:
-            await m.answer("❌ Неверная цена")
-            return
-        
-        now = datetime.now(pytz.timezone('Europe/Moscow'))
-        if ticker not in positions:
-            positions[ticker] = {}
-        positions[ticker]['type'] = direction.lower()
-        positions[ticker]['entry_price'] = entry_price
-        positions[ticker]['entry_time'] = now
-        positions[ticker]['is_manual'] = True
-    
-    stop = entry_price * (1 - STRATEGY['STOP_LOSS']) if direction == 'LONG' else entry_price * (1 + STRATEGY['STOP_LOSS'])
-    take = entry_price * (1 + STRATEGY['TAKE_PROFIT']) if direction == 'LONG' else entry_price * (1 - STRATEGY['TAKE_PROFIT'])
-    msg = f"✅ Ручное открытие {direction} по {TICKERS[ticker]['name']} ({ticker})\n💰 Вход: {entry_price:.2f}\n🛑 Стоп: {stop:.2f}\n🎯 Тейк: {take:.2f}"
-    await m.answer(msg)
-
-@dp.message_handler(commands=['close'])
-async def close_cmd(m):
-    global positions, daily_pnl
-    
-    async with positions_lock:
-        active_ticker = None
-        active_pos = None
-        for ticker, pos in positions.items():
-            if pos.get('type') is not None:
-                active_ticker = ticker
-                active_pos = pos
-                break
-        
-        if not active_ticker or active_pos is None:
-            await m.answer("⚠️ Нет открытой позиции")
-            return
-    
-    price = await data_fetcher.get_price(active_ticker)
-    if not price or price <= 0:
-        await m.answer("⚠️ Нет цены")
-        return
-    
-    pnl_percent, commission_percent = calculate_pnl_percent(active_pos['entry_price'], price, active_pos['type'])
-    
-    async with positions_lock:
-        daily_pnl += pnl_percent
-        save_trade(active_ticker, active_pos['type'], active_pos['entry_price'], price, pnl_percent, commission_percent, active_pos.get('is_manual', False))
-        positions[active_ticker] = {'type': None, 'entry_price': None, 'entry_time': None, 'is_manual': False}
-    
-    msg = f"✅ Закрыто {active_pos['type'].upper()} по {TICKERS[active_ticker]['name']} ({active_ticker})\n💰 Вход: {active_pos['entry_price']:.2f}\n💰 Выход: {price:.2f}\n📊 P&L: {pnl_percent:+.2f}%\n💸 Комиссия: {commission_percent:.2f}%"
-    await m.answer(msg)
-
-@dp.message_handler(commands=['balance'])
-async def balance_cmd(m):
-    stats = get_stats()
-    price = await data_fetcher.get_price("SBER")
-    msg = f"📊 СТАТИСТИКА ПО СДЕЛКАМ\n\n"
-    msg += f"💰 Цена Сбера: {price:.2f} ₽\n\n" if price else ""
-    msg += f"📈 ОБЩАЯ\n   Всего сделок: {stats['total_trades']}\n"
-    msg += f"   Прибыльных: {stats['winning_trades']}\n   Убыточных: {stats['losing_trades']}\n"
-    msg += f"   Win Rate: {stats['win_rate']:.1f}%\n   Общий P&L: {stats['total_pnl']:+.2f}%\n"
-    msg += f"   Средний P&L: {stats['avg_pnl']:+.2f}%\n\n📅 СЕГОДНЯ\n   P&L: {daily_pnl:+.2f}%"
     await m.answer(msg, parse_mode='HTML')
 
 # === КНОПКИ ===
@@ -934,7 +907,44 @@ async def btn_lunar(m):
 
 @dp.message_handler(lambda msg: msg.text == "📊 Информация")
 async def btn_info(m):
-    await m.answer("Введите тикер из списка:\n" + ", ".join(ALL_TICKERS))
+    await m.answer("📊 Загружаю данные по всем 17 активам...")
+    
+    all_info = []
+    for ticker in ALL_TICKERS:
+        info_msg, error = await get_asset_info(ticker)
+        if info_msg:
+            all_info.append(info_msg)
+        await asyncio.sleep(0.1)  # небольшая задержка, чтобы не перегружать MOEX
+    
+    if all_info:
+        full_msg = "\n\n".join(all_info)
+        # Если сообщение слишком длинное, разбиваем на части
+        if len(full_msg) > 4000:
+            parts = []
+            current_part = ""
+            for info in all_info:
+                if len(current_part) + len(info) + 2 > 4000:
+                    parts.append(current_part)
+                    current_part = info
+                else:
+                    if current_part:
+                        current_part += "\n\n" + info
+                    else:
+                        current_part = info
+            if current_part:
+                parts.append(current_part)
+            
+            for i, part in enumerate(parts):
+                if i == 0:
+                    await m.answer(part, parse_mode='HTML')
+                else:
+                    await m.answer(part, parse_mode='HTML')
+        else:
+            await m.answer(full_msg, parse_mode='HTML')
+    else:
+        await m.answer("⚠️ Нет данных от MOEX")
+    
+    gc.collect()
 
 @dp.message_handler(lambda msg: msg.text == "📋 Тикеры")
 async def btn_tickers(m):
@@ -971,9 +981,9 @@ async def btn_emergency_snapshot(m):
         msg += f"   Цена: {sber_data['price']:.2f} | ADX: {sber_data['adx']}\n"
         msg += f"   🛑 {sber_data['stop']:.2f} | 🎯 {sber_data['target']:.2f}\n"
         if sber_signal == 'LONG':
-            msg += f"   ✅ Рекомендую открыть LONG по Сберу (SBER) по цене {sber_data['price']:.2f} ₽\n\n"
+            msg += f"   ✅ Рекомендую открыть LONG\n\n"
         else:
-            msg += f"   ✅ Рекомендую открыть SHORT по Сберу (SBER) по цене {sber_data['price']:.2f} ₽\n\n"
+            msg += f"   ✅ Рекомендую открыть SHORT\n\n"
     else:
         msg += f"⚪ СБЕР: НЕТ СИГНАЛА\n"
         msg += f"   Цена: {sber_data['price']:.2f} | ADX: {sber_data['adx']:.1f}\n"
@@ -988,30 +998,15 @@ async def btn_emergency_snapshot(m):
             direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
             msg += f"{emoji} {data['name']} ({s['ticker']}) | {direction} | ADX {data['adx']}\n"
             if s['signal'] == 'LONG':
-                msg += f"   ✅ Рекомендую открыть LONG по {data['name']} ({s['ticker']}) по цене {data['price']:.2f} ₽\n\n"
+                msg += f"   ✅ Рекомендую открыть LONG\n\n"
             else:
-                msg += f"   ✅ Рекомендую открыть SHORT по {data['name']} ({s['ticker']}) по цене {data['price']:.2f} ₽\n\n"
+                msg += f"   ✅ Рекомендую открыть SHORT\n\n"
     else:
         msg += f"⚪ СИГНАЛОВ ПО ОСТАЛЬНЫМ НЕТ\n"
     
     msg += f"\n🤖 Срез выполнен вручную"
     
     await m.answer(msg, parse_mode='HTML')
-    gc.collect()
-
-@dp.message_handler(lambda msg: msg.text.upper() in ALL_TICKERS)
-async def info_by_ticker(m):
-    ticker = m.text.upper()
-    msg = await m.answer(f"📊 Загружаю данные по {TICKERS[ticker]['name']}...")
-    
-    info_msg, error = await get_asset_info(ticker)
-    
-    if error:
-        await msg.edit_text(error)
-    else:
-        await msg.delete()
-        await m.answer(info_msg, parse_mode='HTML')
-    
     gc.collect()
 
 # === ВЕБ-ДАШБОРД (ОТКЛЮЧЁН) ===
@@ -1027,7 +1022,6 @@ async def moex_health(req):
     })
 
 async def web_server():
-    # Веб-сервер отключён для экономии памяти
     logger.info("🌐 Веб-сервер отключён для экономии памяти")
     return
 
@@ -1102,10 +1096,10 @@ if __name__ == "__main__":
     print("=" * 50)
     print("АНАЛИТИК | ОПТИМИЗИРОВАННАЯ ВЕРСИЯ")
     print("Сбер: сигналы каждый час | Остальные: только при сигнале")
-    print("Кнопка «Информация» — данные по активу без графика")
-    print("Срочный срез — с рекомендациями вместо команд")
+    print("Кнопка «Информация» — данные по всем 17 активам")
+    print("Срочный срез — с рекомендациями")
+    print("Команда /луна — лунная стратегия по системе Дмитриева")
     print("Дашборд отключён для экономии памяти")
-    print(f"Капитал: {STRATEGY['CAPITAL']:,} ₽ | Размер позиции: {STRATEGY['POSITION_SIZE']*100:.0f}%")
     print("=" * 50)
     
     asyncio.run(run_bot_with_retry())
