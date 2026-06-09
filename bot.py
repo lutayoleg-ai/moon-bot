@@ -17,7 +17,6 @@ import matplotlib.pyplot as plt
 from io import BytesIO
 import sqlite3
 import signal
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 warnings.filterwarnings('ignore')
 
@@ -37,12 +36,12 @@ STRATEGY = {
     'STOP_LOSS': 0.06,
     'TAKE_PROFIT': 0.12,
     'DAILY_LOSS_LIMIT': 0.03,
-    'CAPITAL': 100000,  # Фиксированный капитал 100 000 ₽
-    'POSITION_SIZE': 0.25  # 25% капитала на сделку (25 000 ₽)
+    'CAPITAL': 100000,
+    'POSITION_SIZE': 0.25
 }
 
-# Комиссия брокера: 0.3% на вход, 0.3% на выход
 COMMISSION = 0.003
+MOEX_TIMEOUT = 10  # секунд на запрос
 
 # === НАСТРОЙКА ЛОГИРОВАНИЯ ===
 logging.basicConfig(
@@ -153,7 +152,7 @@ def get_days_until_new_moon():
 positions = {}
 positions_lock = asyncio.Lock()
 last_signal_sent = {}
-daily_pnl = 0.0  # в процентах от капитала
+daily_pnl = 0.0
 last_reset_date = None
 lunar_notified_days = set()
 
@@ -194,17 +193,11 @@ def save_daily_summary(date, summary):
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO daily_summary (date, summary) VALUES (?, ?)", (date, summary))
 
-# === MOEX С RETRY И ЛОГИРОВАНИЕМ ===
+# === MOEX ===
 class DataFetcher:
     moex_last_success = None
     moex_error_count = 0
     
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
-        reraise=True
-    )
     async def _fetch_json(self, url, params=None):
         async with aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(ssl=ssl.create_default_context(cafile=certifi.where())),
@@ -214,17 +207,13 @@ class DataFetcher:
             async with session.get(url, params=params) as resp:
                 if resp.status != 200:
                     logger.warning(f"MOEX вернул {resp.status} для {url}")
-                    raise aiohttp.ClientResponseError(
-                        status=resp.status,
-                        message=f"HTTP {resp.status}",
-                        headers=resp.headers
-                    )
+                    raise Exception(f"HTTP {resp.status}")
                 return await resp.json()
     
     async def get_price(self, ticker):
         try:
             url = f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{ticker}.json"
-            data = await self._fetch_json(url)
+            data = await asyncio.wait_for(self._fetch_json(url), timeout=MOEX_TIMEOUT)
             
             md = data.get('marketdata', {})
             if md:
@@ -241,12 +230,16 @@ class DataFetcher:
                                         DataFetcher.moex_last_success = datetime.now()
                                         return p
                                     else:
-                                        logger.warning(f"Цена {p} вне допустимого диапазона для {ticker}")
+                                        logger.warning(f"Цена {p} вне диапазона для {ticker}")
                                         return None
                                 except (ValueError, TypeError) as e:
                                     logger.error(f"Ошибка преобразования цены {ticker}: {e}")
                                     return None
             logger.warning(f"Нет данных о цене для {ticker}")
+            return None
+        except asyncio.TimeoutError:
+            logger.error(f"Таймаут get_price({ticker})")
+            DataFetcher.moex_error_count += 1
             return None
         except Exception as e:
             logger.error(f"Ошибка get_price({ticker}): {type(e).__name__}: {e}")
@@ -260,7 +253,7 @@ class DataFetcher:
             url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json"
             params = {'from': start.strftime('%Y-%m-%d'), 'till': end.strftime('%Y-%m-%d'), 'interval': 24}
             
-            data = await self._fetch_json(url, params)
+            data = await asyncio.wait_for(self._fetch_json(url, params), timeout=MOEX_TIMEOUT)
             candles = data.get('candles', {})
             rows = candles.get('data', [])
             cols = candles.get('columns', [])
@@ -285,24 +278,25 @@ class DataFetcher:
             
             logger.warning(f"Недостаточно данных для {ticker}, получено {len(rows) if rows else 0} строк")
             return None
+        except asyncio.TimeoutError:
+            logger.error(f"Таймаут fetch_candles_daily({ticker})")
+            return None
         except Exception as e:
             logger.error(f"Ошибка fetch_candles_daily({ticker}): {type(e).__name__}: {e}")
             return None
     
-    async def healthcheck_moex(self, bot):
+    async def healthcheck_moex(self):
         while True:
             try:
                 price = await self.get_price("SBER")
                 if price is not None:
-                    if DataFetcher.moex_error_count >= 10 and CHANNEL_ID:
-                        await bot.send_message(CHANNEL_ID, "✅ MOEX снова доступен. Сигналы возобновлены.")
+                    if DataFetcher.moex_error_count >= 10:
+                        logger.info("✅ MOEX снова доступен")
+                        DataFetcher.moex_error_count = 0
                 elif DataFetcher.moex_error_count >= 10:
                     logger.critical("MOEX недоступен более 30 минут!")
-                    if CHANNEL_ID:
-                        await bot.send_message(CHANNEL_ID, "🚨 КРИТИЧЕСКАЯ ОШИБКА: MOEX не отвечает более 30 минут. Сигналы могут не приходить.")
             except Exception as e:
                 logger.error(f"Healthcheck MOEX ошибка: {e}")
-            
             await asyncio.sleep(180)
 
 data_fetcher = DataFetcher()
@@ -352,8 +346,7 @@ def calc_trend_for_ticker(df):
 
 # === РАСЧЁТ P&L ===
 def calculate_pnl_percent(entry_price, exit_price, direction):
-    """Расчёт P&L в процентах от фиксированного капитала"""
-    position_value = STRATEGY['CAPITAL'] * STRATEGY['POSITION_SIZE']  # 25 000 ₽
+    position_value = STRATEGY['CAPITAL'] * STRATEGY['POSITION_SIZE']
     shares = position_value / entry_price
     
     if direction == 'long':
@@ -361,11 +354,9 @@ def calculate_pnl_percent(entry_price, exit_price, direction):
     else:
         pnl_rub = (entry_price - exit_price) * shares
     
-    # Комиссия в рублях
     commission_rub = (entry_price * shares * COMMISSION) + (exit_price * shares * COMMISSION)
     pnl_rub_net = pnl_rub - commission_rub
     
-    # P&L в процентах от капитала
     pnl_percent = (pnl_rub_net / STRATEGY['CAPITAL']) * 100
     commission_percent = (commission_rub / STRATEGY['CAPITAL']) * 100
     
@@ -377,7 +368,7 @@ async def get_signal_for_ticker(ticker):
     price = await data_fetcher.get_price(ticker)
     
     if df is None or price is None or price <= 0:
-        logger.warning(f"Нет данных для {ticker}: df={df is not None}, price={price}")
+        logger.warning(f"Нет данных для {ticker}")
         return None, None, "Нет данных от MOEX"
     
     trend = get_trend(df)
@@ -446,9 +437,9 @@ async def get_sber_signal_detailed():
         if data.get('adx', 0) < STRATEGY['ADX_THRESHOLD']:
             reasons.append(f"⚠️ ADX = {data['adx']:.1f} (нужно > {STRATEGY['ADX_THRESHOLD']}) — рынок во флете")
         if data.get('trend') == 'bearish':
-            reasons.append(f"📉 Тренд медвежий (MA10 ниже MA30) — для LONG нужен бычий тренд")
+            reasons.append(f"📉 Тренд медвежий — для LONG нужен бычий")
         elif data.get('trend') == 'bullish':
-            reasons.append(f"📈 Тренд бычий (MA10 выше MA30) — для SHORT нужен медвежий тренд")
+            reasons.append(f"📈 Тренд бычий — для SHORT нужен медвежий")
         if not reasons:
             reasons.append("Условия для входа не выполнены")
         return None, data, "\n".join(reasons)
@@ -600,7 +591,6 @@ async def send_sber_hourly():
     if exit_needed:
         msg += f"\n\n🚨 <b>ВЫХОД ИЗ ПОЗИЦИИ ПО СБЕРУ</b>\n{exit_reason}"
         
-        # Расчёт P&L с комиссией
         pnl_percent, commission_percent = calculate_pnl_percent(sber_entry, price, sber_position)
         
         async with positions_lock:
@@ -737,7 +727,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
 
-# === КЛАВИАТУРА ===
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🌙 Фазы Луны")],
@@ -860,7 +849,6 @@ async def close_cmd(m):
         await m.answer("⚠️ Нет цены")
         return
     
-    # Расчёт P&L с комиссией
     pnl_percent, commission_percent = calculate_pnl_percent(active_pos['entry_price'], price, active_pos['type'])
     
     async with positions_lock:
@@ -993,12 +981,17 @@ async def chart(m):
 
 # === ВЕБ-ДАШБОРД ===
 async def dashboard(req):
-    tr = await get_all_trends()
+    try:
+        tr = await get_all_trends()
+    except Exception as e:
+        logger.error(f"Ошибка get_all_trends: {e}")
+        tr = {}
+    
     ph, _, next_full, next_new = get_lunar_info()
     now = datetime.now(pytz.timezone('Europe/Moscow'))
-    long_count = sum(1 for d in tr.values() if d['trend'] == 'бычий')
-    short_count = sum(1 for d in tr.values() if d['trend'] == 'медвежий')
-    side_count = sum(1 for d in tr.values() if d['trend'] == 'боковик')
+    long_count = sum(1 for d in tr.values() if d.get('trend') == 'бычий')
+    short_count = sum(1 for d in tr.values() if d.get('trend') == 'медвежий')
+    side_count = sum(1 for d in tr.values() if d.get('trend') == 'боковик')
     total_count = long_count + short_count + side_count
     short_percent = round((short_count / total_count) * 100, 1) if total_count else 0
     long_percent = round((long_count / total_count) * 100, 1) if total_count else 0
@@ -1009,20 +1002,20 @@ async def dashboard(req):
     long_returns = []
     short_returns = []
     for ticker, data in tr.items():
-        price = f"{data['price']:.2f}" if data['price'] else "—"
-        if data['trend'] == 'бычий':
+        price = f"{data.get('price', 0):.2f}" if data.get('price') else "—"
+        if data.get('trend') == 'бычий':
             trend_class = "trend-bull"
             trend_text = "🟢 БЫЧИЙ"
-        elif data['trend'] == 'медвежий':
+        elif data.get('trend') == 'медвежий':
             trend_class = "trend-bear"
             trend_text = "🔴 МЕДВЕЖИЙ"
         else:
             trend_class = "trend-neutral"
             trend_text = "⚪ БОКОВИК"
-        rows += f"<tr><td style='font-weight:500;'>{data['name']}</td><td class='ticker-cell'><b>{ticker}</b></td><td class='price-cell'><b>{price}</b> ₽</td><td class='{trend_class}'>{trend_text}</td><td class='bull'>+{data['return_bull']:.2f}%</td><td class='bear'>+{data['return_bear']:.2f}%</td></tr>"
-        tickers_names.append(data['name'])
-        long_returns.append(data['return_bull'])
-        short_returns.append(data['return_bear'])
+        rows += f"<tr><td style='font-weight:500;'>{data.get('name', ticker)}</td><td class='ticker-cell'><b>{ticker}</b></td><td class='price-cell'><b>{price}</b> ₽</td><td class='{trend_class}'>{trend_text}</td><td class='bull'>+{data.get('return_bull', 0):.2f}%</td><td class='bear'>+{data.get('return_bear', 0):.2f}%</td></tr>"
+        tickers_names.append(data.get('name', ticker))
+        long_returns.append(data.get('return_bull', 0))
+        short_returns.append(data.get('return_bear', 0))
     
     html = f"""
 <!DOCTYPE html>
@@ -1123,21 +1116,27 @@ async def moex_health(req):
     })
 
 async def web_server():
-    app = web.Application()
-    app.router.add_get('/health', lambda req: web.Response(text="OK"))
-    app.router.add_get('/health/moex', moex_health)
-    app.router.add_get('/dashboard', dashboard)
-    app.router.add_get('/', dashboard)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', 10000).start()
-    logger.info("🌐 Веб-сервер запущен на порту 10000")
+    try:
+        app = web.Application()
+        app.router.add_get('/health', lambda req: web.Response(text="OK"))
+        app.router.add_get('/health/moex', moex_health)
+        app.router.add_get('/dashboard', dashboard)
+        app.router.add_get('/', dashboard)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        
+        port = int(os.environ.get('PORT', 10000))
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        logger.info(f"🌐 Веб-сервер запущен на порту {port}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска веб-сервера: {e}")
 
 # === ЗАПУСК ===
 async def main():
     init_db()
-    await web_server()
-    asyncio.create_task(data_fetcher.healthcheck_moex(bot))
+    asyncio.create_task(data_fetcher.healthcheck_moex())
+    asyncio.create_task(web_server())
     
     tasks = [
         asyncio.create_task(daily_loop()),
@@ -1170,15 +1169,24 @@ async def main():
     await stop_event.wait()
     
     logger.info("🛑 Останавливаю бота...")
-    await dp.stop_polling()
+    
+    try:
+        await dp.stop_polling()
+    except Exception as e:
+        logger.error(f"Ошибка при остановке polling: {e}")
+    
     polling_task.cancel()
     
     for task in tasks:
         task.cancel()
     
     await asyncio.gather(*tasks, return_exceptions=True)
-    await data_fetcher.close()
-    await bot.close()
+    
+    if bot:
+        try:
+            await bot.close()
+        except Exception as e:
+            logger.error(f"Ошибка закрытия bot: {e}")
     
     logger.info("✅ Бот остановлен")
 
