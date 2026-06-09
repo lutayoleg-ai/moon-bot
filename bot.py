@@ -36,12 +36,13 @@ STRATEGY = {
     'ADX_THRESHOLD': 20,
     'STOP_LOSS': 0.06,
     'TAKE_PROFIT': 0.12,
-    'DAILY_LOSS_LIMIT': 0.03
+    'DAILY_LOSS_LIMIT': 0.03,
+    'CAPITAL': 100000,  # Фиксированный капитал 100 000 ₽
+    'POSITION_SIZE': 0.25  # 25% капитала на сделку (25 000 ₽)
 }
 
-# Комиссия брокера: 0.3% на вход, 0.3% на выход = 0.6% от суммы сделки
-COMMISSION = 0.003  # 0.3%
-COMMISSION_TOTAL_PCT = COMMISSION * 2 * 100  # 0.6 процентных пункта
+# Комиссия брокера: 0.3% на вход, 0.3% на выход
+COMMISSION = 0.003
 
 # === НАСТРОЙКА ЛОГИРОВАНИЯ ===
 logging.basicConfig(
@@ -152,7 +153,7 @@ def get_days_until_new_moon():
 positions = {}
 positions_lock = asyncio.Lock()
 last_signal_sent = {}
-daily_pnl = 0.0
+daily_pnl = 0.0  # в процентах от капитала
 last_reset_date = None
 lunar_notified_days = set()
 
@@ -160,19 +161,19 @@ lunar_notified_days = set()
 def init_db():
     with sqlite3.connect('bot_data.db') as conn:
         c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, ticker TEXT, type TEXT, entry REAL, exit REAL, pnl REAL, commission REAL, is_manual INTEGER)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, ticker TEXT, type TEXT, entry REAL, exit REAL, pnl_percent REAL, commission_percent REAL, is_manual INTEGER, capital REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS daily_summary (date TEXT PRIMARY KEY, summary TEXT)''')
 
-def save_trade(ticker, trade_type, entry, exit_price, pnl, commission, is_manual=False):
+def save_trade(ticker, trade_type, entry, exit_price, pnl_percent, commission_percent, is_manual=False):
     with sqlite3.connect('bot_data.db') as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO trades (date, ticker, type, entry, exit, pnl, commission, is_manual) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                  (datetime.now().isoformat(), ticker, trade_type, entry, exit_price, pnl, commission, 1 if is_manual else 0))
+        c.execute("INSERT INTO trades (date, ticker, type, entry, exit, pnl_percent, commission_percent, is_manual, capital) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  (datetime.now().isoformat(), ticker, trade_type, entry, exit_price, pnl_percent, commission_percent, 1 if is_manual else 0, STRATEGY['CAPITAL']))
 
 def get_stats():
     with sqlite3.connect('bot_data.db') as conn:
         c = conn.cursor()
-        c.execute("SELECT COUNT(*), SUM(pnl), AVG(pnl), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) FROM trades")
+        c.execute("SELECT COUNT(*), SUM(pnl_percent), AVG(pnl_percent), SUM(CASE WHEN pnl_percent > 0 THEN 1 ELSE 0 END) FROM trades")
         row = c.fetchone()
         total_trades = row[0] or 0
         total_pnl = row[1] or 0
@@ -233,11 +234,18 @@ class DataFetcher:
                     for i, col in enumerate(cols):
                         if col.lower() in ('last', 'currentprice'):
                             if i < len(rows[0]) and rows[0][i]:
-                                p = float(rows[0][i])
-                                if 1 < p < 20000:
-                                    DataFetcher.moex_error_count = 0
-                                    DataFetcher.moex_last_success = datetime.now()
-                                    return p
+                                try:
+                                    p = float(rows[0][i])
+                                    if 0 < p < 20000:
+                                        DataFetcher.moex_error_count = 0
+                                        DataFetcher.moex_last_success = datetime.now()
+                                        return p
+                                    else:
+                                        logger.warning(f"Цена {p} вне допустимого диапазона для {ticker}")
+                                        return None
+                                except (ValueError, TypeError) as e:
+                                    logger.error(f"Ошибка преобразования цены {ticker}: {e}")
+                                    return None
             logger.warning(f"Нет данных о цене для {ticker}")
             return None
         except Exception as e:
@@ -282,7 +290,6 @@ class DataFetcher:
             return None
     
     async def healthcheck_moex(self, bot):
-        """Фоновая проверка доступности MOEX"""
         while True:
             try:
                 price = await self.get_price("SBER")
@@ -296,7 +303,7 @@ class DataFetcher:
             except Exception as e:
                 logger.error(f"Healthcheck MOEX ошибка: {e}")
             
-            await asyncio.sleep(180)  # каждые 3 минуты
+            await asyncio.sleep(180)
 
 data_fetcher = DataFetcher()
 
@@ -343,12 +350,34 @@ def calc_trend_for_ticker(df):
     spread = abs(ma18 - ma50) / ma50 * 100
     return "боковик" if spread < 0.7 else ("бычий" if ma18 > ma50 else "медвежий")
 
+# === РАСЧЁТ P&L ===
+def calculate_pnl_percent(entry_price, exit_price, direction):
+    """Расчёт P&L в процентах от фиксированного капитала"""
+    position_value = STRATEGY['CAPITAL'] * STRATEGY['POSITION_SIZE']  # 25 000 ₽
+    shares = position_value / entry_price
+    
+    if direction == 'long':
+        pnl_rub = (exit_price - entry_price) * shares
+    else:
+        pnl_rub = (entry_price - exit_price) * shares
+    
+    # Комиссия в рублях
+    commission_rub = (entry_price * shares * COMMISSION) + (exit_price * shares * COMMISSION)
+    pnl_rub_net = pnl_rub - commission_rub
+    
+    # P&L в процентах от капитала
+    pnl_percent = (pnl_rub_net / STRATEGY['CAPITAL']) * 100
+    commission_percent = (commission_rub / STRATEGY['CAPITAL']) * 100
+    
+    return pnl_percent, commission_percent
+
 # === АНАЛИЗ СИГНАЛА ===
 async def get_signal_for_ticker(ticker):
     df = await data_fetcher.fetch_candles_daily(ticker, 100)
     price = await data_fetcher.get_price(ticker)
     
-    if df is None or price is None:
+    if df is None or price is None or price <= 0:
+        logger.warning(f"Нет данных для {ticker}: df={df is not None}, price={price}")
         return None, None, "Нет данных от MOEX"
     
     trend = get_trend(df)
@@ -365,28 +394,32 @@ async def get_signal_for_ticker(ticker):
     dead_cross = (last_ma10 < last_ma30) and (prev_ma10 >= prev_ma30)
     
     if trend == "bullish" and (adx > STRATEGY['ADX_THRESHOLD'] or golden_cross):
+        stop_price = price * (1 - STRATEGY['STOP_LOSS'])
+        target_price = price * (1 + STRATEGY['TAKE_PROFIT'])
         return "LONG", {
             'ticker': ticker,
             'name': TICKERS[ticker]['name'],
             'price': price,
             'trend': trend,
             'adx': round(adx, 1),
-            'target': price * (1 + STRATEGY['TAKE_PROFIT']),
-            'stop': price * (1 - STRATEGY['STOP_LOSS']),
+            'target': target_price,
+            'stop': stop_price,
             'signal_type': "ЗОЛОТОЕ ПЕРЕСЕЧЕНИЕ" if golden_cross else "ТРЕНД",
             'ma10': last_ma10,
             'ma30': last_ma30
         }, None
     
     if trend == "bearish" and (adx > STRATEGY['ADX_THRESHOLD'] or dead_cross):
+        stop_price = price * (1 + STRATEGY['STOP_LOSS'])
+        target_price = price * (1 - STRATEGY['TAKE_PROFIT'])
         return "SHORT", {
             'ticker': ticker,
             'name': TICKERS[ticker]['name'],
             'price': price,
             'trend': trend,
             'adx': round(adx, 1),
-            'target': price * (1 - STRATEGY['TAKE_PROFIT']),
-            'stop': price * (1 + STRATEGY['STOP_LOSS']),
+            'target': target_price,
+            'stop': stop_price,
             'signal_type': "МЁРТВОЕ ПЕРЕСЕЧЕНИЕ" if dead_cross else "ТРЕНД",
             'ma10': last_ma10,
             'ma30': last_ma30
@@ -404,8 +437,8 @@ async def get_signal_for_ticker(ticker):
 
 async def get_sber_signal_detailed():
     signal, data, explanation = await get_signal_for_ticker("SBER")
-    if data is None:
-        return None, None, "Нет данных"
+    if data is None or data.get('price') is None or data['price'] <= 0:
+        return None, None, "Нет данных от MOEX"
     if signal:
         return signal, data, None
     else:
@@ -432,7 +465,7 @@ async def check_and_send_all_signals():
             if ticker in positions and positions[ticker].get('type') is not None:
                 continue
             signal, data, _ = await get_signal_for_ticker(ticker)
-            if signal and data:
+            if signal and data and data.get('price') is not None and data['price'] > 0:
                 signals.append({
                     'ticker': ticker,
                     'signal': signal,
@@ -491,7 +524,9 @@ async def send_sber_hourly():
     await reset_daily_pnl()
     
     signal, data, explanation = await get_sber_signal_detailed()
-    if data is None:
+    
+    if data is None or data.get('price') is None or data['price'] <= 0:
+        logger.error("Нет корректной цены для Сбера, пропускаем сигнал")
         return
     
     price = data['price']
@@ -564,12 +599,13 @@ async def send_sber_hourly():
     
     if exit_needed:
         msg += f"\n\n🚨 <b>ВЫХОД ИЗ ПОЗИЦИИ ПО СБЕРУ</b>\n{exit_reason}"
-        pnl_final = (price - sber_entry) / sber_entry * 100 if sber_position == 'long' else (sber_entry - price) / sber_entry * 100
-        pnl_after = pnl_final - COMMISSION_TOTAL_PCT
+        
+        # Расчёт P&L с комиссией
+        pnl_percent, commission_percent = calculate_pnl_percent(sber_entry, price, sber_position)
         
         async with positions_lock:
-            daily_pnl += pnl_after / 100
-            save_trade("SBER", sber_position, sber_entry, price, pnl_after, COMMISSION_TOTAL_PCT, positions.get("SBER", {}).get('is_manual', False))
+            daily_pnl += pnl_percent
+            save_trade("SBER", sber_position, sber_entry, price, pnl_percent, commission_percent, positions.get("SBER", {}).get('is_manual', False))
             positions["SBER"] = {'type': None, 'entry_price': None, 'entry_time': None, 'is_manual': False}
     
     elif signal and not sber_position:
@@ -717,7 +753,8 @@ async def start_cmd(m):
     await m.answer(
         "📊 <b>АНАЛИТИК</b>\n\n"
         "🔹 <b>СБЕР (сигналы каждый час с 10:00 до 22:00)</b>\n"
-        "   Стратегия: MA10/MA30 + ADX | Стоп 6% | Тейк 12%\n\n"
+        "   Стратегия: MA10/MA30 + ADX | Стоп 6% | Тейк 12%\n"
+        f"   Капитал: {STRATEGY['CAPITAL']:,} ₽ | Размер позиции: {STRATEGY['POSITION_SIZE']*100:.0f}%\n\n"
         "🔹 <b>ОСТАЛЬНЫЕ 16 АКТИВОВ</b>\n"
         "   Проверяются каждый час, ТОП-3 видны сразу, остальные под спойлером\n\n"
         "🔹 <b>ЛУННАЯ СТРАТЕГИЯ</b>\n"
@@ -739,7 +776,7 @@ async def tickers_cmd(m):
 async def status_cmd(m):
     price = await data_fetcher.get_price("SBER")
     df = await data_fetcher.fetch_candles_daily("SBER", 100)
-    if price is None or df is None:
+    if price is None or df is None or price <= 0:
         await m.answer("⚠️ Нет данных")
         return
     trend = get_trend(df)
@@ -756,10 +793,10 @@ async def status_cmd(m):
     
     if sber_pos and sber_entry:
         pnl = (price - sber_entry) / sber_entry * 100 if sber_pos == 'long' else (sber_entry - price) / sber_entry * 100
-        msg += f"\n📌 ПОЗИЦИЯ: {sber_pos.upper()}\n   Вход: {sber_entry:.2f} ₽\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n   С комиссией: {'+' if pnl - COMMISSION_TOTAL_PCT >= 0 else ''}{pnl - COMMISSION_TOTAL_PCT:.2f}%\n"
+        msg += f"\n📌 ПОЗИЦИЯ: {sber_pos.upper()}\n   Вход: {sber_entry:.2f} ₽\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n"
     else:
         msg += f"\n📌 ПОЗИЦИЯ: НЕТ\n"
-    msg += f"\n📅 Дневной P&L: {'+' if daily_pnl*100 >= 0 else ''}{daily_pnl*100:.2f}%"
+    msg += f"\n📅 Дневной P&L: {'+' if daily_pnl >= 0 else ''}{daily_pnl:.2f}%"
     await m.answer(msg, parse_mode='HTML')
 
 @dp.message_handler(commands=['open'])
@@ -819,23 +856,19 @@ async def close_cmd(m):
             return
     
     price = await data_fetcher.get_price(active_ticker)
-    if not price:
+    if not price or price <= 0:
         await m.answer("⚠️ Нет цены")
         return
     
-    if active_pos['type'] == 'long':
-        pnl = (price - active_pos['entry_price']) / active_pos['entry_price'] * 100
-    else:
-        pnl = (active_pos['entry_price'] - price) / active_pos['entry_price'] * 100
-    
-    pnl_after = pnl - COMMISSION_TOTAL_PCT
+    # Расчёт P&L с комиссией
+    pnl_percent, commission_percent = calculate_pnl_percent(active_pos['entry_price'], price, active_pos['type'])
     
     async with positions_lock:
-        daily_pnl += pnl_after / 100
-        save_trade(active_ticker, active_pos['type'], active_pos['entry_price'], price, pnl_after, COMMISSION_TOTAL_PCT, active_pos.get('is_manual', False))
+        daily_pnl += pnl_percent
+        save_trade(active_ticker, active_pos['type'], active_pos['entry_price'], price, pnl_percent, commission_percent, active_pos.get('is_manual', False))
         positions[active_ticker] = {'type': None, 'entry_price': None, 'entry_time': None, 'is_manual': False}
     
-    msg = f"✅ Закрыто {active_pos['type'].upper()} по {TICKERS[active_ticker]['name']} ({active_ticker})\n💰 Вход: {active_pos['entry_price']:.2f}\n💰 Выход: {price:.2f}\n📊 P&L: {pnl:+.2f}%\n💸 С комиссией: {pnl_after:+.2f}%"
+    msg = f"✅ Закрыто {active_pos['type'].upper()} по {TICKERS[active_ticker]['name']} ({active_ticker})\n💰 Вход: {active_pos['entry_price']:.2f}\n💰 Выход: {price:.2f}\n📊 P&L: {pnl_percent:+.2f}%\n💸 Комиссия: {commission_percent:.2f}%"
     await m.answer(msg)
 
 @dp.message_handler(commands=['balance'])
@@ -847,7 +880,7 @@ async def balance_cmd(m):
     msg += f"📈 <b>ОБЩАЯ</b>\n   Всего сделок: {stats['total_trades']}\n"
     msg += f"   Прибыльных: {stats['winning_trades']}\n   Убыточных: {stats['losing_trades']}\n"
     msg += f"   Win Rate: {stats['win_rate']:.1f}%\n   Общий P&L: {stats['total_pnl']:+.2f}%\n"
-    msg += f"   Средний P&L: {stats['avg_pnl']:+.2f}%\n\n📅 <b>СЕГОДНЯ</b>\n   P&L: {daily_pnl*100:+.2f}%"
+    msg += f"   Средний P&L: {stats['avg_pnl']:+.2f}%\n\n📅 <b>СЕГОДНЯ</b>\n   P&L: {daily_pnl:+.2f}%"
     await m.answer(msg, parse_mode='HTML')
 
 # === КНОПКИ ===
@@ -892,7 +925,7 @@ async def btn_emergency_snapshot(m):
             if ticker in positions and positions[ticker].get('type') is not None:
                 continue
             signal, data, _ = await get_signal_for_ticker(ticker)
-            if signal and data:
+            if signal and data and data.get('price') is not None and data['price'] > 0:
                 signals.append({
                     'ticker': ticker,
                     'signal': signal,
@@ -986,7 +1019,7 @@ async def dashboard(req):
         else:
             trend_class = "trend-neutral"
             trend_text = "⚪ БОКОВИК"
-        rows += f"<tr><td style='font-weight:500;'>{data['name']}</td><td><b>{ticker}</b></td><td><b>{price}</b> ₽</td><td class='{trend_class}'>{trend_text}</td><td class='bull'>+{data['return_bull']:.2f}%</td><td class='bear'>+{data['return_bear']:.2f}%</td></tr>"
+        rows += f"<tr><td style='font-weight:500;'>{data['name']}</td><td class='ticker-cell'><b>{ticker}</b></td><td class='price-cell'><b>{price}</b> ₽</td><td class='{trend_class}'>{trend_text}</td><td class='bull'>+{data['return_bull']:.2f}%</td><td class='bear'>+{data['return_bear']:.2f}%</td></tr>"
         tickers_names.append(data['name'])
         long_returns.append(data['return_bull'])
         short_returns.append(data['return_bear'])
@@ -1023,6 +1056,8 @@ async def dashboard(req):
         td {{ padding: 12px 10px; border-bottom: 1px solid #1e293b; }}
         tr:hover td {{ background-color: rgba(30, 41, 59, 0.5); }}
         .trend-bull {{ color: #4ade80; font-weight: 600; }} .trend-bear {{ color: #f87171; font-weight: 600; }} .trend-neutral {{ color: #facc15; font-weight: 600; }}
+        .ticker-cell {{ font-family: monospace; font-weight: 600; letter-spacing: 0.5px; }}
+        .price-cell {{ font-weight: 700; color: #facc15; }}
         .footer-note {{ margin-top: 28px; text-align: center; font-size: 0.75rem; color: #5b6e8c; border-top: 1px solid #1e293b; padding-top: 20px; }}
         @media (max-width: 700px) {{ body {{ padding: 16px; }} .stat-value {{ font-size: 1.8rem; }} th, td {{ font-size: 0.7rem; padding: 6px 4px; }} }}
     </style>
@@ -1100,16 +1135,10 @@ async def web_server():
 
 # === ЗАПУСК ===
 async def main():
-    # Инициализация
     init_db()
-    
-    # Запуск веб-сервера
     await web_server()
-    
-    # Запуск healthcheck MOEX
     asyncio.create_task(data_fetcher.healthcheck_moex(bot))
     
-    # Запуск фоновых задач
     tasks = [
         asyncio.create_task(daily_loop()),
         asyncio.create_task(lunar_notify()),
@@ -1117,7 +1146,6 @@ async def main():
         asyncio.create_task(all_signals_check_loop()),
     ]
     
-    # Обработка сигналов завершения
     stop_event = asyncio.Event()
     loop = asyncio.get_event_loop()
     
@@ -1128,7 +1156,6 @@ async def main():
     loop.add_signal_handler(signal.SIGTERM, signal_handler)
     loop.add_signal_handler(signal.SIGINT, signal_handler)
     
-    # Запуск polling
     logger.info("🚀 Бот запущен, начинаю polling...")
     
     async def run_polling():
@@ -1140,23 +1167,16 @@ async def main():
             stop_event.set()
     
     polling_task = asyncio.create_task(run_polling())
-    
-    # Ждём остановки
     await stop_event.wait()
     
     logger.info("🛑 Останавливаю бота...")
-    
-    # Остановка polling
     await dp.stop_polling()
     polling_task.cancel()
     
-    # Остановка фоновых задач
     for task in tasks:
         task.cancel()
     
     await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Закрытие соединений
     await data_fetcher.close()
     await bot.close()
     
@@ -1178,6 +1198,7 @@ if __name__ == "__main__":
     print("Сбер: каждый час | Остальные: ТОП-3 видно, остальные под спойлером")
     print("Луна: уведомления за 3 дня до ПОЛНОЛУНИЯ и НОВОЛУНИЯ")
     print("Стоп 6% | Тейк 12% | ADX > 20")
+    print(f"Капитал: {STRATEGY['CAPITAL']:,} ₽ | Размер позиции: {STRATEGY['POSITION_SIZE']*100:.0f}%")
     print("🚨 Срочный срез — кнопка в меню")
     print("=" * 50)
     
