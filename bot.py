@@ -61,7 +61,7 @@ TICKERS = {
 }
 ALL_TICKERS = list(TICKERS.keys())
 
-# === ЛУННЫЕ ДАННЫЕ ===
+# === ЛУННЫЕ ДАННЫЕ (полнолуния и новолуния) ===
 LUNAR_PHASES = {
     "full_moons": [
         ("2026-01-03", "13:04"), ("2026-02-02", "01:10"), ("2026-03-03", "14:39"),
@@ -75,6 +75,7 @@ LUNAR_PHASES = {
         ("2026-04-17", "14:54"), ("2026-05-16", "23:03"), ("2026-06-15", "05:56"),
         ("2026-07-14", "12:45"), ("2026-08-12", "20:37"), ("2026-09-11", "06:27"),
         ("2026-10-10", "18:50"), ("2026-11-09", "10:02"), ("2026-12-09", "03:52"),
+        ("2027-01-07", "23:25"),
     ]
 }
 
@@ -82,32 +83,58 @@ def get_lunar_info():
     msk = pytz.timezone('Europe/Moscow')
     now = datetime.now(msk)
     next_full = None
+    next_new = None
+    
     for date_str, time_str in LUNAR_PHASES["full_moons"]:
         dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
         if dt > now:
             next_full = dt
             break
+    
+    for date_str, time_str in LUNAR_PHASES["new_moons"]:
+        dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
+        if dt > now:
+            next_new = dt
+            break
+    
     for date_str, time_str in LUNAR_PHASES["full_moons"]:
         dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
         if (now - dt).days <= 1 and (now - dt).days >= 0:
-            return "полнолуние", dt, next_full
+            return "полнолуние", dt, next_full, next_new
         if (dt - now).days == 1:
-            return "полнолуние_завтра", dt, next_full
+            return "полнолуние_завтра", dt, next_full, next_new
+    
     for date_str, time_str in LUNAR_PHASES["new_moons"]:
         dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
-        if abs((now - dt).days) <= 1:
-            return "новолуние", dt, next_full
+        if (now - dt).days <= 1 and (now - dt).days >= 0:
+            return "новолуние", dt, next_full, next_new
+        if (dt - now).days == 1:
+            return "новолуние_завтра", dt, next_full, next_new
+    
     new_moons = [msk.localize(datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M")) for d, t in LUNAR_PHASES["new_moons"]]
     last_new = max([d for d in new_moons if d <= now], default=None)
     if last_new:
         days = (now - last_new).days
-        return ("растущая" if days < 14 else "убывающая"), last_new, next_full
-    return "обычный день", None, next_full
+        if days < 14:
+            return "растущая", last_new, next_full, next_new
+        else:
+            return "убывающая", last_new, next_full, next_new
+    
+    return "обычный день", None, next_full, next_new
 
 def get_days_until_full_moon():
     msk = pytz.timezone('Europe/Moscow')
     now = datetime.now(msk)
     for date_str, time_str in LUNAR_PHASES["full_moons"]:
+        dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
+        if dt > now:
+            return (dt - now).days
+    return None
+
+def get_days_until_new_moon():
+    msk = pytz.timezone('Europe/Moscow')
+    now = datetime.now(msk)
+    for date_str, time_str in LUNAR_PHASES["new_moons"]:
         dt = msk.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
         if dt > now:
             return (dt - now).days
@@ -361,7 +388,7 @@ async def get_signal_for_ticker(ticker):
         'ma30': last_ma30
     }, f"ADX = {adx:.1f} (нужно > {STRATEGY['ADX_THRESHOLD']})"
 
-# === ДЛЯ СБЕРА (подробный мониторинг) ===
+# === ДЛЯ СБЕРА ===
 async def get_sber_signal_detailed():
     signal, data, explanation = await get_signal_for_ticker("SBER")
     if data is None:
@@ -380,7 +407,7 @@ async def get_sber_signal_detailed():
             reasons.append("Условия для входа не выполнены")
         return None, data, "\n".join(reasons)
 
-# === ОТПРАВКА СИГНАЛОВ ПО ВСЕМ АКТИВАМ (со сворачивающимся списком) ===
+# === ОТПРАВКА СИГНАЛОВ ПО ВСЕМ АКТИВАМ ===
 async def check_and_send_all_signals():
     global last_signal_sent
     
@@ -442,7 +469,7 @@ async def check_and_send_all_signals():
     except Exception as e:
         print(f"Ошибка отправки: {e}")
 
-# === ОТПРАВКА СИГНАЛА ПО СБЕРУ (КАЖДЫЙ ЧАС) ===
+# === ОТПРАВКА СИГНАЛА ПО СБЕРУ ===
 async def send_sber_hourly():
     global positions, daily_pnl
     
@@ -576,15 +603,29 @@ def get_tickers_list_text():
 async def lunar_notify():
     global lunar_notified_days
     while True:
-        days_until = get_days_until_full_moon()
-        if days_until is not None and days_until <= 3 and days_until not in lunar_notified_days:
-            lunar_notified_days.add(days_until)
-            if days_until == 3:
+        days_until_full = get_days_until_full_moon()
+        days_until_new = get_days_until_new_moon()
+        
+        # Полнолуние
+        if days_until_full is not None and days_until_full <= 3 and days_until_full not in lunar_notified_days:
+            lunar_notified_days.add(days_until_full)
+            if days_until_full == 3:
                 await bot.send_message(MY_CHAT_ID, f"🌕 ЧЕРЕЗ 3 ДНЯ ПОЛНОЛУНИЕ\nГотовьтесь к точке входа")
-            elif days_until == 2:
+            elif days_until_full == 2:
                 await bot.send_message(MY_CHAT_ID, f"🌕 ЧЕРЕЗ 2 ДНЯ ПОЛНОЛУНИЕ")
-            elif days_until == 1:
+            elif days_until_full == 1:
                 await bot.send_message(MY_CHAT_ID, f"🌕 ЗАВТРА ПОЛНОЛУНИЕ — ТОЧКА ВХОДА")
+        
+        # Новолуние
+        if days_until_new is not None and days_until_new <= 3 and days_until_new not in lunar_notified_days:
+            lunar_notified_days.add(days_until_new)
+            if days_until_new == 3:
+                await bot.send_message(MY_CHAT_ID, f"🌑 ЧЕРЕЗ 3 ДНЯ НОВОЛУНИЕ\nОжидайте повышенную волатильность")
+            elif days_until_new == 2:
+                await bot.send_message(MY_CHAT_ID, f"🌑 ЧЕРЕЗ 2 ДНЯ НОВОЛУНИЕ")
+            elif days_until_new == 1:
+                await bot.send_message(MY_CHAT_ID, f"🌑 ЗАВТРА НОВОЛУНИЕ\nБудьте осторожны с позициями")
+        
         await asyncio.sleep(3600)
 
 async def daily_lunar_summary():
@@ -594,7 +635,7 @@ async def daily_lunar_summary():
     today = datetime.now(msk).strftime('%Y-%m-%d')
     if get_last_summary_date() == today:
         return
-    ph, _, nxt = get_lunar_info()
+    ph, _, nxt_full, nxt_new = get_lunar_info()
     trends = {}
     for ticker in ALL_TICKERS:
         df = await data_fetcher.fetch_candles_daily(ticker, 100)
@@ -603,14 +644,18 @@ async def daily_lunar_summary():
     long_cnt = sum(1 for t in trends.values() if t == 'бычий')
     short_cnt = sum(1 for t in trends.values() if t == 'медвежий')
     txt = f"🌙 **{datetime.now(msk).strftime('%d.%m.%Y')}**\n"
-    if nxt:
-        txt += f"🌕 Полнолуние {nxt.strftime('%d.%m.%Y')}\n"
+    if nxt_full:
+        txt += f"🌕 Полнолуние {nxt_full.strftime('%d.%m.%Y')}\n"
+    if nxt_new:
+        txt += f"🌑 Новолуние {nxt_new.strftime('%d.%m.%Y')}\n"
     txt += f"🟢 LONG: {long_cnt}  🔴 SHORT: {short_cnt}\n💡 /status /balance"
     save_daily_summary(today, txt)
     try:
         await bot.send_message(CHANNEL_ID, txt, parse_mode='Markdown')
     except:
-        passasync def daily_loop():
+        pass
+
+async def daily_loop():
     while True:
         now = datetime.now(pytz.timezone('Europe/Moscow'))
         if now.hour == 10 and now.minute < 5:
@@ -649,7 +694,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
 
-# === КЛАВИАТУРА (с кнопкой Срочный срез) ===
+# === КЛАВИАТУРА ===
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🌙 Фазы Луны"), KeyboardButton(text="📈 Открыть позицию")],
@@ -669,7 +714,7 @@ async def start_cmd(m):
         "🔹 <b>ОСТАЛЬНЫЕ 16 АКТИВОВ</b>\n"
         "   Проверяются каждый час, ТОП-3 видны сразу, остальные под спойлером\n\n"
         "🔹 <b>ЛУННАЯ СТРАТЕГИЯ</b>\n"
-        "   Ежедневная сводка в 10:00 | Уведомление за 3 дня до полнолуния\n\n"
+        "   Ежедневная сводка в 10:00 | Уведомления за 3 дня до полнолуния и новолуния\n\n"
         "🔹 <b>КОМАНДЫ:</b>\n"
         "   /status — состояние по Сберу\n"
         "   /open SBER LONG 310 — открыть сделку\n"
@@ -784,19 +829,28 @@ async def balance_cmd(m):
 # === КНОПКИ ===
 @dp.message_handler(lambda msg: msg.text == "🌙 Фазы Луны")
 async def btn_lunar(m):
-    ph, dt, nxt = get_lunar_info()
+    ph, dt, next_full, next_new = get_lunar_info()
     now = datetime.now(pytz.timezone('Europe/Moscow'))
-    days = get_days_until_full_moon()
+    days_full = get_days_until_full_moon()
+    days_new = get_days_until_new_moon()
+    
     txt = f"🌙 {ph.upper()}\n📅 {now.strftime('%d.%m.%Y')}"
-    if nxt:
-        txt += f"\n🌕 Полнолуние: {nxt.strftime('%d.%m.%Y %H:%M')}"
-    if days is not None:
-        txt += f"\n⏳ До полнолуния: {days} дн."
+    
+    if next_full:
+        txt += f"\n\n🌕 ПОЛНОЛУНИЕ: {next_full.strftime('%d.%m.%Y %H:%M')}"
+        if days_full is not None:
+            txt += f"\n   ⏳ До полнолуния: {days_full} дн."
+    
+    if next_new:
+        txt += f"\n\n🌑 НОВОЛУНИЕ: {next_new.strftime('%d.%m.%Y %H:%M')}"
+        if days_new is not None:
+            txt += f"\n   ⏳ До новолуния: {days_new} дн."
+    
     await m.answer(txt)
 
 @dp.message_handler(lambda msg: msg.text == "📈 Открыть позицию")
 async def btn_open_position(m):
-    ph, _, _ = get_lunar_info()
+    ph, _, _, _ = get_lunar_info()
     if ph == "полнолуние":
         await m.answer("🌕 **ТОЧКА ВХОДА!**\n📝 Используйте /open SBER LONG ЦЕНА\nили /open GAZP SHORT ЦЕНА")
     else:
@@ -899,7 +953,7 @@ async def chart(m):
 # === ВЕБ-ДАШБОРД ===
 async def dashboard(req):
     tr = await get_all_trends()
-    ph, _, nxt = get_lunar_info()
+    ph, _, next_full, next_new = get_lunar_info()
     now = datetime.now(pytz.timezone('Europe/Moscow'))
     long_count = sum(1 for d in tr.values() if d['trend'] == 'бычий')
     short_count = sum(1 for d in tr.values() if d['trend'] == 'медвежий')
@@ -924,7 +978,7 @@ async def dashboard(req):
         else:
             trend_class = "trend-neutral"
             trend_text = "⚪ БОКОВИК"
-        rows += f"<tr><td style='font-weight:500;'>{data['name']}</td><td><b>{ticker}</b></td><td><b>{price}</b> ₽</td><td class='{trend_class}'>{trend_text}</td><td class='bull'>+{data['return_bull']:.2f}%</td><td class='bear'>+{data['return_bear']:.2f}%</td></tr>"
+        rows += f"<tr><td style='font-weight:500;'>{data['name']}</td><td><b>{ticker}</b></td><td><b>{price}</b> ₽</td><td class='{trend_class}'>{trend_text}</td><td class='bull'>+{data['return_bull']:.2f}%</td><td class='bear'>+{data['return_bear']:.2f}%</td>{a</td>"
         tickers_names.append(data['name'])
         long_returns.append(data['return_bull'])
         short_returns.append(data['return_bear'])
@@ -972,7 +1026,8 @@ async def dashboard(req):
         <div class="lunar-info">
             <span>🗓️ {now.strftime('%d.%m.%Y %H:%M')}</span>
             <span class="lunar-badge">🌙 {ph.upper()}</span>
-            <span class="lunar-badge">🌕 Полнолуние: {nxt.strftime('%d.%m.%Y') if nxt else '—'}</span>
+            <span class="lunar-badge">🌕 Полнолуние: {next_full.strftime('%d.%m.%Y') if next_full else '—'}</span>
+            <span class="lunar-badge">🌑 Новолуние: {next_new.strftime('%d.%m.%Y') if next_new else '—'}</span>
         </div>
     </div>
     <div class="stats-grid">
@@ -993,7 +1048,7 @@ async def dashboard(req):
             <tbody>{rows}</tbody>
         </table>
     </div>
-    <div class="footer-note">🤖 Сбер: сигналы каждый час | Остальные: ТОП-3 видны сразу, остальные под спойлером</div>
+    <div class="footer-note">🤖 Сбер: сигналы каждый час | Остальные: ТОП-3 видны сразу, остальные под спойлером | 🌕🌑 Уведомления за 3 дня</div>
 </div>
 <script>
     new Chart(document.getElementById('trendPieChart'), {{
@@ -1024,7 +1079,7 @@ async def on_startup(dp):
     asyncio.create_task(sber_hourly_loop())
     asyncio.create_task(all_signals_check_loop())
     try:
-        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n\n🔹 СБЕР: сигналы КАЖДЫЙ ЧАС с 10:00 до 22:00\n🔹 ОСТАЛЬНЫЕ 16: ТОП-3 видны сразу, остальные под спойлером\n🔹 ЛУНА: сводка в 10:00, уведомления за 3 дня\n🔹 КНОПКА: 🚨 Срочный срез — моментальный анализ всех 17 активов\n\n📋 /tickers — список всех активов\n/open SBER LONG 310 — открыть сделку\n/close — закрыть\n/status — состояние Сбера\n/balance — статистика")
+        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n\n🔹 СБЕР: сигналы КАЖДЫЙ ЧАС с 10:00 до 22:00\n🔹 ОСТАЛЬНЫЕ 16: ТОП-3 видны сразу, остальные под спойлером\n🔹 ЛУНА: сводка в 10:00, уведомления за 3 дня до ПОЛНОЛУНИЯ и НОВОЛУНИЯ\n🔹 КНОПКА: 🚨 Срочный срез — моментальный анализ всех 17 активов\n\n📋 /tickers — список всех активов\n/open SBER LONG 310 — открыть сделку\n/close — закрыть\n/status — состояние Сбера\n/balance — статистика")
     except:
         pass
 
@@ -1046,6 +1101,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print("АНАЛИТИК | СИГНАЛЫ ПО ВСЕМ 17 АКТИВАМ")
     print("Сбер: каждый час | Остальные: ТОП-3 видно, остальные под спойлером")
+    print("Луна: уведомления за 3 дня до ПОЛНОЛУНИЯ и НОВОЛУНИЯ")
     print("Стоп 6% | Тейк 12% | ADX > 20")
     print("🚨 Срочный срез — кнопка в меню")
     print("=" * 50)
