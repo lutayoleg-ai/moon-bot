@@ -610,9 +610,7 @@ async def daily_lunar_summary():
     try:
         await bot.send_message(CHANNEL_ID, txt, parse_mode='Markdown')
     except:
-        pass
-
-async def daily_loop():
+        passasync def daily_loop():
     while True:
         now = datetime.now(pytz.timezone('Europe/Moscow'))
         if now.hour == 10 and now.minute < 5:
@@ -651,11 +649,12 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
 
+# === КЛАВИАТУРА (с кнопкой Срочный срез) ===
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🌙 Фазы Луны"), KeyboardButton(text="📈 Открыть позицию")],
         [KeyboardButton(text="📊 Историческая статистика"), KeyboardButton(text="📈 График акции")],
-        [KeyboardButton(text="📋 Тикеры")],
+        [KeyboardButton(text="📋 Тикеры"), KeyboardButton(text="🚨 Срочный срез")],
     ],
     resize_keyboard=True
 )
@@ -820,6 +819,60 @@ async def btn_chart(m):
 async def btn_tickers(m):
     await m.answer(get_tickers_list_text(), parse_mode='HTML')
 
+@dp.message_handler(lambda msg: msg.text == "🚨 Срочный срез")
+async def btn_emergency_snapshot(m):
+    await m.answer("🚨 Срочный срез... Анализирую все 17 активов 🔍")
+    
+    signals = []
+    for ticker in ALL_TICKERS:
+        if ticker == "SBER":
+            continue
+        if ticker in positions and positions[ticker].get('type') is not None:
+            continue
+        signal, data, _ = await get_signal_for_ticker(ticker)
+        if signal and data:
+            signals.append({
+                'ticker': ticker,
+                'signal': signal,
+                'data': data,
+                'adx': data['adx']
+            })
+    
+    sber_signal, sber_data, sber_expl = await get_sber_signal_detailed()
+    now = datetime.now(pytz.timezone('Europe/Moscow'))
+    
+    msg = f"🚨 <b>СРОЧНЫЙ СРЕЗ</b> 🚨\n"
+    msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"⏰ {now.strftime('%H:%M:%S')}\n\n"
+    
+    if sber_signal:
+        msg += f"🔔 <b>СБЕР: СИГНАЛ {sber_signal}</b>\n"
+        msg += f"   Цена: {sber_data['price']:.2f} | ADX: {sber_data['adx']}\n"
+        msg += f"   🛑 {sber_data['stop']:.2f} | 🎯 {sber_data['target']:.2f}\n"
+        msg += f"   💡 /open SBER {sber_signal} {sber_data['price']:.2f}\n\n"
+    else:
+        msg += f"⚪ <b>СБЕР: НЕТ СИГНАЛА</b>\n"
+        msg += f"   Цена: {sber_data['price']:.2f} | ADX: {sber_data['adx']:.1f}\n"
+        msg += f"   {sber_expl.split(chr(10))[0] if sber_expl else 'Условия не выполнены'}\n\n"
+    
+    if signals:
+        signals.sort(key=lambda x: x['adx'], reverse=True)
+        msg += f"📊 <b>СИГНАЛЫ ПО ОСТАЛЬНЫМ ({len(signals)})</b>\n"
+        msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        for s in signals:
+            data = s['data']
+            emoji = "🟢" if s['signal'] == 'LONG' else "🔴"
+            direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
+            msg += f"{emoji} <b>{data['name']} ({s['ticker']})</b> | {direction} | ADX {data['adx']}\n"
+            msg += f"   💡 /open {s['ticker']} {s['signal']} {data['price']:.2f}\n"
+    else:
+        msg += f"⚪ <b>СИГНАЛОВ ПО ОСТАЛЬНЫМ НЕТ</b>\n"
+    
+    msg += f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"🤖 Срез выполнен вручную"
+    
+    await m.answer(msg, parse_mode='HTML')
+
 @dp.message_handler(lambda msg: msg.text.upper() in ALL_TICKERS)
 async def chart(m):
     ticker = m.text.upper()
@@ -971,7 +1024,7 @@ async def on_startup(dp):
     asyncio.create_task(sber_hourly_loop())
     asyncio.create_task(all_signals_check_loop())
     try:
-        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n\n🔹 СБЕР: сигналы КАЖДЫЙ ЧАС с 10:00 до 22:00\n🔹 ОСТАЛЬНЫЕ 16: ТОП-3 видны сразу, остальные под спойлером\n🔹 ЛУНА: сводка в 10:00, уведомления за 3 дня\n\n📋 /tickers — список всех активов\n/open SBER LONG 310 — открыть сделку\n/close — закрыть\n/status — состояние Сбера\n/balance — статистика")
+        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n\n🔹 СБЕР: сигналы КАЖДЫЙ ЧАС с 10:00 до 22:00\n🔹 ОСТАЛЬНЫЕ 16: ТОП-3 видны сразу, остальные под спойлером\n🔹 ЛУНА: сводка в 10:00, уведомления за 3 дня\n🔹 КНОПКА: 🚨 Срочный срез — моментальный анализ всех 17 активов\n\n📋 /tickers — список всех активов\n/open SBER LONG 310 — открыть сделку\n/close — закрыть\n/status — состояние Сбера\n/balance — статистика")
     except:
         pass
 
@@ -994,6 +1047,7 @@ if __name__ == "__main__":
     print("АНАЛИТИК | СИГНАЛЫ ПО ВСЕМ 17 АКТИВАМ")
     print("Сбер: каждый час | Остальные: ТОП-3 видно, остальные под спойлером")
     print("Стоп 6% | Тейк 12% | ADX > 20")
+    print("🚨 Срочный срез — кнопка в меню")
     print("=" * 50)
     from aiogram.utils import executor
     executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
