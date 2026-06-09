@@ -911,37 +911,340 @@ async def dashboard(req):
     tr = await get_all_trends()
     ph, _, nxt = get_lunar_info()
     now = datetime.now(pytz.timezone('Europe/Moscow'))
-    long = sum(1 for d in tr.values() if d['trend'] == 'бычий')
-    short = sum(1 for d in tr.values() if d['trend'] == 'медвежий')
-    side = sum(1 for d in tr.values() if d['trend'] == 'боковик')
-    rows = ""
-    for t, d in tr.items():
-        p = f"{d['price']:.2f}" if d['price'] else "—"
-        cls = "bull" if d['trend'] == 'бычий' else "bear" if d['trend'] == 'медвежий' else "neutral"
-        sym = "🟢" if d['trend'] == 'бычий' else "🔴" if d['trend'] == 'медвежий' else "⚪"
-        rows += f"<tr><td>{d['name']}</td><td>{t}</td><td>{p}</td><td class='{cls}'>{sym} {d['trend']}</td><td class='bull'>+{d['return_bull']:.2f}%</td><td class='bear'>+{d['return_bear']:.2f}%</td></tr>"
+
+    # --- АНАЛИТИКА ---
+    long_count = sum(1 for d in tr.values() if d['trend'] == 'бычий')
+    short_count = sum(1 for d in tr.values() if d['trend'] == 'медвежий')
+    side_count = sum(1 for d in tr.values() if d['trend'] == 'боковик')
+    total_count = long_count + short_count + side_count
+
+    # Проценты для аналитики
+    short_percent = round((short_count / total_count) * 100, 1) if total_count else 0
+    long_percent = round((long_count / total_count) * 100, 1) if total_count else 0
+    
+    # Определение рыночного настроения
+    market_sentiment = "МЕДВЕЖИЙ (SHORT)" if short_count > long_count else "БЫЧИЙ (LONG)" if long_count > short_count else "НЕЙТРАЛЬНЫЙ"
+    sentiment_color = "#f87171" if short_count > long_count else "#4ade80" if long_count > short_count else "#facc15"
+
+    # --- СТРОИМ HTML ---
     html = f"""
     <!DOCTYPE html>
-    <html><head><title>Аналитик</title><meta charset="UTF-8">
-    <style>
-        body{{background:#0f0f1a;color:#eee;font-family:system-ui;padding:20px;}}
-        .card{{background:#1a1a2e;border-radius:20px;padding:20px;margin-bottom:20px;}}
-        .grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-bottom:20px;}}
-        .stat{{background:#1a1a2e;border-radius:20px;padding:20px;text-align:center;}}
-        .num{{font-size:2.5rem;font-weight:bold;color:#f0c040;}}
-        table{{width:100%;border-collapse:collapse;background:#1a1a2e;border-radius:20px;overflow:hidden;}}
-        th,td{{padding:12px;text-align:left;border-bottom:1px solid #2a2a3e;}}
-        th{{background:#f0c04020;color:#f0c040;}}
-        .bull{{color:#4ade80;}}.bear{{color:#f87171;}}.neutral{{color:#facc15;}}
-        .footer{{text-align:center;color:#666;margin-top:20px;}}
-    </style>
+    <html>
+    <head>
+        <title>АНАЛИТИК | ПРОФАНАЛИТИК</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            body {{
+                background: #0a0c15;
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+                padding: 24px;
+                color: #e2e8f0;
+            }}
+            .container {{
+                max-width: 1400px;
+                margin: 0 auto;
+            }}
+            /* header */
+            .header {{
+                background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+                border-radius: 28px;
+                padding: 28px 32px;
+                margin-bottom: 32px;
+                border: 1px solid #334155;
+                box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5);
+            }}
+            .header h1 {{
+                font-size: 2.2rem;
+                font-weight: 700;
+                background: linear-gradient(135deg, #f0f9ff, #bae6fd);
+                -webkit-background-clip: text;
+                background-clip: text;
+                color: transparent;
+                margin-bottom: 12px;
+            }}
+            .lunar-info {{
+                display: flex;
+                gap: 24px;
+                flex-wrap: wrap;
+                margin-top: 12px;
+                color: #94a3b8;
+            }}
+            .lunar-badge {{
+                background: #1e293b;
+                padding: 6px 14px;
+                border-radius: 40px;
+                font-size: 0.85rem;
+                border-left: 3px solid #facc15;
+            }}
+            /* cards */
+            .stats-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                gap: 20px;
+                margin-bottom: 32px;
+            }}
+            .stat-card {{
+                background: #111827;
+                border-radius: 24px;
+                padding: 20px;
+                text-align: center;
+                border: 1px solid #2d3a4e;
+                transition: 0.2s;
+                box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+            }}
+            .stat-card:hover {{ transform: translateY(-3px); border-color: #4f5b73; }}
+            .stat-value {{
+                font-size: 3rem;
+                font-weight: 800;
+                line-height: 1;
+            }}
+            .stat-label {{
+                font-size: 0.85rem;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                color: #94a3b8;
+                margin-top: 12px;
+            }}
+            .bull { color: #4ade80; }
+            .bear { color: #f87171; }
+            .neutral { color: #facc15; }
+            /* charts */
+            .charts-row {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 24px;
+                margin-bottom: 32px;
+            }}
+            .chart-box {{
+                flex: 1;
+                min-width: 260px;
+                background: #0f172a;
+                border-radius: 24px;
+                padding: 20px;
+                border: 1px solid #2d3a4e;
+            }}
+            .chart-box h3 {{
+                font-size: 1.2rem;
+                margin-bottom: 16px;
+                font-weight: 500;
+                color: #cbd5e1;
+            }}
+            canvas {{
+                max-height: 260px;
+                width: 100%;
+            }}
+            /* table */
+            .table-wrapper {{
+                overflow-x: auto;
+                border-radius: 24px;
+                background: #0f172a;
+                border: 1px solid #2d3a4e;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 0.85rem;
+            }}
+            th {{
+                background: #1e293b;
+                padding: 14px 10px;
+                text-align: left;
+                font-weight: 600;
+                color: #cbd5e6;
+                border-bottom: 1px solid #334155;
+            }}
+            td {{
+                padding: 12px 10px;
+                border-bottom: 1px solid #1e293b;
+            }}
+            tr:hover td {{
+                background-color: rgba(30, 41, 59, 0.5);
+            }}
+            .ticker-badge {{
+                font-weight: 700;
+                background: #1e293b;
+                padding: 4px 8px;
+                border-radius: 20px;
+                display: inline-block;
+                font-size: 0.75rem;
+            }}
+            .trend-bull {{ color: #4ade80; font-weight: 600; }}
+            .trend-bear {{ color: #f87171; font-weight: 600; }}
+            .trend-neutral {{ color: #facc15; font-weight: 600; }}
+            .signal-badge {{
+                background: #facc1510;
+                border: 1px solid #facc15;
+                color: #facc15;
+                padding: 2px 8px;
+                border-radius: 20px;
+                font-size: 0.7rem;
+                font-weight: bold;
+            }}
+            .footer-note {{
+                margin-top: 28px;
+                text-align: center;
+                font-size: 0.75rem;
+                color: #5b6e8c;
+                border-top: 1px solid #1e293b;
+                padding-top: 20px;
+            }}
+            @media (max-width: 700px) {{
+                body {{ padding: 16px; }}
+                .stat-value {{ font-size: 2rem; }}
+                th, td {{ font-size: 0.75rem; padding: 8px 6px; }}
+            }}
+        </style>
     </head>
     <body>
-    <div class="card"><h1>📊 АНАЛИТИК</h1><div>{now.strftime('%d.%m.%Y %H:%M')}</div><div>{ph}</div><div>🌕 Полнолуние: {nxt.strftime('%d.%m.%Y') if nxt else '—'}</div></div>
-    <div class="grid"><div class="stat"><div class="num">{long}</div><div>LONG</div></div><div class="stat"><div class="num">{short}</div><div>SHORT</div></div><div class="stat"><div class="num">{side}</div><div>БОКОВИК</div></div></div>
-    <table><thead><tr><th>Актив</th><th>Тикер</th><th>Цена</th><th>Тренд</th><th>LONG</th><th>SHORT</th></table></thead><tbody>{rows}</tbody></table>
-    <div class="footer">Сбер: сигналы каждый час | Остальные: только при сигнале</div>
-    </body></html>
+    <div class="container">
+        <!-- ШАПКА -->
+        <div class="header">
+            <h1>📊 АНАЛИТИК</h1>
+            <div style="display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
+                <div class="lunar-info">
+                    <span>🗓️ {now.strftime('%d.%m.%Y %H:%M')}</span>
+                    <span class="lunar-badge">🌙 {ph.upper()}</span>
+                    <span class="lunar-badge">🌕 Полнолуние: {nxt.strftime('%d.%m.%Y') if nxt else '—'}</span>
+                </div>
+                <div class="lunar-info">
+                    <span style="background:#1e293b; padding:4px 12px; border-radius:40px;">📐 ADX порог > 20</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- КАРТОЧКИ СТАТИСТИКИ + АНАЛИТИКА -->
+        <div class="stats-grid">
+            <div class="stat-card"><div class="stat-value bull">{long_count}</div><div class="stat-label">🟢 LONG</div></div>
+            <div class="stat-card"><div class="stat-value bear">{short_count}</div><div class="stat-label">🔴 SHORT</div></div>
+            <div class="stat-card"><div class="stat-value neutral">{side_count}</div><div class="stat-label">⚪ БОКОВИК</div></div>
+            <div class="stat-card"><div class="stat-value" style="color: {sentiment_color};">{short_percent}%</div><div class="stat-label">📉 ПРЕОБЛАДАНИЕ SHORT</div></div>
+            <div class="stat-card"><div class="stat-value" style="color: #60a5fa;">{long_percent}%</div><div class="stat-label">📈 % БЫЧЬИХ</div></div>
+            <div class="stat-card"><div class="stat-value" style="color: #c084fc;">{total_count}</div><div class="stat-label">🏷️ ВСЕГО АКТИВОВ</div></div>
+        </div>
+
+        <!-- ГРАФИКИ (распределение + доходность) -->
+        <div class="charts-row">
+            <div class="chart-box">
+                <h3>📊 РАСПРЕДЕЛЕНИЕ ТРЕНДОВ</h3>
+                <canvas id="trendPieChart" width="400" height="250"></canvas>
+            </div>
+            <div class="chart-box">
+                <h3>📊 ПОТЕНЦИАЛЬНАЯ ДОХОДНОСТЬ (LONG/SHORT)</h3>
+                <canvas id="returnBarChart" width="400" height="250"></canvas>
+            </div>
+        </div>
+        
+        <!-- ТАБЛИЦА АКТИВОВ -->
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Актив</th><th>Тикер</th><th>💰 Цена</th><th>📈 Тренд</th><th>🚀 LONG %</th><th>📉 SHORT %</th><th>🔥 СИГНАЛ</th>
+                    </tr>
+                </thead>
+                <tbody>
+    """
+    # Формируем строки таблицы и собираем данные для графиков
+    tickers_for_chart = []
+    long_returns = []
+    short_returns = []
+    
+    for ticker, data in tr.items():
+        price = f"{data['price']:.2f}" if data['price'] else "—"
+        trend_class = ""
+        trend_text = ""
+        if data['trend'] == 'бычий':
+            trend_class = "trend-bull"
+            trend_text = "🟢 БЫЧИЙ"
+        elif data['trend'] == 'медвежий':
+            trend_class = "trend-bear"
+            trend_text = "🔴 МЕДВЕЖИЙ"
+        else:
+            trend_class = "trend-neutral"
+            trend_text = "⚪ БОКОВИК"
+            
+        long_potential = f"+{data['return_bull']:.2f}%"
+        short_potential = f"+{data['return_bear']:.2f}%"
+        
+        # Флаг сильного сигнала: если тренд медвежий и потенциальная доходность SHORT > 4.5% (можно подсветить)
+        signal_badge = ""
+        if data['trend'] == 'медвежий' and data['return_bear'] > 4.5:
+            signal_badge = ' <span class="signal-badge">🔥 ТОП СИГНАЛ</span>'
+        elif data['trend'] == 'бычий' and data['return_bull'] > 4.5:
+            signal_badge = ' <span class="signal-badge">⭐ ПОТЕНЦИАЛ</span>'
+            
+        html += f"""
+            <tr>
+                <td style="font-weight:500;">{data['name']}</td>
+                <td><span class="ticker-badge">{ticker}</span></td>
+                <td><b>{price}</b> ₽</td>
+                <td class="{trend_class}">{trend_text}</td>
+                <td class="bull">{long_potential}</td>
+                <td class="bear">{short_potential}</td>
+                <td>{signal_badge}</td>
+            </tr>
+        """
+        tickers_for_chart.append(data['name'])
+        long_returns.append(data['return_bull'])
+        short_returns.append(data['return_bear'])
+
+    # Завершаем таблицу и добавляем скрипты для графиков
+    html += f"""
+                </tbody>
+            </table>
+        </div>
+        <div class="footer-note">
+            🤖 Сбер: сигналы каждый час | Остальные: только при сигнале<br>
+            💡 Тренды рассчитаны по MA18/MA50. Потенциальная доходность — историческая эффективность стратегии.
+        </div>
+    </div>
+    <script>
+        // График распределения трендов
+        const ctxPie = document.getElementById('trendPieChart').getContext('2d');
+        new Chart(ctxPie, {{
+            type: 'doughnut',
+            data: {{
+                labels: ['LONG (бычьи)', 'SHORT (медвежьи)', 'БОКОВИК'],
+                datasets: [{{
+                    data: [{long_count}, {short_count}, {side_count}],
+                    backgroundColor: ['#4ade80', '#f87171', '#facc15'],
+                    borderWidth: 0,
+                    hoverOffset: 5
+                }}]
+            }},
+            options: {{
+                responsive: true, maintainAspectRatio: true,
+                plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#cbd5e6' }} }} }}
+            }}
+        }});
+
+        // Столбчатая диаграмма доходности (только топ-10 для наглядности)
+        const labelsTop = {tickers_for_chart[:10]};
+        const longTop = {long_returns[:10]};
+        const shortTop = {short_returns[:10]};
+        const ctxBar = document.getElementById('returnBarChart').getContext('2d');
+        new Chart(ctxBar, {{
+            type: 'bar',
+            data: {{
+                labels: labelsTop,
+                datasets: [
+                    {{ label: 'LONG потенциал (%)', data: longTop, backgroundColor: '#4ade8066', borderColor: '#4ade80', borderWidth: 1, borderRadius: 6 }},
+                    {{ label: 'SHORT потенциал (%)', data: shortTop, backgroundColor: '#f8717166', borderColor: '#f87171', borderWidth: 1, borderRadius: 6 }}
+                ]
+            }},
+            options: {{
+                responsive: true, maintainAspectRatio: true,
+                plugins: {{ legend: {{ position: 'top', labels: {{ color: '#cbd5e6' }} }} }},
+                scales: {{ y: {{ grid: {{ color: '#2d3a4e' }}, ticks: {{ color: '#cbd5e6' }} }},
+                          x: {{ ticks: {{ color: '#cbd5e6', rotation: 35, autoSkip: true, maxRotation: 45 }} }} }}
+            }}
+        }});
+    </script>
+    </body>
+    </html>
     """
     return web.Response(text=html, content_type='text/html')
 
