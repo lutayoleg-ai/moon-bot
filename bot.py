@@ -61,7 +61,7 @@ TICKERS = {
 }
 ALL_TICKERS = list(TICKERS.keys())
 
-# === ЛУННЫЕ ДАННЫЕ (только для информации) ===
+# === ЛУННЫЕ ДАННЫЕ ===
 LUNAR_PHASES = {
     "full_moons": [
         ("2026-01-03", "13:04"), ("2026-02-02", "01:10"), ("2026-03-03", "14:39"),
@@ -128,7 +128,7 @@ def get_from_cache(key):
 def set_to_cache(key, data):
     data_cache[key] = (data, datetime.now())
 
-# === СОСТОЯНИЕ ПОЗИЦИЙ (для всех активов) ===
+# === СОСТОЯНИЕ ПОЗИЦИЙ ===
 positions = {}
 last_signal_sent = {}
 daily_pnl = 0.0
@@ -302,9 +302,8 @@ def calc_trend_for_ticker(df):
     spread = abs(ma18 - ma50) / ma50 * 100
     return "боковик" if spread < 0.7 else ("бычий" if ma18 > ma50 else "медвежий")
 
-# === АНАЛИЗ СИГНАЛА ДЛЯ ЛЮБОГО ТИКЕРА ===
+# === АНАЛИЗ СИГНАЛА ===
 async def get_signal_for_ticker(ticker):
-    """Возвращает сигнал для указанного тикера (LONG/SHORT/None) и данные"""
     df = await data_fetcher.fetch_candles_daily(ticker, 100)
     price = await data_fetcher.get_price(ticker)
     
@@ -324,7 +323,6 @@ async def get_signal_for_ticker(ticker):
     golden_cross = (last_ma10 > last_ma30) and (prev_ma10 <= prev_ma30)
     dead_cross = (last_ma10 < last_ma30) and (prev_ma10 >= prev_ma30)
     
-    # ИСПРАВЛЕНО: строгое соответствие направления тренду
     if trend == "bullish" and (adx > STRATEGY['ADX_THRESHOLD'] or golden_cross):
         return "LONG", {
             'ticker': ticker,
@@ -363,17 +361,14 @@ async def get_signal_for_ticker(ticker):
         'ma30': last_ma30
     }, f"ADX = {adx:.1f} (нужно > {STRATEGY['ADX_THRESHOLD']})"
 
-# === СПЕЦИАЛЬНАЯ ФУНКЦИЯ ДЛЯ СБЕРА (с подробным объяснением) ===
+# === ДЛЯ СБЕРА (подробный мониторинг) ===
 async def get_sber_signal_detailed():
-    """Для Сбера — с подробным объяснением, как сейчас"""
     signal, data, explanation = await get_signal_for_ticker("SBER")
     if data is None:
         return None, None, "Нет данных"
-    
     if signal:
         return signal, data, None
     else:
-        # Формируем подробное объяснение
         reasons = []
         if data.get('adx', 0) < STRATEGY['ADX_THRESHOLD']:
             reasons.append(f"⚠️ ADX = {data['adx']:.1f} (нужно > {STRATEGY['ADX_THRESHOLD']}) — рынок во флете")
@@ -385,20 +380,16 @@ async def get_sber_signal_detailed():
             reasons.append("Условия для входа не выполнены")
         return None, data, "\n".join(reasons)
 
-# === ПРОВЕРКА ВСЕХ АКТИВОВ ===
+# === ОТПРАВКА СИГНАЛОВ ПО ВСЕМ АКТИВАМ (со сворачивающимся списком) ===
 async def check_and_send_all_signals():
-    """Проверяет все активы, отправляет ОДНО сообщение со всеми сигналами"""
     global last_signal_sent
     
     signals = []
     for ticker in ALL_TICKERS:
         if ticker == "SBER":
             continue
-        
-        # Пропускаем, если уже есть открытая позиция
         if ticker in positions and positions[ticker].get('type') is not None:
             continue
-        
         signal, data, _ = await get_signal_for_ticker(ticker)
         if signal and data:
             signals.append({
@@ -411,53 +402,49 @@ async def check_and_send_all_signals():
     if not signals:
         return
     
-    # Сортируем по ADX (от最强的 к слабому)
     signals.sort(key=lambda x: x['adx'], reverse=True)
-    
-    # Формируем одно сообщение
     now = datetime.now(pytz.timezone('Europe/Moscow'))
+    
     msg = f"🔔🔔🔔 <b>НАЙДЕНЫ СИГНАЛЫ</b> 🔔🔔🔔\n"
     msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"⏰ {now.strftime('%H:%M')} | Найдено {len(signals)} сигналов\n\n"
     
-    for s in signals:
+    msg += f"📊 <b>САМЫЕ СИЛЬНЫЕ (ТОП-3):</b>\n"
+    msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    top_count = min(3, len(signals))
+    for i in range(top_count):
+        s = signals[i]
         data = s['data']
-        emoji = "🟢" if s['signal'] == "LONG" else "🔴"
-        direction = "LONG (покупка)" if s['signal'] == "LONG" else "SHORT (продажа)"
-        trend_ru = "БЫЧИЙ" if data['trend'] == 'bullish' else "МЕДВЕЖИЙ"
-        trend_emoji = "🟢" if data['trend'] == 'bullish' else "🔴"
-        
-        msg += f"{emoji} <b>{data['name']} ({s['ticker']})</b> | {direction}\n"
-        msg += f"   Цена: {data['price']:.2f} | ADX: {data['adx']}\n"
-        msg += f"   Тренд: {trend_emoji} {trend_ru} | MA10: {data['ma10']:.2f} | MA30: {data['ma30']:.2f}\n"
-        msg += f"   🛑 Стоп: {data['stop']:.2f} | 🎯 Тейк: {data['target']:.2f}\n"
+        emoji = "🟢" if s['signal'] == 'LONG' else "🔴"
+        direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
+        msg += f"{emoji} <b>{data['name']} ({s['ticker']})</b> | {direction} | ADX {data['adx']}\n"
         msg += f"   💡 /open {s['ticker']} {s['signal']} {data['price']:.2f}\n\n"
+    
+    if len(signals) > top_count:
+        msg += f"<details>\n<summary>📋 Остальные {len(signals) - top_count} сигналов (нажмите, чтобы раскрыть)</summary>\n\n"
+        for i in range(top_count, len(signals)):
+            s = signals[i]
+            data = s['data']
+            emoji = "🟢" if s['signal'] == 'LONG' else "🔴"
+            direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
+            msg += f"{emoji} <b>{data['name']} ({s['ticker']})</b> | {direction} | ADX {data['adx']}\n"
+            msg += f"   💡 /open {s['ticker']} {s['signal']} {data['price']:.2f}\n\n"
+        msg += f"</details>\n"
     
     msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"🤖 Сигналы сгенерированы в {now.strftime('%H:%M')}"
     
-    # Отправляем одно сообщение
     try:
         await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
-        # Запоминаем отправленные сигналы
         for s in signals:
             last_signal_sent[s['ticker']] = f"{s['signal']}_{int(s['data']['price'])}"
     except Exception as e:
-        print(f"Ошибка отправки сигналов: {e}")
-
-# === УПРАВЛЕНИЕ ПОЗИЦИЯМИ ===
-async def reset_daily_pnl():
-    global daily_pnl, last_reset_date
-    msk = pytz.timezone('Europe/Moscow')
-    today = datetime.now(msk).date()
-    if last_reset_date != today:
-        daily_pnl = 0.0
-        last_reset_date = today
+        print(f"Ошибка отправки: {e}")
 
 # === ОТПРАВКА СИГНАЛА ПО СБЕРУ (КАЖДЫЙ ЧАС) ===
 async def send_sber_hourly():
-    """Отправка сигнала по Сберу каждый час (как сейчас)"""
-    global positions
+    global positions, daily_pnl
     
     if not CHANNEL_ID:
         return
@@ -473,7 +460,6 @@ async def send_sber_hourly():
     
     trend_ru = "БЫЧИЙ 🟢" if data.get('trend') == 'bullish' else "МЕДВЕЖИЙ 🔴" if data.get('trend') == 'bearish' else "НЕЙТРАЛЬНО ⚪"
     
-    # Проверка выхода из позиции по Сберу
     exit_needed = False
     exit_reason = None
     sber_position = positions.get("SBER", {}).get('type')
@@ -484,7 +470,6 @@ async def send_sber_hourly():
             pnl_check = (price - sber_entry) / sber_entry * 100
         else:
             pnl_check = (sber_entry - price) / sber_entry * 100
-        
         if pnl_check <= -STRATEGY['STOP_LOSS'] * 100:
             exit_needed = True
             exit_reason = f"Стоп-лосс: {pnl_check:.1f}%"
@@ -530,7 +515,6 @@ async def send_sber_hourly():
 💡 Следующая проверка через час
 """
     
-    # Информация об открытой позиции по Сберу
     if sber_position:
         pnl = (price - sber_entry) / sber_entry * 100 if sber_position == 'long' else (sber_entry - price) / sber_entry * 100
         msg += f"\n\n📌 ПОЗИЦИЯ ПО СБЕРУ: {sber_position.upper()}\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%"
@@ -543,7 +527,6 @@ async def send_sber_hourly():
         daily_pnl += pnl_after / 100
         save_trade("SBER", sber_position, sber_entry, price, pnl_after, commission_cost, positions["SBER"].get('is_manual', False))
         positions["SBER"] = {'type': None, 'entry_price': None, 'entry_time': None, 'is_manual': False}
-    
     elif signal and not sber_position:
         positions["SBER"] = {
             'type': signal.lower(),
@@ -558,41 +541,38 @@ async def send_sber_hourly():
     except Exception as e:
         print(f"Ошибка отправки: {e}")
 
-# === ЦИКЛЫ ===
-async def sber_hourly_loop():
-    """Сигналы по Сберу каждый час с 10 до 22"""
-    await asyncio.sleep(10)
-    last_sent_hour = None
-    
-    while True:
-        msk = pytz.timezone('Europe/Moscow')
-        now = datetime.now(msk)
-        current_hour = now.hour
-        current_minute = now.minute
-        
-        if 10 <= current_hour <= 22 and current_minute < 3 and last_sent_hour != current_hour:
-            await send_sber_hourly()
-            last_sent_hour = current_hour
-        
-        await asyncio.sleep(60)
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+async def reset_daily_pnl():
+    global daily_pnl, last_reset_date
+    msk = pytz.timezone('Europe/Moscow')
+    today = datetime.now(msk).date()
+    if last_reset_date != today:
+        daily_pnl = 0.0
+        last_reset_date = today
 
-async def all_signals_check_loop():
-    """Проверка всех активов каждый час (тихо, только при сигнале)"""
-    await asyncio.sleep(30)
-    last_check_hour = None
-    
-    while True:
-        msk = pytz.timezone('Europe/Moscow')
-        now = datetime.now(msk)
-        current_hour = now.hour
-        
-        if 10 <= current_hour <= 22 and last_check_hour != current_hour:
-            await check_and_send_all_signals()
-            last_check_hour = current_hour
-        
-        await asyncio.sleep(60)
+async def get_all_trends():
+    results = {}
+    for ticker in ALL_TICKERS:
+        df = await data_fetcher.fetch_candles_daily(ticker, 100)
+        price = await data_fetcher.get_price(ticker)
+        trend = calc_trend_for_ticker(df)
+        results[ticker] = {**TICKERS[ticker], "price": price, "trend": trend}
+    return results
 
-# === ЛУННАЯ СТРАТЕГИЯ (только информационно) ===
+def get_tickers_list_text():
+    text = "📋 <b>ДОСТУПНЫЕ ТИКЕРЫ</b> (17 активов)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    for i, (ticker, info) in enumerate(TICKERS.items(), 1):
+        text += f"{i}. <b>{info['name']}</b> ({ticker})\n"
+    text += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    text += "💡 <b>Как использовать:</b>\n"
+    text += "   /open SBER LONG 310.50 — открыть LONG\n"
+    text += "   /open GAZP SHORT 180.20 — открыть SHORT\n"
+    text += "   /close — закрыть позицию\n"
+    text += "   /status — состояние Сбера\n"
+    text += "   /balance — общая статистика"
+    return text
+
+# === ЛУННАЯ СТРАТЕГИЯ ===
 async def lunar_notify():
     global lunar_notified_days
     while True:
@@ -615,21 +595,17 @@ async def daily_lunar_summary():
     if get_last_summary_date() == today:
         return
     ph, _, nxt = get_lunar_info()
-    
-    # Собираем тренды по всем активам для сводки
     trends = {}
     for ticker in ALL_TICKERS:
         df = await data_fetcher.fetch_candles_daily(ticker, 100)
         trend = calc_trend_for_ticker(df)
         trends[ticker] = trend
-    
-    long = sum(1 for t in trends.values() if t == 'бычий')
-    short = sum(1 for t in trends.values() if t == 'медвежий')
-    
+    long_cnt = sum(1 for t in trends.values() if t == 'бычий')
+    short_cnt = sum(1 for t in trends.values() if t == 'медвежий')
     txt = f"🌙 **{datetime.now(msk).strftime('%d.%m.%Y')}**\n"
     if nxt:
         txt += f"🌕 Полнолуние {nxt.strftime('%d.%m.%Y')}\n"
-    txt += f"🟢 LONG: {long}  🔴 SHORT: {short}\n💡 /status /balance"
+    txt += f"🟢 LONG: {long_cnt}  🔴 SHORT: {short_cnt}\n💡 /status /balance"
     save_daily_summary(today, txt)
     try:
         await bot.send_message(CHANNEL_ID, txt, parse_mode='Markdown')
@@ -643,33 +619,31 @@ async def daily_loop():
             await daily_lunar_summary()
         await asyncio.sleep(60)
 
-# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
-async def get_all_trends():
-    results = {}
-    for ticker in ALL_TICKERS:
-        df = await data_fetcher.fetch_candles_daily(ticker, 100)
-        price = await data_fetcher.get_price(ticker)
-        trend = calc_trend_for_ticker(df)
-        results[ticker] = {**TICKERS[ticker], "price": price, "trend": trend}
-    return results
+# === ЦИКЛЫ СИГНАЛОВ ===
+async def sber_hourly_loop():
+    await asyncio.sleep(10)
+    last_sent_hour = None
+    while True:
+        msk = pytz.timezone('Europe/Moscow')
+        now = datetime.now(msk)
+        current_hour = now.hour
+        current_minute = now.minute
+        if 10 <= current_hour <= 22 and current_minute < 3 and last_sent_hour != current_hour:
+            await send_sber_hourly()
+            last_sent_hour = current_hour
+        await asyncio.sleep(60)
 
-def get_tickers_list_text():
-    """Возвращает текст со списком всех тикеров"""
-    text = "📋 <b>ДОСТУПНЫЕ ТИКЕРЫ</b> (17 активов)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    
-    ticker_list = list(TICKERS.items())
-    for i, (ticker, info) in enumerate(ticker_list, 1):
-        text += f"{i}. <b>{info['name']}</b> ({ticker})\n"
-    
-    text += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += "💡 <b>Как использовать:</b>\n"
-    text += "   /open SBER LONG 310.50 — открыть LONG\n"
-    text += "   /open GAZP SHORT 180.20 — открыть SHORT\n"
-    text += "   /close — закрыть позицию по текущему активу\n"
-    text += "   /status — состояние по Сберу\n"
-    text += "   /balance — общая статистика"
-    
-    return text
+async def all_signals_check_loop():
+    await asyncio.sleep(30)
+    last_check_hour = None
+    while True:
+        msk = pytz.timezone('Europe/Moscow')
+        now = datetime.now(msk)
+        current_hour = now.hour
+        if 10 <= current_hour <= 22 and last_check_hour != current_hour:
+            await check_and_send_all_signals()
+            last_check_hour = current_hour
+        await asyncio.sleep(60)
 
 # === НАСТРОЙКА БОТА ===
 logging.basicConfig(level=logging.INFO)
@@ -677,7 +651,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
 
-# === КЛАВИАТУРА ===
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🌙 Фазы Луны"), KeyboardButton(text="📈 Открыть позицию")],
@@ -695,7 +668,7 @@ async def start_cmd(m):
         "🔹 <b>СБЕР (сигналы каждый час с 10:00 до 22:00)</b>\n"
         "   Стратегия: MA10/MA30 + ADX | Стоп 6% | Тейк 12%\n\n"
         "🔹 <b>ОСТАЛЬНЫЕ 16 АКТИВОВ</b>\n"
-        "   Проверяются каждый час, сообщение приходит ТОЛЬКО при сигнале\n\n"
+        "   Проверяются каждый час, ТОП-3 видны сразу, остальные под спойлером\n\n"
         "🔹 <b>ЛУННАЯ СТРАТЕГИЯ</b>\n"
         "   Ежедневная сводка в 10:00 | Уведомление за 3 дня до полнолуния\n\n"
         "🔹 <b>КОМАНДЫ:</b>\n"
@@ -715,65 +688,47 @@ async def tickers_cmd(m):
 async def status_cmd(m):
     price = await data_fetcher.get_price("SBER")
     df = await data_fetcher.fetch_candles_daily("SBER", 100)
-    
     if price is None or df is None:
         await m.answer("⚠️ Нет данных")
         return
-    
     trend = get_trend(df)
     adx = calculate_adx(df)
     ma10 = df['close'].rolling(10).mean().iloc[-1]
     ma30 = df['close'].rolling(30).mean().iloc[-1]
-    
     trend_ru = "БЫЧИЙ 🟢" if trend == "bullish" else "МЕДВЕЖИЙ 🔴" if trend == "bearish" else "БОКОВИК ⚪"
-    
     msg = f"📊 <b>СБЕР - СТАТУС</b>\n━━━━━━━━━━━━━━━━━━━\n💰 Цена: <b>{price:.2f} ₽</b>\n"
-    msg += f"📈 Тренд: {trend_ru}\n"
-    msg += f"📊 MA10: {ma10:.2f} | MA30: {ma30:.2f}\n"
-    msg += f"📈 ADX: {adx:.1f}\n"
-    
+    msg += f"📈 Тренд: {trend_ru}\n📊 MA10: {ma10:.2f} | MA30: {ma30:.2f}\n📈 ADX: {adx:.1f}\n"
     sber_pos = positions.get("SBER", {}).get('type')
     sber_entry = positions.get("SBER", {}).get('entry_price') if sber_pos else None
-    
     if sber_pos and sber_entry:
         pnl = (price - sber_entry) / sber_entry * 100 if sber_pos == 'long' else (sber_entry - price) / sber_entry * 100
         commission_cost = COMMISSION * 2 * 100
-        msg += f"\n📌 ПОЗИЦИЯ: {sber_pos.upper()}\n"
-        msg += f"   Вход: {sber_entry:.2f} ₽\n"
-        msg += f"   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n"
-        msg += f"   С комиссией: {'+' if pnl - commission_cost >= 0 else ''}{pnl - commission_cost:.2f}%\n"
+        msg += f"\n📌 ПОЗИЦИЯ: {sber_pos.upper()}\n   Вход: {sber_entry:.2f} ₽\n   P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n   С комиссией: {'+' if pnl - commission_cost >= 0 else ''}{pnl - commission_cost:.2f}%\n"
     else:
         msg += f"\n📌 ПОЗИЦИЯ: НЕТ\n"
-    
     msg += f"\n📅 Дневной P&L: {'+' if daily_pnl*100 >= 0 else ''}{daily_pnl*100:.2f}%"
-    
     await m.answer(msg, parse_mode='HTML')
 
 @dp.message_handler(commands=['open'])
 async def open_cmd(m):
     global positions
-    
     parts = m.text.split()
     if len(parts) != 4 or parts[2].upper() not in ['LONG', 'SHORT']:
         await m.answer("📝 /open SBER LONG 310.50\nили\n📝 /open GAZP SHORT 180.20")
         return
-    
     ticker = parts[1].upper()
     if ticker not in TICKERS:
         await m.answer(f"❌ Тикер {ticker} не найден. Список: /tickers")
         return
-    
     if ticker in positions and positions[ticker].get('type') is not None:
         await m.answer(f"⚠️ Уже есть открытая позиция по {TICKERS[ticker]['name']}. Сначала закройте /close")
         return
-    
     direction = parts[2].upper()
     try:
         entry_price = float(parts[3])
     except:
         await m.answer("❌ Неверная цена")
         return
-    
     now = datetime.now(pytz.timezone('Europe/Moscow'))
     if ticker not in positions:
         positions[ticker] = {}
@@ -781,17 +736,14 @@ async def open_cmd(m):
     positions[ticker]['entry_price'] = entry_price
     positions[ticker]['entry_time'] = now
     positions[ticker]['is_manual'] = True
-    
     stop = entry_price * (1 - STRATEGY['STOP_LOSS']) if direction == 'LONG' else entry_price * (1 + STRATEGY['STOP_LOSS'])
     take = entry_price * (1 + STRATEGY['TAKE_PROFIT']) if direction == 'LONG' else entry_price * (1 - STRATEGY['TAKE_PROFIT'])
-    
     msg = f"✅ Ручное открытие {direction} по {TICKERS[ticker]['name']} ({ticker})\n💰 Вход: {entry_price:.2f}\n🛑 Стоп: {stop:.2f}\n🎯 Тейк: {take:.2f}"
     await m.answer(msg)
 
 @dp.message_handler(commands=['close'])
 async def close_cmd(m):
     global positions, daily_pnl
-    
     active_ticker = None
     active_pos = None
     for ticker, pos in positions.items():
@@ -799,50 +751,35 @@ async def close_cmd(m):
             active_ticker = ticker
             active_pos = pos
             break
-    
     if not active_ticker or active_pos is None:
         await m.answer("⚠️ Нет открытой позиции")
         return
-    
     price = await data_fetcher.get_price(active_ticker)
     if not price:
         await m.answer("⚠️ Нет цены")
         return
-    
     if active_pos['type'] == 'long':
         pnl = (price - active_pos['entry_price']) / active_pos['entry_price'] * 100
     else:
         pnl = (active_pos['entry_price'] - price) / active_pos['entry_price'] * 100
-    
     commission_cost = COMMISSION * 2 * 100
     pnl_after = pnl - commission_cost
     daily_pnl += pnl_after / 100
-    
     save_trade(active_ticker, active_pos['type'], active_pos['entry_price'], price, pnl_after, commission_cost, active_pos.get('is_manual', False))
-    
     msg = f"✅ Закрыто {active_pos['type'].upper()} по {TICKERS[active_ticker]['name']} ({active_ticker})\n💰 Вход: {active_pos['entry_price']:.2f}\n💰 Выход: {price:.2f}\n📊 P&L: {pnl:+.2f}%\n💸 С комиссией: {pnl_after:+.2f}%"
-    
     positions[active_ticker] = {'type': None, 'entry_price': None, 'entry_time': None, 'is_manual': False}
-    
     await m.answer(msg)
 
 @dp.message_handler(commands=['balance'])
 async def balance_cmd(m):
     stats = get_stats()
     price = await data_fetcher.get_price("SBER")
-    
     msg = f"📊 <b>СТАТИСТИКА ПО СДЕЛКАМ</b>\n━━━━━━━━━━━━━━━━━━━\n"
     msg += f"💰 Цена Сбера: {price:.2f} ₽\n\n" if price else ""
-    msg += f"📈 <b>ОБЩАЯ СТАТИСТИКА</b>\n"
-    msg += f"   Всего сделок: {stats['total_trades']}\n"
-    msg += f"   Прибыльных: {stats['winning_trades']}\n"
-    msg += f"   Убыточных: {stats['losing_trades']}\n"
-    msg += f"   Win Rate: {stats['win_rate']:.1f}%\n"
-    msg += f"   Общий P&L: {stats['total_pnl']:+.2f}%\n"
-    msg += f"   Средний P&L: {stats['avg_pnl']:+.2f}%\n\n"
-    msg += f"📅 <b>СЕГОДНЯ</b>\n"
-    msg += f"   P&L: {daily_pnl*100:+.2f}%"
-    
+    msg += f"📈 <b>ОБЩАЯ</b>\n   Всего сделок: {stats['total_trades']}\n"
+    msg += f"   Прибыльных: {stats['winning_trades']}\n   Убыточных: {stats['losing_trades']}\n"
+    msg += f"   Win Rate: {stats['win_rate']:.1f}%\n   Общий P&L: {stats['total_pnl']:+.2f}%\n"
+    msg += f"   Средний P&L: {stats['avg_pnl']:+.2f}%\n\n📅 <b>СЕГОДНЯ</b>\n   P&L: {daily_pnl*100:+.2f}%"
     await m.answer(msg, parse_mode='HTML')
 
 # === КНОПКИ ===
@@ -911,251 +848,20 @@ async def dashboard(req):
     tr = await get_all_trends()
     ph, _, nxt = get_lunar_info()
     now = datetime.now(pytz.timezone('Europe/Moscow'))
-
-    # --- АНАЛИТИКА ---
     long_count = sum(1 for d in tr.values() if d['trend'] == 'бычий')
     short_count = sum(1 for d in tr.values() if d['trend'] == 'медвежий')
     side_count = sum(1 for d in tr.values() if d['trend'] == 'боковик')
     total_count = long_count + short_count + side_count
-
-    # Проценты для аналитики
     short_percent = round((short_count / total_count) * 100, 1) if total_count else 0
     long_percent = round((long_count / total_count) * 100, 1) if total_count else 0
-    
-    # Определение рыночного настроения
-    market_sentiment = "МЕДВЕЖИЙ (SHORT)" if short_count > long_count else "БЫЧИЙ (LONG)" if long_count > short_count else "НЕЙТРАЛЬНЫЙ"
     sentiment_color = "#f87171" if short_count > long_count else "#4ade80" if long_count > short_count else "#facc15"
-
-    # --- СТРОИМ HTML ---
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>АНАЛИТИК | ПРОФАНАЛИТИК</title>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-        <style>
-            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-            body {{
-                background: #0a0c15;
-                font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-                padding: 24px;
-                color: #e2e8f0;
-            }}
-            .container {{
-                max-width: 1400px;
-                margin: 0 auto;
-            }}
-            /* header */
-            .header {{
-                background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
-                border-radius: 28px;
-                padding: 28px 32px;
-                margin-bottom: 32px;
-                border: 1px solid #334155;
-                box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5);
-            }}
-            .header h1 {{
-                font-size: 2.2rem;
-                font-weight: 700;
-                background: linear-gradient(135deg, #f0f9ff, #bae6fd);
-                -webkit-background-clip: text;
-                background-clip: text;
-                color: transparent;
-                margin-bottom: 12px;
-            }}
-            .lunar-info {{
-                display: flex;
-                gap: 24px;
-                flex-wrap: wrap;
-                margin-top: 12px;
-                color: #94a3b8;
-            }}
-            .lunar-badge {{
-                background: #1e293b;
-                padding: 6px 14px;
-                border-radius: 40px;
-                font-size: 0.85rem;
-                border-left: 3px solid #facc15;
-            }}
-            /* cards */
-            .stats-grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-                gap: 20px;
-                margin-bottom: 32px;
-            }}
-            .stat-card {{
-                background: #111827;
-                border-radius: 24px;
-                padding: 20px;
-                text-align: center;
-                border: 1px solid #2d3a4e;
-                transition: 0.2s;
-                box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
-            }}
-            .stat-card:hover {{ transform: translateY(-3px); border-color: #4f5b73; }}
-            .stat-value {{
-                font-size: 3rem;
-                font-weight: 800;
-                line-height: 1;
-            }}
-            .stat-label {{
-                font-size: 0.85rem;
-                text-transform: uppercase;
-                letter-spacing: 1px;
-                color: #94a3b8;
-                margin-top: 12px;
-            }}
-            .bull { color: #4ade80; }
-            .bear { color: #f87171; }
-            .neutral { color: #facc15; }
-            /* charts */
-            .charts-row {{
-                display: flex;
-                flex-wrap: wrap;
-                gap: 24px;
-                margin-bottom: 32px;
-            }}
-            .chart-box {{
-                flex: 1;
-                min-width: 260px;
-                background: #0f172a;
-                border-radius: 24px;
-                padding: 20px;
-                border: 1px solid #2d3a4e;
-            }}
-            .chart-box h3 {{
-                font-size: 1.2rem;
-                margin-bottom: 16px;
-                font-weight: 500;
-                color: #cbd5e1;
-            }}
-            canvas {{
-                max-height: 260px;
-                width: 100%;
-            }}
-            /* table */
-            .table-wrapper {{
-                overflow-x: auto;
-                border-radius: 24px;
-                background: #0f172a;
-                border: 1px solid #2d3a4e;
-            }}
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-                font-size: 0.85rem;
-            }}
-            th {{
-                background: #1e293b;
-                padding: 14px 10px;
-                text-align: left;
-                font-weight: 600;
-                color: #cbd5e6;
-                border-bottom: 1px solid #334155;
-            }}
-            td {{
-                padding: 12px 10px;
-                border-bottom: 1px solid #1e293b;
-            }}
-            tr:hover td {{
-                background-color: rgba(30, 41, 59, 0.5);
-            }}
-            .ticker-badge {{
-                font-weight: 700;
-                background: #1e293b;
-                padding: 4px 8px;
-                border-radius: 20px;
-                display: inline-block;
-                font-size: 0.75rem;
-            }}
-            .trend-bull {{ color: #4ade80; font-weight: 600; }}
-            .trend-bear {{ color: #f87171; font-weight: 600; }}
-            .trend-neutral {{ color: #facc15; font-weight: 600; }}
-            .signal-badge {{
-                background: #facc1510;
-                border: 1px solid #facc15;
-                color: #facc15;
-                padding: 2px 8px;
-                border-radius: 20px;
-                font-size: 0.7rem;
-                font-weight: bold;
-            }}
-            .footer-note {{
-                margin-top: 28px;
-                text-align: center;
-                font-size: 0.75rem;
-                color: #5b6e8c;
-                border-top: 1px solid #1e293b;
-                padding-top: 20px;
-            }}
-            @media (max-width: 700px) {{
-                body {{ padding: 16px; }}
-                .stat-value {{ font-size: 2rem; }}
-                th, td {{ font-size: 0.75rem; padding: 8px 6px; }}
-            }}
-        </style>
-    </head>
-    <body>
-    <div class="container">
-        <!-- ШАПКА -->
-        <div class="header">
-            <h1>📊 АНАЛИТИК</h1>
-            <div style="display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
-                <div class="lunar-info">
-                    <span>🗓️ {now.strftime('%d.%m.%Y %H:%M')}</span>
-                    <span class="lunar-badge">🌙 {ph.upper()}</span>
-                    <span class="lunar-badge">🌕 Полнолуние: {nxt.strftime('%d.%m.%Y') if nxt else '—'}</span>
-                </div>
-                <div class="lunar-info">
-                    <span style="background:#1e293b; padding:4px 12px; border-radius:40px;">📐 ADX порог > 20</span>
-                </div>
-            </div>
-        </div>
-
-        <!-- КАРТОЧКИ СТАТИСТИКИ + АНАЛИТИКА -->
-        <div class="stats-grid">
-            <div class="stat-card"><div class="stat-value bull">{long_count}</div><div class="stat-label">🟢 LONG</div></div>
-            <div class="stat-card"><div class="stat-value bear">{short_count}</div><div class="stat-label">🔴 SHORT</div></div>
-            <div class="stat-card"><div class="stat-value neutral">{side_count}</div><div class="stat-label">⚪ БОКОВИК</div></div>
-            <div class="stat-card"><div class="stat-value" style="color: {sentiment_color};">{short_percent}%</div><div class="stat-label">📉 ПРЕОБЛАДАНИЕ SHORT</div></div>
-            <div class="stat-card"><div class="stat-value" style="color: #60a5fa;">{long_percent}%</div><div class="stat-label">📈 % БЫЧЬИХ</div></div>
-            <div class="stat-card"><div class="stat-value" style="color: #c084fc;">{total_count}</div><div class="stat-label">🏷️ ВСЕГО АКТИВОВ</div></div>
-        </div>
-
-        <!-- ГРАФИКИ (распределение + доходность) -->
-        <div class="charts-row">
-            <div class="chart-box">
-                <h3>📊 РАСПРЕДЕЛЕНИЕ ТРЕНДОВ</h3>
-                <canvas id="trendPieChart" width="400" height="250"></canvas>
-            </div>
-            <div class="chart-box">
-                <h3>📊 ПОТЕНЦИАЛЬНАЯ ДОХОДНОСТЬ (LONG/SHORT)</h3>
-                <canvas id="returnBarChart" width="400" height="250"></canvas>
-            </div>
-        </div>
-        
-        <!-- ТАБЛИЦА АКТИВОВ -->
-        <div class="table-wrapper">
-            <table>
-                <thead>
-                    <tr>
-                        <th>Актив</th><th>Тикер</th><th>💰 Цена</th><th>📈 Тренд</th><th>🚀 LONG %</th><th>📉 SHORT %</th><th>🔥 СИГНАЛ</th>
-                    </tr>
-                </thead>
-                <tbody>
-    """
-    # Формируем строки таблицы и собираем данные для графиков
-    tickers_for_chart = []
+    
+    rows = ""
+    tickers_names = []
     long_returns = []
     short_returns = []
-    
     for ticker, data in tr.items():
         price = f"{data['price']:.2f}" if data['price'] else "—"
-        trend_class = ""
-        trend_text = ""
         if data['trend'] == 'бычий':
             trend_class = "trend-bull"
             trend_text = "🟢 БЫЧИЙ"
@@ -1165,101 +871,96 @@ async def dashboard(req):
         else:
             trend_class = "trend-neutral"
             trend_text = "⚪ БОКОВИК"
-            
-        long_potential = f"+{data['return_bull']:.2f}%"
-        short_potential = f"+{data['return_bear']:.2f}%"
-        
-        # Флаг сильного сигнала: если тренд медвежий и потенциальная доходность SHORT > 4.5% (можно подсветить)
-        signal_badge = ""
-        if data['trend'] == 'медвежий' and data['return_bear'] > 4.5:
-            signal_badge = ' <span class="signal-badge">🔥 ТОП СИГНАЛ</span>'
-        elif data['trend'] == 'бычий' and data['return_bull'] > 4.5:
-            signal_badge = ' <span class="signal-badge">⭐ ПОТЕНЦИАЛ</span>'
-            
-        html += f"""
-            <tr>
-                <td style="font-weight:500;">{data['name']}</td>
-                <td><span class="ticker-badge">{ticker}</span></td>
-                <td><b>{price}</b> ₽</td>
-                <td class="{trend_class}">{trend_text}</td>
-                <td class="bull">{long_potential}</td>
-                <td class="bear">{short_potential}</td>
-                <td>{signal_badge}</td>
-            </tr>
-        """
-        tickers_for_chart.append(data['name'])
+        rows += f"<tr><td style='font-weight:500;'>{data['name']}</td><td><b>{ticker}</b></td><td><b>{price}</b> ₽</td><td class='{trend_class}'>{trend_text}</td><td class='bull'>+{data['return_bull']:.2f}%</td><td class='bear'>+{data['return_bear']:.2f}%</td></tr>"
+        tickers_names.append(data['name'])
         long_returns.append(data['return_bull'])
         short_returns.append(data['return_bear'])
-
-    # Завершаем таблицу и добавляем скрипты для графиков
-    html += f"""
-                </tbody>
-            </table>
-        </div>
-        <div class="footer-note">
-            🤖 Сбер: сигналы каждый час | Остальные: только при сигнале<br>
-            💡 Тренды рассчитаны по MA18/MA50. Потенциальная доходность — историческая эффективность стратегии.
+    
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>АНАЛИТИК | ПРОФАНАЛИТИК</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ background: #0a0c15; font-family: 'Inter', system-ui, sans-serif; padding: 24px; color: #e2e8f0; }}
+        .container {{ max-width: 1400px; margin: 0 auto; }}
+        .header {{ background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); border-radius: 28px; padding: 28px 32px; margin-bottom: 32px; border: 1px solid #334155; }}
+        .header h1 {{ font-size: 2rem; font-weight: 700; background: linear-gradient(135deg, #f0f9ff, #bae6fd); -webkit-background-clip: text; background-clip: text; color: transparent; }}
+        .lunar-info {{ display: flex; gap: 20px; flex-wrap: wrap; margin-top: 16px; color: #94a3b8; }}
+        .lunar-badge {{ background: #1e293b; padding: 6px 14px; border-radius: 40px; font-size: 0.85rem; border-left: 3px solid #facc15; }}
+        .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 20px; margin-bottom: 32px; }}
+        .stat-card {{ background: #111827; border-radius: 24px; padding: 20px; text-align: center; border: 1px solid #2d3a4e; transition: 0.2s; }}
+        .stat-card:hover {{ transform: translateY(-3px); border-color: #4f5b73; }}
+        .stat-value {{ font-size: 2.5rem; font-weight: 800; }}
+        .stat-label {{ font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; color: #94a3b8; margin-top: 10px; }}
+        .bull {{ color: #4ade80; }} .bear {{ color: #f87171; }} .neutral {{ color: #facc15; }}
+        .charts-row {{ display: flex; flex-wrap: wrap; gap: 24px; margin-bottom: 32px; }}
+        .chart-box {{ flex: 1; min-width: 280px; background: #0f172a; border-radius: 24px; padding: 20px; border: 1px solid #2d3a4e; }}
+        .chart-box h3 {{ font-size: 1.1rem; margin-bottom: 16px; color: #cbd5e1; }}
+        canvas {{ max-height: 260px; width: 100%; }}
+        .table-wrapper {{ overflow-x: auto; border-radius: 24px; background: #0f172a; border: 1px solid #2d3a4e; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
+        th {{ background: #1e293b; padding: 14px 10px; text-align: left; color: #cbd5e6; border-bottom: 1px solid #334155; }}
+        td {{ padding: 12px 10px; border-bottom: 1px solid #1e293b; }}
+        tr:hover td {{ background-color: rgba(30, 41, 59, 0.5); }}
+        .trend-bull {{ color: #4ade80; font-weight: 600; }} .trend-bear {{ color: #f87171; font-weight: 600; }} .trend-neutral {{ color: #facc15; font-weight: 600; }}
+        .footer-note {{ margin-top: 28px; text-align: center; font-size: 0.75rem; color: #5b6e8c; border-top: 1px solid #1e293b; padding-top: 20px; }}
+        @media (max-width: 700px) {{ body {{ padding: 16px; }} .stat-value {{ font-size: 1.8rem; }} th, td {{ font-size: 0.7rem; padding: 6px 4px; }} }}
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>📊 АНАЛИТИК</h1>
+        <div class="lunar-info">
+            <span>🗓️ {now.strftime('%d.%m.%Y %H:%M')}</span>
+            <span class="lunar-badge">🌙 {ph.upper()}</span>
+            <span class="lunar-badge">🌕 Полнолуние: {nxt.strftime('%d.%m.%Y') if nxt else '—'}</span>
         </div>
     </div>
-    <script>
-        // График распределения трендов
-        const ctxPie = document.getElementById('trendPieChart').getContext('2d');
-        new Chart(ctxPie, {{
-            type: 'doughnut',
-            data: {{
-                labels: ['LONG (бычьи)', 'SHORT (медвежьи)', 'БОКОВИК'],
-                datasets: [{{
-                    data: [{long_count}, {short_count}, {side_count}],
-                    backgroundColor: ['#4ade80', '#f87171', '#facc15'],
-                    borderWidth: 0,
-                    hoverOffset: 5
-                }}]
-            }},
-            options: {{
-                responsive: true, maintainAspectRatio: true,
-                plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#cbd5e6' }} }} }}
-            }}
-        }});
-
-        // Столбчатая диаграмма доходности (только топ-10 для наглядности)
-        const labelsTop = {tickers_for_chart[:10]};
-        const longTop = {long_returns[:10]};
-        const shortTop = {short_returns[:10]};
-        const ctxBar = document.getElementById('returnBarChart').getContext('2d');
-        new Chart(ctxBar, {{
-            type: 'bar',
-            data: {{
-                labels: labelsTop,
-                datasets: [
-                    {{ label: 'LONG потенциал (%)', data: longTop, backgroundColor: '#4ade8066', borderColor: '#4ade80', borderWidth: 1, borderRadius: 6 }},
-                    {{ label: 'SHORT потенциал (%)', data: shortTop, backgroundColor: '#f8717166', borderColor: '#f87171', borderWidth: 1, borderRadius: 6 }}
-                ]
-            }},
-            options: {{
-                responsive: true, maintainAspectRatio: true,
-                plugins: {{ legend: {{ position: 'top', labels: {{ color: '#cbd5e6' }} }} }},
-                scales: {{ y: {{ grid: {{ color: '#2d3a4e' }}, ticks: {{ color: '#cbd5e6' }} }},
-                          x: {{ ticks: {{ color: '#cbd5e6', rotation: 35, autoSkip: true, maxRotation: 45 }} }} }}
-            }}
-        }});
-    </script>
-    </body>
-    </html>
+    <div class="stats-grid">
+        <div class="stat-card"><div class="stat-value bull">{long_count}</div><div class="stat-label">🟢 LONG</div></div>
+        <div class="stat-card"><div class="stat-value bear">{short_count}</div><div class="stat-label">🔴 SHORT</div></div>
+        <div class="stat-card"><div class="stat-value neutral">{side_count}</div><div class="stat-label">⚪ БОКОВИК</div></div>
+        <div class="stat-card"><div class="stat-value" style="color: {sentiment_color};">{short_percent}%</div><div class="stat-label">📉 ПРЕОБЛАДАНИЕ SHORT</div></div>
+        <div class="stat-card"><div class="stat-value" style="color: #60a5fa;">{long_percent}%</div><div class="stat-label">📈 % БЫЧЬИХ</div></div>
+        <div class="stat-card"><div class="stat-value" style="color: #c084fc;">{total_count}</div><div class="stat-label">🏷️ ВСЕГО АКТИВОВ</div></div>
+    </div>
+    <div class="charts-row">
+        <div class="chart-box"><h3>📊 РАСПРЕДЕЛЕНИЕ ТРЕНДОВ</h3><canvas id="trendPieChart"></canvas></div>
+        <div class="chart-box"><h3>📊 ПОТЕНЦИАЛЬНАЯ ДОХОДНОСТЬ (ТОП-10)</h3><canvas id="returnBarChart"></canvas></div>
+    </div>
+    <div class="table-wrapper">
+        <table>
+            <thead><tr><th>Актив</th><th>Тикер</th><th>💰 Цена</th><th>📈 Тренд</th><th>🚀 LONG %</th><th>📉 SHORT %</th></tr></thead>
+            <tbody>{rows}</tbody>
+        </table>
+    </div>
+    <div class="footer-note">🤖 Сбер: сигналы каждый час | Остальные: ТОП-3 видны сразу, остальные под спойлером</div>
+</div>
+<script>
+    new Chart(document.getElementById('trendPieChart'), {{
+        type: 'doughnut',
+        data: {{ labels: ['LONG', 'SHORT', 'БОКОВИК'], datasets: [{{ data: [{long_count}, {short_count}, {side_count}], backgroundColor: ['#4ade80', '#f87171', '#facc15'], borderWidth: 0 }}] }},
+        options: {{ responsive: true, maintainAspectRatio: true, plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#cbd5e6' }} }} }} }}
+    }});
+    new Chart(document.getElementById('returnBarChart'), {{
+        type: 'bar',
+        data: {{ labels: {tickers_names[:10]}, datasets: [
+            {{ label: 'LONG потенциал (%)', data: {long_returns[:10]}, backgroundColor: '#4ade8066', borderColor: '#4ade80', borderWidth: 1 }},
+            {{ label: 'SHORT потенциал (%)', data: {short_returns[:10]}, backgroundColor: '#f8717166', borderColor: '#f87171', borderWidth: 1 }}
+        ] }},
+        options: {{ responsive: true, maintainAspectRatio: true, plugins: {{ legend: {{ position: 'top', labels: {{ color: '#cbd5e6' }} }} }}, scales: {{ y: {{ grid: {{ color: '#2d3a4e' }}, ticks: {{ color: '#cbd5e6' }} }}, x: {{ ticks: {{ color: '#cbd5e6', rotation: 35, autoSkip: true }} }} }} }}
+    }});
+</script>
+</body>
+</html>
     """
     return web.Response(text=html, content_type='text/html')
-
-async def health(req):
-    return web.Response(text="OK")
-
-async def web_server():
-    app = web.Application()
-    app.router.add_get('/health', health)
-    app.router.add_get('/dashboard', dashboard)
-    app.router.add_get('/', dashboard)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', 10000).start()
-    print("🌐 Веб-сервер запущен")
 
 # === ЗАПУСК ===
 async def on_startup(dp):
@@ -1270,7 +971,7 @@ async def on_startup(dp):
     asyncio.create_task(sber_hourly_loop())
     asyncio.create_task(all_signals_check_loop())
     try:
-        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n\n🔹 СБЕР: сигналы КАЖДЫЙ ЧАС с 10:00 до 22:00\n🔹 ОСТАЛЬНЫЕ 16: проверка каждый час, сообщение ТОЛЬКО при сигнале\n🔹 ЛУНА: сводка в 10:00, уведомления за 3 дня\n\n📋 /tickers — список всех активов\n/open SBER LONG 310 — открыть сделку\n/close — закрыть\n/status — состояние Сбера\n/balance — статистика")
+        await bot.send_message(MY_CHAT_ID, "🚀 Бот запущен\n\n🔹 СБЕР: сигналы КАЖДЫЙ ЧАС с 10:00 до 22:00\n🔹 ОСТАЛЬНЫЕ 16: ТОП-3 видны сразу, остальные под спойлером\n🔹 ЛУНА: сводка в 10:00, уведомления за 3 дня\n\n📋 /tickers — список всех активов\n/open SBER LONG 310 — открыть сделку\n/close — закрыть\n/status — состояние Сбера\n/balance — статистика")
     except:
         pass
 
@@ -1278,10 +979,20 @@ async def on_shutdown(dp):
     await data_fetcher.close()
     await bot.close()
 
+async def web_server():
+    app = web.Application()
+    app.router.add_get('/health', lambda req: web.Response(text="OK"))
+    app.router.add_get('/dashboard', dashboard)
+    app.router.add_get('/', dashboard)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, '0.0.0.0', 10000).start()
+    print("🌐 Веб-сервер запущен")
+
 if __name__ == "__main__":
     print("=" * 50)
     print("АНАЛИТИК | СИГНАЛЫ ПО ВСЕМ 17 АКТИВАМ")
-    print("Сбер: каждый час | Остальные: только при сигнале")
+    print("Сбер: каждый час | Остальные: ТОП-3 видно, остальные под спойлером")
     print("Стоп 6% | Тейк 12% | ADX > 20")
     print("=" * 50)
     from aiogram.utils import executor
