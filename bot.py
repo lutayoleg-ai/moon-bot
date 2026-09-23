@@ -41,7 +41,6 @@ STRATEGY = {
 COMMISSION = 0.003
 MOEX_TIMEOUT = 15
 
-# === НАСТРОЙКА ЛОГИРОВАНИЯ ===
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -102,11 +101,9 @@ def _msk():
     return pytz.timezone('Europe/Moscow')
 
 def _parse_lunar_datetime(date_str, time_str):
-    """Парсит дату и время лунной фазы в MSK timezone"""
     return _msk().localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
 
 def _get_next_phase_date(phase_list, now=None):
-    """Единая функция поиска следующей фазы в списке"""
     if now is None:
         now = datetime.now(_msk())
     for date_str, time_str in phase_list:
@@ -116,30 +113,22 @@ def _get_next_phase_date(phase_list, now=None):
     return None
 
 def get_days_until_full_moon():
-    """Дней до следующего полнолуния (или None)"""
     next_full = _get_next_phase_date(LUNAR_PHASES["full_moons"])
     if next_full:
         return (next_full - datetime.now(_msk())).days
     return None
 
 def get_days_until_new_moon():
-    """Дней до следующего новолуния (или None)"""
     next_new = _get_next_phase_date(LUNAR_PHASES["new_moons"])
     if next_new:
         return (next_new - datetime.now(_msk())).days
     return None
 
 def get_lunar_info():
-    """
-    Возвращает (phase_name, next_full, next_new).
-    phase_name: 'полнолуние', 'полнолуние_завтра', 'новолуние', 'новолуние_завтра',
-                'растущая', 'убывающая', 'обычный день'
-    """
     now = datetime.now(_msk())
     next_full = _get_next_phase_date(LUNAR_PHASES["full_moons"], now)
     next_new = _get_next_phase_date(LUNAR_PHASES["new_moons"], now)
 
-    # Проверка: полнолуние сегодня или завтра
     for date_str, time_str in LUNAR_PHASES["full_moons"]:
         dt = _parse_lunar_datetime(date_str, time_str)
         delta_days = (now - dt).days
@@ -148,7 +137,6 @@ def get_lunar_info():
         if (dt - now).days == 1:
             return "полнолуние_завтра", next_full, next_new
 
-    # Проверка: новолуние сегодня или завтра
     for date_str, time_str in LUNAR_PHASES["new_moons"]:
         dt = _parse_lunar_datetime(date_str, time_str)
         delta_days = (now - dt).days
@@ -157,7 +145,6 @@ def get_lunar_info():
         if (dt - now).days == 1:
             return "новолуние_завтра", next_full, next_new
 
-    # Определение растущая/убывающая
     new_moons = [_parse_lunar_datetime(d, t) for d, t in LUNAR_PHASES["new_moons"]]
     last_new = max([d for d in new_moons if d <= now], default=None)
     if last_new:
@@ -166,26 +153,21 @@ def get_lunar_info():
 
     return "обычный день", next_full, next_new
 
-# === ЛУННАЯ СТРАТЕГИЯ ПО СИСТЕМЕ ДМИТРИЕВА ===
 async def get_lunar_signal():
-    """Возвращает (signal_type, signal_date, next_full, next_new)"""
     now = datetime.now(_msk())
     next_full = _get_next_phase_date(LUNAR_PHASES["full_moons"], now)
     next_new = _get_next_phase_date(LUNAR_PHASES["new_moons"], now)
 
-    # Полнолуние сегодня
     for date_str, time_str in LUNAR_PHASES["full_moons"]:
         dt = _parse_lunar_datetime(date_str, time_str)
         if dt.date() == now.date():
             return "full_today", dt, next_full, next_new
 
-    # За 1-3 дня до полнолуния
     if next_full:
         days_until_full = (next_full - now).days
         if 1 <= days_until_full <= 3:
             return "prepare", next_full, next_full, next_new
 
-    # 1-5 дней после полнолуния
     for date_str, time_str in LUNAR_PHASES["full_moons"]:
         dt = _parse_lunar_datetime(date_str, time_str)
         if dt < now:
@@ -193,7 +175,6 @@ async def get_lunar_signal():
             if 1 <= days_after <= 5:
                 return "hold", dt, next_full, next_new
 
-    # Новолуние сегодня
     for date_str, time_str in LUNAR_PHASES["new_moons"]:
         dt = _parse_lunar_datetime(date_str, time_str)
         if dt.date() == now.date():
@@ -232,25 +213,6 @@ def save_trade(ticker, trade_type, entry, exit_price, pnl_percent, commission_pe
             (datetime.now().isoformat(), ticker, trade_type, entry, exit_price,
              pnl_percent, commission_percent, 1 if is_manual else 0, STRATEGY['CAPITAL'])
         )
-
-def get_stats():
-    with sqlite3.connect('bot_data.db') as conn:
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*), SUM(pnl_percent), AVG(pnl_percent), SUM(CASE WHEN pnl_percent > 0 THEN 1 ELSE 0 END) FROM trades")
-        row = c.fetchone()
-        total_trades = row[0] or 0
-        total_pnl = row[1] or 0
-        avg_pnl = row[2] or 0
-        winning_trades = row[3] or 0
-        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
-        return {
-            'total_trades': total_trades,
-            'total_pnl': total_pnl,
-            'avg_pnl': avg_pnl,
-            'win_rate': win_rate,
-            'winning_trades': winning_trades,
-            'losing_trades': total_trades - winning_trades
-        }
 
 def get_last_summary_date():
     with sqlite3.connect('bot_data.db') as conn:
@@ -372,6 +334,56 @@ class DataFetcher:
 
 data_fetcher = DataFetcher()
 
+# === ИСТОРИЯ ЦЕН ===
+def get_historical_prices(df):
+    """
+    Возвращает цены: вчера (close[-2]), неделю назад (close[-6]), месяц назад (close[-22]).
+    change_pct считаем позже относительно текущей (last).
+    """
+    if df is None or len(df) < 22:
+        return None
+
+    closes = df['close'].values
+    result = {}
+
+    if len(closes) >= 2:
+        result['yesterday'] = {'price': closes[-2], 'change_pct': 0.0}
+    if len(closes) >= 6:
+        result['week_ago'] = {'price': closes[-6], 'change_pct': 0.0}
+    if len(closes) >= 22:
+        result['month_ago'] = {'price': closes[-22], 'change_pct': 0.0}
+
+    return result
+
+def update_hist_pct(hist, closes, current_price):
+    """Пересчитывает change_pct относительно текущей цены (last)."""
+    if not hist or closes is None:
+        return hist
+    for key, offset in [('yesterday', -2), ('week_ago', -6), ('month_ago', -22)]:
+        if key in hist and len(closes) >= abs(offset):
+            h = closes[offset]
+            hist[key]['change_pct'] = (current_price - h) / h * 100 if h > 0 else 0.0
+    return hist
+
+def format_historical_prices(hist):
+    """Форматирование истории цен."""
+    if not hist:
+        return ""
+    lines = []
+    if 'yesterday' in hist:
+        d = hist['yesterday']
+        icon = "📈" if d['change_pct'] > 0 else "📉" if d['change_pct'] < 0 else "➡️"
+        lines.append(f"{icon} Вчера: {d['price']:.2f} ₽ ({d['change_pct']:+.2f}%)")
+    if 'week_ago' in hist:
+        d = hist['week_ago']
+        icon = "📈" if d['change_pct'] > 0 else "📉" if d['change_pct'] < 0 else "➡️"
+        lines.append(f"{icon} Неделю назад: {d['price']:.2f} ₽ ({d['change_pct']:+.2f}%)")
+    if 'month_ago' in hist:
+        d = hist['month_ago']
+        icon = "📈" if d['change_pct'] > 0 else "📉" if d['change_pct'] < 0 else "➡️"
+        lines.append(f"{icon} Месяц назад: {d['price']:.2f} ₽ ({d['change_pct']:+.2f}%)")
+    return "\n".join(lines)
+
 # === ИНДИКАТОРЫ ===
 def calculate_adx(df, period=14):
     if len(df) < period + 5:
@@ -436,7 +448,17 @@ async def get_asset_info(ticker):
 
     adx_status = "тренд" if adx > STRATEGY['ADX_THRESHOLD'] else "флет"
 
+    closes = df['close'].values
+    hist = get_historical_prices(df)
+    hist = update_hist_pct(hist, closes, price)
+
     msg = f"📊 {TICKERS[ticker]['name']} ({ticker}) 💰 {price:.2f} ₽\n"
+    msg += f"{'─' * 30}\n"
+
+    if hist:
+        msg += format_historical_prices(hist) + "\n"
+        msg += f"{'─' * 30}\n"
+
     if ma18 and ma50:
         msg += f"📈 MA18: {ma18:.2f} | MA50: {ma50:.2f}\n"
     msg += f"📊 ADX: {adx:.1f} ({adx_status})\n"
@@ -732,6 +754,155 @@ def calculate_pnl_percent(entry_price, exit_price, direction):
 
     return pnl_percent, commission_percent
 
+# === АНАЛИТИКА СРАВНЕНИЯ ===
+def analyze_comparison(hist):
+    if not hist or 'yesterday' not in hist or 'week_ago' not in hist or 'month_ago' not in hist:
+        return {
+            'verdict': '❓ НЕДОСТАТОЧНО ДАННЫХ',
+            'trend': 'нет данных',
+            'momentum': 'нейтрально',
+            'day': 0, 'week': 0, 'month': 0
+        }
+
+    day = hist['yesterday']['change_pct']
+    week = hist['week_ago']['change_pct']
+    month = hist['month_ago']['change_pct']
+
+    avg_day_week = week / 5 if week != 0 else 0
+
+    if month > 2 and week > 0 and day > 0:
+        trend = '🚀 СИЛЬНЫЙ РОСТ'
+    elif month > 0 and week > 0:
+        trend = '📈 УМЕРЕННЫЙ РОСТ'
+    elif month < -2 and week < 0 and day < 0:
+        trend = '💥 СИЛЬНОЕ ПАДЕНИЕ'
+    elif month < 0 and week < 0:
+        trend = '📉 УМЕРЕННОЕ ПАДЕНИЕ'
+    elif month > 0 and week < 0:
+        trend = '⚠️ КОРРЕКЦИЯ В ВОСХОДЯЩЕМ ТРЕНДЕ'
+    elif month < 0 and week > 0:
+        trend = '🔄 ОТСКОК В НИСХОДЯЩЕМ ТРЕНДЕ'
+    else:
+        trend = '➡️ БОКОВИК'
+
+    if day > avg_day_week * 1.5 and day > 0:
+        momentum = '🔥 УСКОРЕНИЕ ВВЕРХ'
+    elif day < avg_day_week * 1.5 and day < 0:
+        momentum = '⚡ УСКОРЕНИЕ ВНИЗ'
+    elif abs(day) < abs(avg_day_week) * 0.5:
+        momentum = '💤 ЗАТУХАНИЕ'
+    elif (day > 0 and avg_day_week < 0) or (day < 0 and avg_day_week > 0):
+        momentum = '🔄 РАЗВОРОТ'
+    else:
+        momentum = '➡️ СТАБИЛЬНО'
+
+    if 'СИЛЬНЫЙ РОСТ' in trend and 'УСКОРЕНИЕ ВВЕРХ' in momentum:
+        verdict = '🟢 LONG — тренд сильный, моментум подтверждает'
+    elif 'СИЛЬНОЕ ПАДЕНИЕ' in trend and 'УСКОРЕНИЕ ВНИЗ' in momentum:
+        verdict = '🔴 SHORT — падение ускоряется'
+    elif 'РАЗВОРОТ' in momentum and month > 5:
+        verdict = '⚠️ ОСТОРОЖНО — возможна коррекция'
+    elif 'РАЗВОРОТ' in momentum and month < -5:
+        verdict = '🟡 НАБЛЮДЕНИЕ — возможен отскок'
+    elif 'ЗАТУХАНИЕ' in momentum:
+        verdict = '⚪ ЖДАТЬ — движение ослабевает'
+    else:
+        verdict = '⚪ НЕЙТРАЛЬНО — нет чёткого сигнала'
+
+    return {
+        'verdict': verdict,
+        'trend': trend,
+        'momentum': momentum,
+        'day': day, 'week': week, 'month': month
+    }
+
+async def get_comparison_analytics():
+    results = []
+    for ticker in ALL_TICKERS:
+        df = await data_fetcher.fetch_candles_daily(ticker, 100)
+        price = await data_fetcher.get_price(ticker)
+        if df is None or price is None or price <= 0:
+            continue
+        closes = df['close'].values
+        hist = get_historical_prices(df)
+        hist = update_hist_pct(hist, closes, price)
+        if not hist:
+            continue
+        analysis = analyze_comparison(hist)
+        results.append({
+            'ticker': ticker,
+            'name': TICKERS[ticker]['name'],
+            'price': price,
+            'hist': hist,
+            'analysis': analysis
+        })
+        await asyncio.sleep(0.05)
+    return results
+
+def format_comparison_report(results):
+    if not results:
+        return "❌ Нет данных от MOEX"
+
+    now = datetime.now(_msk())
+    msg = f"📈 АНАЛИТИКА СРАВНЕНИЯ\n"
+    msg += f"📅 {now.strftime('%d.%m.%Y %H:%M')}\n"
+    msg += f"{'═' * 35}\n\n"
+
+    long_signals, short_signals, watch, neutral = [], [], [], []
+    for r in results:
+        v = r['analysis']['verdict']
+        if '🟢 LONG' in v:
+            long_signals.append(r)
+        elif '🔴 SHORT' in v:
+            short_signals.append(r)
+        elif '⚠️' in v or '🟡' in v:
+            watch.append(r)
+        else:
+            neutral.append(r)
+
+    if long_signals:
+        msg += f"🟢 LONG-СИГНАЛЫ ({len(long_signals)}):\n"
+        for r in long_signals[:5]:
+            a = r['analysis']
+            msg += f"  • {r['name']} ({r['ticker']}) — {r['price']:.2f} ₽\n"
+            msg += f"    1д {a['day']:+.2f}% | 1н {a['week']:+.2f}% | 1м {a['month']:+.2f}%\n"
+            msg += f"    {a['momentum']}\n\n"
+
+    if short_signals:
+        msg += f"🔴 SHORT-СИГНАЛЫ ({len(short_signals)}):\n"
+        for r in short_signals[:5]:
+            a = r['analysis']
+            msg += f"  • {r['name']} ({r['ticker']}) — {r['price']:.2f} ₽\n"
+            msg += f"    1д {a['day']:+.2f}% | 1н {a['week']:+.2f}% | 1м {a['month']:+.2f}%\n"
+            msg += f"    {a['momentum']}\n\n"
+
+    if watch:
+        msg += f"⚠️ НАБЛЮДЕНИЕ ({len(watch)}):\n"
+        for r in watch[:5]:
+            a = r['analysis']
+            msg += f"  • {r['name']} ({r['ticker']}) — {r['price']:.2f} ₽\n"
+            msg += f"    1д {a['day']:+.2f}% | 1н {a['week']:+.2f}% | 1м {a['month']:+.2f}%\n"
+            msg += f"    {a['trend']}\n\n"
+
+    if neutral:
+        msg += f"⚪ БЕЗ СИГНАЛА ({len(neutral)}):\n"
+        for r in neutral:
+            a = r['analysis']
+            msg += f"  • {r['name']} ({r['ticker']}): "
+            msg += f"1д {a['day']:+.1f}% | 1н {a['week']:+.1f}% | 1м {a['month']:+.1f}%\n"
+        msg += "\n"
+
+    msg += f"{'═' * 35}\n"
+    msg += f"📊 ИТОГО:\n"
+    msg += f"🟢 LONG: {len(long_signals)}\n"
+    msg += f"🔴 SHORT: {len(short_signals)}\n"
+    msg += f"⚠️ Наблюдение: {len(watch)}\n"
+    msg += f"⚪ Нейтрально: {len(neutral)}\n\n"
+    msg += f"💡 Методология: сравнение close за 1д / 1н / 1м\n"
+    msg += f"⚠️ Не является инвестиционной рекомендацией"
+
+    return msg
+
 # === ЛУННАЯ СТРАТЕГИЯ ===
 async def lunar_notify():
     global lunar_notified_days
@@ -794,7 +965,7 @@ async def daily_lunar_summary():
     days_full = get_days_until_full_moon()
     days_new = get_days_until_new_moon()
 
-    txt = f"📊 ЕЖЕДНЕВНАЯ СВОДКА {_msk().localize(datetime.now()).strftime('%d.%m.%Y %H:%M')}\n\n"
+    txt = f"📊 ЕЖЕДНЕВНАЯ СВОДКА {datetime.now(_msk()).strftime('%d.%m.%Y %H:%M')}\n\n"
     txt += f"🌙 Фаза Луны: {ph.upper()}\n"
     if nxt_full:
         txt += f"🌕 Полнолуние: {nxt_full.strftime('%d.%m.%Y')}"
@@ -866,7 +1037,8 @@ dp.middleware.setup(LoggingMiddleware())
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🌙 Фазы Луны"), KeyboardButton(text="📊 Информация")],
-        [KeyboardButton(text="📋 Тикеры"), KeyboardButton(text="🚨 Срочный срез")],
+        [KeyboardButton(text="📈 Сравнение"), KeyboardButton(text="📋 Тикеры")],
+        [KeyboardButton(text="🚨 Срочный срез")],
     ],
     resize_keyboard=True
 )
@@ -879,16 +1051,17 @@ async def start_cmd(m):
         "🔹 СБЕР (сигналы каждый час с 10:00 до 22:00)\n"
         "   Стратегия: MA10/MA30 + ADX | Стоп 6% | Тейк 12%\n\n"
         "🔹 ОСТАЛЬНЫЕ 16 АКТИВОВ\n"
-        "   Проверяются каждый час, при сигнале присылается список или актив\n\n"
+        "   Проверяются каждый час, при сигнале присылается список\n\n"
         "🔹 ЛУННАЯ СТРАТЕГИЯ\n"
-        "   Ежедневная сводка в 10:00 | Уведомления за 3 дня до полнолуния и новолуния\n\n"
+        "   Ежедневная сводка в 10:00 | Уведомления за 3 дня до полнолуния\n\n"
         "🔹 КНОПКИ:\n"
-        "   🌙 Фазы Луны — информация о луне и общий тренд на Мосбирже\n"
-        "   📊 Информация — данные по всем 17 активам\n"
+        "   🌙 Фазы Луны — информация о луне и общий тренд\n"
+        "   📊 Информация — данные по 17 активам с историей цен\n"
+        "   📈 Сравнение — аналитика за день/неделю/месяц\n"
         "   📋 Тикеры — список тикеров\n"
         "   🚨 Срочный срез — моментальный анализ всех 17 активов\n\n"
         "🔹 КОМАНДА:\n"
-        "   /luna — детальная лунная стратегия с сигналами по системе Дмитриева",
+        "   /luna — детальная лунная стратегия",
         reply_markup=keyboard, parse_mode='HTML')
 
 @dp.message_handler(commands=['luna'])
@@ -1020,6 +1193,37 @@ async def btn_info(m):
             await m.answer(full_msg, parse_mode='HTML')
     else:
         await m.answer("⚠️ Нет данных от MOEX")
+
+    gc.collect()
+
+@dp.message_handler(lambda msg: msg.text == "📈 Сравнение")
+async def btn_comparison(m):
+    await m.answer("📈 Собираю аналитику по 17 активам...\n⏳ 30-60 секунд")
+
+    try:
+        results = await get_comparison_analytics()
+        report = format_comparison_report(results)
+
+        if len(report) > 4000:
+            parts = []
+            current = ""
+            for line in report.split('\n'):
+                if len(current) + len(line) + 1 > 3900:
+                    parts.append(current)
+                    current = line + '\n'
+                else:
+                    current += line + '\n'
+            if current:
+                parts.append(current)
+
+            for part in parts:
+                await m.answer(part, parse_mode='HTML')
+        else:
+            await m.answer(report, parse_mode='HTML')
+
+    except Exception as e:
+        logger.error(f"Ошибка аналитики сравнения: {e}")
+        await m.answer("⚠️ Ошибка получения данных от MOEX")
 
     gc.collect()
 
@@ -1157,7 +1361,8 @@ if __name__ == "__main__":
     print("=" * 50)
     print("АНАЛИТИК | ОПТИМИЗИРОВАННАЯ ВЕРСИЯ")
     print("Сбер: сигналы каждый час | Остальные: только при сигнале")
-    print("Кнопка «Информация» — данные по всем 17 активам")
+    print("Информация — данные с историей цен (вчера/неделя/месяц)")
+    print("Сравнение — аналитика 1д/1н/1м")
     print("Срочный срез — с рекомендациями")
     print("Команда /luna — лунная стратегия по системе Дмитриева")
     print("=" * 50)
