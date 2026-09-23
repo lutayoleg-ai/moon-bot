@@ -24,7 +24,10 @@ MY_CHAT_ID = 414210743
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 
 if not BOT_TOKEN:
-    raise ValueError("❌ Токен не найден")
+    raise ValueError("❌ BOT_TOKEN не найден")
+
+if not CHANNEL_ID:
+    raise ValueError("❌ CHANNEL_ID не найден")
 
 # === ПАРАМЕТРЫ СТРАТЕГИИ ===
 STRATEGY = {
@@ -41,6 +44,18 @@ STRATEGY = {
 COMMISSION = 0.003
 MOEX_TIMEOUT = 15
 
+# Дисклеймер
+DISCLAIMER = (
+    "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "⚠️ Данная информация не является индивидуальной инвестиционной рекомендацией, "
+    "а финансовые инструменты и операции могут не соответствовать вашему инвестиционному профилю."
+)
+
+LUNAR_DISCLAIMER = (
+    "\n\n⚠️ Лунная стратегия — не является торговой рекомендацией. "
+    "Использовать только как дополнительный фактор."
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -49,23 +64,23 @@ logger = logging.getLogger(__name__)
 
 # === 17 АКТИВОВ ===
 TICKERS = {
-    "SBER": {"name": "Сбер", "return_bull": 3.62, "return_bear": 4.52},
-    "VTBR": {"name": "ВТБ", "return_bull": 5.31, "return_bear": 5.35},
-    "GAZP": {"name": "Газпром", "return_bull": 4.40, "return_bear": 3.35},
-    "LKOH": {"name": "Лукойл", "return_bull": 2.98, "return_bear": 3.43},
-    "ROSN": {"name": "Роснефть", "return_bull": 4.18, "return_bear": 3.04},
-    "TATN": {"name": "Татнефть", "return_bull": 3.26, "return_bear": 2.79},
-    "NLMK": {"name": "НЛМК", "return_bull": 4.84, "return_bear": 3.91},
-    "GMKN": {"name": "Норникель", "return_bull": 4.60, "return_bear": 3.55},
-    "MTLR": {"name": "Мечел", "return_bull": 5.41, "return_bear": 4.55},
-    "ALRS": {"name": "Алроса", "return_bull": 4.73, "return_bear": 3.91},
-    "AFLT": {"name": "Аэрофлот", "return_bull": 4.33, "return_bear": 4.58},
-    "YDEX": {"name": "Яндекс", "return_bull": 2.31, "return_bear": 3.52},
-    "OZON": {"name": "OZON", "return_bull": 3.92, "return_bear": 4.65},
-    "MGNT": {"name": "Магнит", "return_bull": 4.62, "return_bear": 3.51},
-    "CBOM": {"name": "МКБ", "return_bull": 4.46, "return_bear": 3.65},
-    "WUSH": {"name": "Whoosh", "return_bull": 4.86, "return_bear": 3.93},
-    "ASTR": {"name": "Астра", "return_bull": 3.77, "return_bear": 3.12},
+    "SBER": {"name": "Сбер"},
+    "VTBR": {"name": "ВТБ"},
+    "GAZP": {"name": "Газпром"},
+    "LKOH": {"name": "Лукойл"},
+    "ROSN": {"name": "Роснефть"},
+    "TATN": {"name": "Татнефть"},
+    "NLMK": {"name": "НЛМК"},
+    "GMKN": {"name": "Норникель"},
+    "MTLR": {"name": "Мечел"},
+    "ALRS": {"name": "Алроса"},
+    "AFLT": {"name": "Аэрофлот"},
+    "YDEX": {"name": "Яндекс"},
+    "OZON": {"name": "OZON"},
+    "MGNT": {"name": "Магнит"},
+    "CBOM": {"name": "МКБ"},
+    "WUSH": {"name": "Whoosh"},
+    "ASTR": {"name": "Астра"},
 }
 ALL_TICKERS = list(TICKERS.keys())
 
@@ -185,10 +200,12 @@ async def get_lunar_signal():
 # === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
 positions = {}
 positions_lock = asyncio.Lock()
-last_signal_sent = {}
+last_signal_sent = {}  # {ticker: (signal_type, price_at_send)}
 daily_pnl = 0.0
 last_reset_date = None
-lunar_notified_days = set()
+lunar_notified_full = set()
+lunar_notified_new = set()
+daily_trade_blocked = False  # Флаг блокировки после DAILY_LOSS_LIMIT
 
 # === БАЗА ДАННЫХ ===
 def init_db():
@@ -279,6 +296,7 @@ class DataFetcher:
             return None
 
     async def fetch_candles_daily(self, ticker, days=100):
+        """P0 FIX: теперь запрашиваем open, high, low, close (не только close)"""
         try:
             end = datetime.now()
             start = end - timedelta(days=days)
@@ -295,19 +313,36 @@ class DataFetcher:
             cols = candles.get('columns', [])
 
             if rows and len(rows) >= 3:
+                # Ищем индексы всех нужных колонок
                 idx_date = next((i for i, c in enumerate(cols) if c.lower() in ('begin', 'date')), None)
-                idx_close = next((i for i, c in enumerate(cols) if c.lower() in ('close', 'value')), None)
+                idx_open = next((i for i, c in enumerate(cols) if c.lower() == 'open'), None)
+                idx_high = next((i for i, c in enumerate(cols) if c.lower() == 'high'), None)
+                idx_low = next((i for i, c in enumerate(cols) if c.lower() == 'low'), None)
+                idx_close = next((i for i, c in enumerate(cols) if c.lower() == 'close'), None)
+
                 if idx_date is not None and idx_close is not None:
                     records = []
                     for row in rows:
                         if len(row) > max(idx_date, idx_close):
                             try:
-                                records.append({
+                                rec = {
                                     'date': pd.to_datetime(row[idx_date]),
-                                    'close': float(row[idx_close])
-                                })
+                                    'close': float(row[idx_close]) if idx_close is not None else None,
+                                    'open': float(row[idx_open]) if idx_open is not None and row[idx_open] is not None else None,
+                                    'high': float(row[idx_high]) if idx_high is not None and row[idx_high] is not None else None,
+                                    'low': float(row[idx_low]) if idx_low is not None and row[idx_low] is not None else None,
+                                }
+                                # Fallback: если high/low отсутствуют — используем close
+                                if rec['high'] is None:
+                                    rec['high'] = rec['close']
+                                if rec['low'] is None:
+                                    rec['low'] = rec['close']
+                                if rec['open'] is None:
+                                    rec['open'] = rec['close']
+                                records.append(rec)
                             except:
                                 pass
+
                     if len(records) >= 5:
                         df = pd.DataFrame(records).sort_values('date').reset_index(drop=True)
                         return df
@@ -336,27 +371,19 @@ data_fetcher = DataFetcher()
 
 # === ИСТОРИЯ ЦЕН ===
 def get_historical_prices(df):
-    """
-    Возвращает цены: вчера (close[-2]), неделю назад (close[-6]), месяц назад (close[-22]).
-    change_pct считаем позже относительно текущей (last).
-    """
     if df is None or len(df) < 22:
         return None
-
     closes = df['close'].values
     result = {}
-
     if len(closes) >= 2:
         result['yesterday'] = {'price': closes[-2], 'change_pct': 0.0}
     if len(closes) >= 6:
         result['week_ago'] = {'price': closes[-6], 'change_pct': 0.0}
     if len(closes) >= 22:
         result['month_ago'] = {'price': closes[-22], 'change_pct': 0.0}
-
     return result
 
 def update_hist_pct(hist, closes, current_price):
-    """Пересчитывает change_pct относительно текущей цены (last)."""
     if not hist or closes is None:
         return hist
     for key, offset in [('yesterday', -2), ('week_ago', -6), ('month_ago', -22)]:
@@ -366,7 +393,6 @@ def update_hist_pct(hist, closes, current_price):
     return hist
 
 def format_historical_prices(hist):
-    """Форматирование истории цен."""
     if not hist:
         return ""
     lines = []
@@ -386,25 +412,53 @@ def format_historical_prices(hist):
 
 # === ИНДИКАТОРЫ ===
 def calculate_adx(df, period=14):
-    if len(df) < period + 5:
+    """
+    P0 FIX: ADX теперь считается по правильной формуле Уайлдера.
+    Использует high/low из df (после фикса fetch_candles_daily они реальные).
+    """
+    if df is None or len(df) < period * 2:
         return 20
-    high = df['high'] if 'high' in df.columns else df['close']
-    low = df['low'] if 'low' in df.columns else df['close']
+
+    high = df['high']
+    low = df['low']
     close = df['close']
 
-    plus_dm = high.diff()
-    minus_dm = low.diff()
-    plus_dm[plus_dm < 0] = 0
-    minus_dm[minus_dm > 0] = 0
+    # +DM и -DM с взаимоисключением (правило Уайлдера)
+    up_move = high.diff()
+    down_move = -low.diff()
 
-    tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
-    atr = tr.rolling(period).mean()
+    plus_dm = pd.Series(0.0, index=df.index)
+    minus_dm = pd.Series(0.0, index=df.index)
 
-    plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
-    minus_di = 100 * (abs(minus_dm).rolling(period).mean() / atr)
-    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
-    adx = dx.rolling(period).mean().iloc[-1]
-    return adx if not np.isnan(adx) else 20
+    # +DM > -DM и +DM > 0
+    plus_cond = (up_move > down_move) & (up_move > 0)
+    plus_dm[plus_cond] = up_move[plus_cond]
+
+    # -DM > +DM и -DM > 0
+    minus_cond = (down_move > up_move) & (down_move > 0)
+    minus_dm[minus_cond] = down_move[minus_cond]
+
+    # True Range (правильный)
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    # Сглаживание через EMA (метод Уайлдера использует SMMA, но EMA близко)
+    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
+
+    # DX и ADX
+    di_sum = plus_di + minus_di
+    di_sum = di_sum.replace(0, np.nan)
+    dx = (abs(plus_di - minus_di) / di_sum) * 100
+    adx_series = dx.ewm(alpha=1/period, adjust=False).mean()
+
+    adx_val = adx_series.iloc[-1]
+    if pd.isna(adx_val):
+        return 20
+    return float(adx_val)
 
 def get_trend(df):
     if df is None or len(df) < 30:
@@ -418,10 +472,10 @@ def get_trend(df):
     return "neutral"
 
 def calc_trend_for_ticker(df):
-    if df is None or len(df) < 30:
+    if df is None or len(df) < 50:
         return "недостаточно данных"
     ma18 = df['close'].rolling(18).mean().iloc[-1]
-    ma50 = df['close'].rolling(50).mean().iloc[-1] if len(df) >= 50 else ma18
+    ma50 = df['close'].rolling(50).mean().iloc[-1]
     if np.isnan(ma18) or np.isnan(ma50):
         return "недостаточно данных"
     spread = abs(ma18 - ma50) / ma50 * 100
@@ -468,27 +522,44 @@ async def get_asset_info(ticker):
     else:
         msg += "❌ Сигналов нет"
 
+    msg += DISCLAIMER
     return msg, None
 
 # === ОТПРАВКА СИГНАЛОВ ===
 async def check_and_send_all_signals():
-    global last_signal_sent
+    """
+    P0 FIX: дедупликация через last_signal_sent,
+    проверка DAILY_LOSS_LIMIT.
+    """
+    global last_signal_sent, daily_trade_blocked
 
-    async with positions_lock:
-        signals = []
-        for ticker in ALL_TICKERS:
-            if ticker == "SBER":
-                continue
-            if ticker in positions and positions[ticker].get('type') is not None:
-                continue
-            signal, data, _ = await get_signal_for_ticker(ticker)
-            if signal and data and data.get('price') is not None and data['price'] > 0:
-                signals.append({
-                    'ticker': ticker,
-                    'signal': signal,
-                    'data': data,
-                    'adx': data['adx']
-                })
+    if daily_trade_blocked:
+        logger.info("⛔ DAILY_LOSS_LIMIT достигнут — сигналы не отправляются")
+        return
+
+    signals = []
+    for ticker in ALL_TICKERS:
+        if ticker == "SBER":
+            continue
+        if ticker in positions and positions[ticker].get('type') is not None:
+            continue
+        signal, data, _ = await get_signal_for_ticker(ticker)
+        if signal and data and data.get('price') is not None and data['price'] > 0:
+            # P0 FIX: дедупликация
+            prev = last_signal_sent.get(ticker)
+            current_price = data['price']
+            if prev is not None:
+                prev_signal, prev_price = prev
+                # Пропускаем если тот же сигнал и цена не изменилась на > 0.5%
+                if prev_signal == signal and abs(current_price - prev_price) / prev_price < 0.005:
+                    continue
+
+            signals.append({
+                'ticker': ticker,
+                'signal': signal,
+                'data': data,
+                'adx': data['adx']
+            })
 
     if not signals:
         return
@@ -507,10 +578,8 @@ async def check_and_send_all_signals():
         emoji = "🟢" if s['signal'] == 'LONG' else "🔴"
         direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
         msg += f"{emoji} {data['name']} ({s['ticker']}) | {direction} | ADX {data['adx']}\n"
-        if s['signal'] == 'LONG':
-            msg += f"   ✅ Рекомендую открыть LONG\n\n"
-        else:
-            msg += f"   ✅ Рекомендую открыть SHORT\n\n"
+        msg += f"   Цена: {data['price']:.2f} ₽ | 🛑 {data['stop']:.2f} | 🎯 {data['target']:.2f}\n"
+        msg += f"   ✅ Рекомендую открыть {direction}\n\n"
 
     if len(signals) > top_count:
         msg += f"ОСТАЛЬНЫЕ {len(signals) - top_count} СИГНАЛОВ:\n\n"
@@ -520,24 +589,23 @@ async def check_and_send_all_signals():
             emoji = "🟢" if s['signal'] == 'LONG' else "🔴"
             direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
             msg += f"{emoji} {data['name']} ({s['ticker']}) | {direction} | ADX {data['adx']}\n"
-            if s['signal'] == 'LONG':
-                msg += f"   ✅ Рекомендую открыть LONG\n\n"
-            else:
-                msg += f"   ✅ Рекомендую открыть SHORT\n\n"
+            msg += f"   ✅ Рекомендую открыть {direction}\n\n"
 
-    msg += f"\n🤖 Сигналы сгенерированы в {now.strftime('%H:%M')}"
+    msg += f"🤖 Сигналы сгенерированы в {now.strftime('%H:%M')}"
+    msg += DISCLAIMER
 
     try:
         await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
+        # P0 FIX: сохраняем сигнал и цену для дедупликации
         for s in signals:
-            last_signal_sent[s['ticker']] = f"{s['signal']}_{int(s['data']['price'])}"
+            last_signal_sent[s['ticker']] = (s['signal'], s['data']['price'])
     except Exception as e:
-        logger.error(f"Ошибка отправки: {e}")
+        logger.exception(f"Ошибка отправки сигналов: {e}")
 
     gc.collect()
 
 async def send_sber_hourly():
-    global positions, daily_pnl
+    global positions, daily_pnl, daily_trade_blocked
 
     if not CHANNEL_ID:
         return
@@ -546,8 +614,9 @@ async def send_sber_hourly():
 
     signal, data, explanation = await get_sber_signal_detailed()
 
+    # P0 FIX: если данных нет — не пытаемся их использовать
     if data is None or data.get('price') is None or data['price'] <= 0:
-        logger.error("Нет корректной цены для Сбера, пропускаем сигнал")
+        logger.warning("Нет данных по Сберу, пропускаем сигнал")
         return
 
     price = data['price']
@@ -616,6 +685,11 @@ async def send_sber_hourly():
                        positions.get("SBER", {}).get('is_manual', False))
             positions["SBER"] = {'type': None, 'entry_price': None, 'entry_time': None, 'is_manual': False}
 
+            # P0 FIX: проверка DAILY_LOSS_LIMIT
+            if daily_pnl <= -STRATEGY['DAILY_LOSS_LIMIT'] * 100:
+                daily_trade_blocked = True
+                logger.warning(f"⛔ DAILY_LOSS_LIMIT достигнут: {daily_pnl:.2f}%")
+
     elif signal and not sber_position:
         async with positions_lock:
             positions["SBER"] = {
@@ -626,18 +700,21 @@ async def send_sber_hourly():
             }
         msg += f"\n\n✅ ВХОД {signal} по сигналу бота"
 
+    msg += DISCLAIMER
+
     try:
         await bot.send_message(CHANNEL_ID, msg, parse_mode='HTML')
     except Exception as e:
-        logger.error(f"Ошибка отправки: {e}")
+        logger.exception(f"Ошибка отправки Сбера: {e}")
 
     gc.collect()
 
 async def reset_daily_pnl():
-    global daily_pnl, last_reset_date
+    global daily_pnl, last_reset_date, daily_trade_blocked
     today = datetime.now(_msk()).date()
     if last_reset_date != today:
         daily_pnl = 0.0
+        daily_trade_blocked = False  # Сбрасываем блокировку в новый день
         last_reset_date = today
 
 async def get_all_trends():
@@ -653,6 +730,7 @@ def get_tickers_list_text():
     text = "📋 ДОСТУПНЫЕ ТИКЕРЫ (17 активов)\n\n"
     for i, (ticker, info) in enumerate(TICKERS.items(), 1):
         text += f"{i}. {info['name']} ({ticker})\n"
+    text += DISCLAIMER
     return text
 
 # === АНАЛИЗ СИГНАЛА ===
@@ -785,16 +863,19 @@ def analyze_comparison(hist):
     else:
         trend = '➡️ БОКОВИК'
 
-    if day > avg_day_week * 1.5 and day > 0:
-        momentum = '🔥 УСКОРЕНИЕ ВВЕРХ'
-    elif day < avg_day_week * 1.5 and day < 0:
-        momentum = '⚡ УСКОРЕНИЕ ВНИЗ'
-    elif abs(day) < abs(avg_day_week) * 0.5:
-        momentum = '💤 ЗАТУХАНИЕ'
-    elif (day > 0 and avg_day_week < 0) or (day < 0 and avg_day_week > 0):
-        momentum = '🔄 РАЗВОРОТ'
+    if avg_day_week != 0:
+        if day > avg_day_week * 1.5 and day > 0:
+            momentum = '🔥 УСКОРЕНИЕ ВВЕРХ'
+        elif day < avg_day_week * 1.5 and day < 0:
+            momentum = '⚡ УСКОРЕНИЕ ВНИЗ'
+        elif abs(day) < abs(avg_day_week) * 0.5:
+            momentum = '💤 ЗАТУХАНИЕ'
+        elif (day > 0 and avg_day_week < 0) or (day < 0 and avg_day_week > 0):
+            momentum = '🔄 РАЗВОРОТ'
+        else:
+            momentum = '➡️ СТАБИЛЬНО'
     else:
-        momentum = '➡️ СТАБИЛЬНО'
+        momentum = '➡️ БОКОВИК'
 
     if 'СИЛЬНЫЙ РОСТ' in trend and 'УСКОРЕНИЕ ВВЕРХ' in momentum:
         verdict = '🟢 LONG — тренд сильный, моментум подтверждает'
@@ -841,7 +922,7 @@ async def get_comparison_analytics():
 
 def format_comparison_report(results):
     if not results:
-        return "❌ Нет данных от MOEX"
+        return "❌ Нет данных от MOEX" + DISCLAIMER
 
     now = datetime.now(_msk())
     msg = f"📈 АНАЛИТИКА СРАВНЕНИЯ\n"
@@ -886,7 +967,7 @@ def format_comparison_report(results):
 
     if neutral:
         msg += f"⚪ БЕЗ СИГНАЛА ({len(neutral)}):\n"
-        for r in neutral:
+        for r in neutral[:10]:
             a = r['analysis']
             msg += f"  • {r['name']} ({r['ticker']}): "
             msg += f"1д {a['day']:+.1f}% | 1н {a['week']:+.1f}% | 1м {a['month']:+.1f}%\n"
@@ -897,36 +978,37 @@ def format_comparison_report(results):
     msg += f"🟢 LONG: {len(long_signals)}\n"
     msg += f"🔴 SHORT: {len(short_signals)}\n"
     msg += f"⚠️ Наблюдение: {len(watch)}\n"
-    msg += f"⚪ Нейтрально: {len(neutral)}\n\n"
-    msg += f"💡 Методология: сравнение close за 1д / 1н / 1м\n"
-    msg += f"⚠️ Не является инвестиционной рекомендацией"
+    msg += f"⚪ Нейтрально: {len(neutral)}\n"
+    msg += f"\n💡 Методология: сравнение close за 1д / 1н / 1м"
+    msg += DISCLAIMER
 
     return msg
 
 # === ЛУННАЯ СТРАТЕГИЯ ===
 async def lunar_notify():
-    global lunar_notified_days
+    """P0 FIX: два отдельных set для полнолуний и новолуний"""
+    global lunar_notified_full, lunar_notified_new
     while True:
         days_until_full = get_days_until_full_moon()
         days_until_new = get_days_until_new_moon()
 
-        if days_until_full is not None and days_until_full <= 3 and days_until_full not in lunar_notified_days:
-            lunar_notified_days.add(days_until_full)
+        if days_until_full is not None and days_until_full <= 3 and days_until_full not in lunar_notified_full:
+            lunar_notified_full.add(days_until_full)
             if days_until_full == 3:
-                await bot.send_message(MY_CHAT_ID, f"🌕 ЧЕРЕЗ 3 ДНЯ ПОЛНОЛУНИЕ\nГотовьтесь к точке входа")
+                await bot.send_message(MY_CHAT_ID, f"🌕 ЧЕРЕЗ 3 ДНЯ ПОЛНОЛУНИЕ\nГотовьтесь к точке входа" + LUNAR_DISCLAIMER)
             elif days_until_full == 2:
-                await bot.send_message(MY_CHAT_ID, f"🌕 ЧЕРЕЗ 2 ДНЯ ПОЛНОЛУНИЕ")
+                await bot.send_message(MY_CHAT_ID, f"🌕 ЧЕРЕЗ 2 ДНЯ ПОЛНОЛУНИЕ" + LUNAR_DISCLAIMER)
             elif days_until_full == 1:
-                await bot.send_message(MY_CHAT_ID, f"🌕 ЗАВТРА ПОЛНОЛУНИЕ — ТОЧКА ВХОДА")
+                await bot.send_message(MY_CHAT_ID, f"🌕 ЗАВТРА ПОЛНОЛУНИЕ — ТОЧКА ВХОДА" + LUNAR_DISCLAIMER)
 
-        if days_until_new is not None and days_until_new <= 3 and days_until_new not in lunar_notified_days:
-            lunar_notified_days.add(days_until_new)
+        if days_until_new is not None and days_until_new <= 3 and days_until_new not in lunar_notified_new:
+            lunar_notified_new.add(days_until_new)
             if days_until_new == 3:
-                await bot.send_message(MY_CHAT_ID, f"🌑 ЧЕРЕЗ 3 ДНЯ НОВОЛУНИЕ\nОжидайте повышенную волатильность")
+                await bot.send_message(MY_CHAT_ID, f"🌑 ЧЕРЕЗ 3 ДНЯ НОВОЛУНИЕ\nОжидайте повышенную волатильность" + LUNAR_DISCLAIMER)
             elif days_until_new == 2:
-                await bot.send_message(MY_CHAT_ID, f"🌑 ЧЕРЕЗ 2 ДНЯ НОВОЛУНИЕ")
+                await bot.send_message(MY_CHAT_ID, f"🌑 ЧЕРЕЗ 2 ДНЯ НОВОЛУНИЕ" + LUNAR_DISCLAIMER)
             elif days_until_new == 1:
-                await bot.send_message(MY_CHAT_ID, f"🌑 ЗАВТРА НОВОЛУНИЕ\nБудьте осторожны с позициями")
+                await bot.send_message(MY_CHAT_ID, f"🌑 ЗАВТРА НОВОЛУНИЕ\nБудьте осторожны с позициями" + LUNAR_DISCLAIMER)
 
         await asyncio.sleep(3600)
 
@@ -988,14 +1070,14 @@ async def daily_lunar_summary():
     txt += f"💡 Рекомендация: {recommendation}\n\n"
     txt += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     txt += f"🔹 СИГНАЛЫ ПО СБЕРУ: каждый час с 10:00 до 22:00\n"
-    txt += f"🔹 СРОЧНЫЙ СРЕЗ: кнопка в меню\n"
     txt += f"🔹 /luna — детальная лунная стратегия"
+    txt += LUNAR_DISCLAIMER
 
     save_daily_summary(today, txt)
     try:
         await bot.send_message(CHANNEL_ID, txt, parse_mode='HTML')
-    except:
-        pass
+    except Exception as e:
+        logger.exception(f"Ошибка отправки сводки: {e}")
 
 async def daily_loop():
     while True:
@@ -1056,12 +1138,13 @@ async def start_cmd(m):
         "   Ежедневная сводка в 10:00 | Уведомления за 3 дня до полнолуния\n\n"
         "🔹 КНОПКИ:\n"
         "   🌙 Фазы Луны — информация о луне и общий тренд\n"
-        "   📊 Информация — данные по 17 активам с историей цен\n"
+        "   📊 Информация — данные по 17 активам\n"
         "   📈 Сравнение — аналитика за день/неделю/месяц\n"
         "   📋 Тикеры — список тикеров\n"
         "   🚨 Срочный срез — моментальный анализ всех 17 активов\n\n"
         "🔹 КОМАНДА:\n"
-        "   /luna — детальная лунная стратегия",
+        "   /luna — детальная лунная стратегия"
+        + DISCLAIMER,
         reply_markup=keyboard, parse_mode='HTML')
 
 @dp.message_handler(commands=['luna'])
@@ -1108,6 +1191,8 @@ async def luna_cmd(m):
     if next_new:
         days_new = (next_new - now).days
         msg += f"\n🌑 Следующее новолуние: {next_new.strftime('%d.%m.%Y')} (через {days_new} дн.)"
+
+    msg += LUNAR_DISCLAIMER
 
     await m.answer(msg, parse_mode='HTML')
 
@@ -1156,6 +1241,7 @@ async def btn_lunar(m):
     txt += f"⚪ БОКОВИК: {side_cnt} активов\n\n"
     txt += f"📈 ПРЕОБЛАДАНИЕ: {predominance}\n"
     txt += f"💡 Рекомендация: {recommendation}"
+    txt += LUNAR_DISCLAIMER
 
     await m.answer(txt, parse_mode='HTML')
 
@@ -1222,7 +1308,7 @@ async def btn_comparison(m):
             await m.answer(report, parse_mode='HTML')
 
     except Exception as e:
-        logger.error(f"Ошибка аналитики сравнения: {e}")
+        logger.exception(f"Ошибка аналитики сравнения: {e}")
         await m.answer("⚠️ Ошибка получения данных от MOEX")
 
     gc.collect()
@@ -1236,20 +1322,19 @@ async def btn_emergency_snapshot(m):
     await m.answer("🚨 Срочный срез... Анализирую все 17 активов 🔍")
 
     signals = []
-    async with positions_lock:
-        for ticker in ALL_TICKERS:
-            if ticker == "SBER":
-                continue
-            if ticker in positions and positions[ticker].get('type') is not None:
-                continue
-            signal, data, _ = await get_signal_for_ticker(ticker)
-            if signal and data and data.get('price') is not None and data['price'] > 0:
-                signals.append({
-                    'ticker': ticker,
-                    'signal': signal,
-                    'data': data,
-                    'adx': data['adx']
-                })
+    for ticker in ALL_TICKERS:
+        if ticker == "SBER":
+            continue
+        if ticker in positions and positions[ticker].get('type') is not None:
+            continue
+        signal, data, _ = await get_signal_for_ticker(ticker)
+        if signal and data and data.get('price') is not None and data['price'] > 0:
+            signals.append({
+                'ticker': ticker,
+                'signal': signal,
+                'data': data,
+                'adx': data['adx']
+            })
 
     sber_signal, sber_data, sber_expl = await get_sber_signal_detailed()
     now = datetime.now(_msk())
@@ -1257,14 +1342,14 @@ async def btn_emergency_snapshot(m):
     msg = f"🚨 СРОЧНЫЙ СРЕЗ 🚨\n\n"
     msg += f"⏰ {now.strftime('%H:%M:%S')}\n\n"
 
-    if sber_signal:
+    # P0 FIX: проверка на None
+    if sber_data is None:
+        msg += f"⚪ СБЕР: НЕТ ДАННЫХ ОТ MOEX\n\n"
+    elif sber_signal:
         msg += f"🔔 СБЕР: СИГНАЛ {sber_signal}\n"
         msg += f"   Цена: {sber_data['price']:.2f} | ADX: {sber_data['adx']}\n"
         msg += f"   🛑 {sber_data['stop']:.2f} | 🎯 {sber_data['target']:.2f}\n"
-        if sber_signal == 'LONG':
-            msg += f"   ✅ Рекомендую открыть LONG\n\n"
-        else:
-            msg += f"   ✅ Рекомендую открыть SHORT\n\n"
+        msg += f"   ✅ Рекомендую открыть {sber_signal}\n\n"
     else:
         msg += f"⚪ СБЕР: НЕТ СИГНАЛА\n"
         msg += f"   Цена: {sber_data['price']:.2f} | ADX: {sber_data['adx']:.1f}\n"
@@ -1278,14 +1363,12 @@ async def btn_emergency_snapshot(m):
             emoji = "🟢" if s['signal'] == 'LONG' else "🔴"
             direction = "LONG" if s['signal'] == 'LONG' else "SHORT"
             msg += f"{emoji} {data['name']} ({s['ticker']}) | {direction} | ADX {data['adx']}\n"
-            if s['signal'] == 'LONG':
-                msg += f"   ✅ Рекомендую открыть LONG\n\n"
-            else:
-                msg += f"   ✅ Рекомендую открыть SHORT\n\n"
+            msg += f"   ✅ Рекомендую открыть {direction}\n\n"
     else:
         msg += f"⚪ СИГНАЛОВ ПО ОСТАЛЬНЫМ НЕТ\n"
 
-    msg += f"\n🤖 Срез выполнен вручную"
+    msg += f"🤖 Срез выполнен вручную"
+    msg += DISCLAIMER
 
     await m.answer(msg, parse_mode='HTML')
     gc.collect()
@@ -1309,8 +1392,12 @@ async def main():
         logger.info("📢 Получен сигнал завершения, останавливаю бота...")
         stop_event.set()
 
-    loop.add_signal_handler(signal.SIGTERM, signal_handler)
-    loop.add_signal_handler(signal.SIGINT, signal_handler)
+    try:
+        loop.add_signal_handler(signal.SIGTERM, signal_handler)
+        loop.add_signal_handler(signal.SIGINT, signal_handler)
+    except NotImplementedError:
+        # Windows или другая ОС без поддержки сигналов
+        pass
 
     logger.info("🚀 Бот запущен, начинаю polling...")
 
@@ -1318,7 +1405,7 @@ async def main():
         try:
             await dp.start_polling()
         except Exception as e:
-            logger.error(f"❌ Ошибка в polling: {e}")
+            logger.exception(f"❌ Ошибка в polling: {e}")
         finally:
             stop_event.set()
 
@@ -1330,7 +1417,7 @@ async def main():
     try:
         await dp.stop_polling()
     except Exception as e:
-        logger.error(f"Ошибка при остановке polling: {e}")
+        logger.exception(f"Ошибка при остановке polling: {e}")
 
     polling_task.cancel()
 
@@ -1343,28 +1430,30 @@ async def main():
         try:
             await bot.close()
         except Exception as e:
-            logger.error(f"Ошибка закрытия bot: {e}")
+            logger.exception(f"Ошибка закрытия bot: {e}")
 
     logger.info("✅ Бот остановлен")
 
 async def run_bot_with_retry():
-    while True:
+    attempt = 0
+    max_attempts = 5
+    while attempt < max_attempts:
         try:
             await main()
-        except Exception as e:
-            logger.error(f"❌ Бот упал с ошибкой: {e}. Перезапуск через 10 секунд...")
-            await asyncio.sleep(10)
-        else:
             break
+        except Exception as e:
+            attempt += 1
+            logger.exception(f"❌ Бот упал (попытка {attempt}/{max_attempts}): {e}")
+            if attempt >= max_attempts:
+                logger.critical("❌ Исчерпаны попытки перезапуска")
+                break
+            await asyncio.sleep(min(10 * attempt, 60))  # backoff
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("АНАЛИТИК | ОПТИМИЗИРОВАННАЯ ВЕРСИЯ")
-    print("Сбер: сигналы каждый час | Остальные: только при сигнале")
-    print("Информация — данные с историей цен (вчера/неделя/месяц)")
-    print("Сравнение — аналитика 1д/1н/1м")
-    print("Срочный срез — с рекомендациями")
-    print("Команда /luna — лунная стратегия по системе Дмитриева")
+    print("АНАЛИТИК | ВЕРСИЯ P0-FIX")
+    print("Исправлено: ADX (high/low), дедупликация, DAILY_LOSS_LIMIT,")
+    print("lunar_notified (два set), None-защита, дисклеймеры")
     print("=" * 50)
 
     asyncio.run(run_bot_with_retry())
